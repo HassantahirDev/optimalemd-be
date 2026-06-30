@@ -1,4 +1,5 @@
-import { Controller, Post, Body, HttpCode, HttpStatus, Get, Query } from '@nestjs/common';
+import { Controller, Post, Body, HttpCode, HttpStatus, Get, Query, UseGuards, Req } from '@nestjs/common';
+import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import {
   ApiTags,
   ApiOperation,
@@ -30,6 +31,30 @@ export class AuthController {
   constructor(
     private readonly authService: AuthService,
   ) { }
+
+  @Get('me')
+  @UseGuards(JwtAuthGuard)
+  @ApiOperation({
+    summary: 'Get current authenticated identity',
+    description: 'Returns the current user. For assistants, includes live CRUD permissions and linked doctor from the database.',
+  })
+  async getMe(@Req() req: any) {
+    const u = req.user;
+    if (u?.userType === 'assistant') {
+      return {
+        success: true,
+        data: {
+          userType: 'assistant',
+          assistantId: u.assistantId,
+          firstName: u.firstName,
+          lastName: u.lastName,
+          linkedDoctorId: u.linkedDoctorId,
+          permissions: u.permissions,
+        },
+      };
+    }
+    return { success: true, data: { userType: u?.userType, id: u?.id } };
+  }
 
   @Post('register')
   @ApiOperation({

@@ -121,9 +121,67 @@ export class AuthService {
     } else if (userType === 'admin') {
       // Handle admin login
       return this.loginAdmin(normalizedEmail, password);
+    } else if (userType === 'assistant') {
+      // Handle assistant doctor login
+      return this.loginAssistant(normalizedEmail, password);
     } else {
-      throw new BadRequestException('Invalid user type. Must be either "user", "doctor", or "admin"');
+      throw new BadRequestException('Invalid user type. Must be "user", "doctor", "admin", or "assistant"');
     }
+  }
+
+  /**
+   * Login assistant doctor — delegated access to a specific doctor's data.
+   * The issued token carries the linked doctor's id and the assistant's CRUD permissions.
+   */
+  private async loginAssistant(email: string, password: string): Promise<AuthResponseDataDto> {
+    const assistant = await this.prisma.doctorAssistant.findUnique({
+      where: { email },
+      include: { linkedDoctor: true },
+    });
+
+    if (!assistant) {
+      throw new UnauthorizedException('Invalid credentials');
+    }
+    if (!assistant.isActive) {
+      throw new UnauthorizedException('Account is deactivated');
+    }
+    if (!assistant.linkedDoctor || !assistant.linkedDoctor.isActive) {
+      throw new UnauthorizedException('The linked doctor account is not available');
+    }
+
+    const isPasswordValid = await bcrypt.compare(password, assistant.password);
+    if (!isPasswordValid) {
+      throw new UnauthorizedException('Invalid credentials');
+    }
+
+    const permissions = {
+      canCreate: assistant.canCreate,
+      canRead: assistant.canRead,
+      canUpdate: assistant.canUpdate,
+      canDelete: assistant.canDelete,
+    };
+
+    const payload = {
+      sub: assistant.id,
+      email: assistant.email,
+      userType: 'assistant',
+      linkedDoctorId: assistant.linkedDoctorId,
+      permissions,
+    };
+    const accessToken = this.jwtService.sign(payload);
+
+    const { password: _, linkedDoctor, ...assistantWithoutPassword } = assistant;
+    const { password: __, ...doctorWithoutPassword } = linkedDoctor;
+
+    return {
+      accessToken,
+      // Return the linked doctor as the active "doctor" so the doctor dashboard works as-is
+      doctor: doctorWithoutPassword as DoctorResponseDto,
+      assistant: assistantWithoutPassword,
+      permissions,
+      linkedDoctorId: assistant.linkedDoctorId,
+      userType: 'assistant' as any,
+    } as any;
   }
 
   /**
