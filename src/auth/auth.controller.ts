@@ -40,14 +40,15 @@ export class AuthController {
   })
   async getMe(@Req() req: any) {
     const u = req.user;
-    if (u?.userType === 'assistant') {
+    if (u?.isAssistant) {
+      const [firstName, ...rest] = (u.assistantName || '').split(' ');
       return {
         success: true,
         data: {
           userType: 'assistant',
           assistantId: u.assistantId,
-          firstName: u.firstName,
-          lastName: u.lastName,
+          firstName: firstName || 'Assistant',
+          lastName: rest.join(' '),
           linkedDoctorId: u.linkedDoctorId,
           permissions: u.permissions,
         },

@@ -47,15 +47,24 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
         canDelete: assistant.canDelete,
       };
 
-      const { password, linkedDoctor, ...assistantSafe } = assistant;
-      // Expose linkedDoctorId + permissions for the AssistantPermissionGuard,
-      // and effectiveDoctorId so "act as doctor" endpoints resolve correctly.
+      const { password, ...doctorSafe } = assistant.linkedDoctor;
+      // "Act fully as the doctor": present req.user as the linked DOCTOR so every
+      // existing doctor endpoint (which checks userType === 'doctor' and
+      // appointment.doctorId === req.user.id) works unchanged — no per-endpoint
+      // edits, so the real doctor's flow is completely untouched.
+      // Assistant context is carried alongside for the guard, /auth/me and audit.
       return {
-        ...assistantSafe,
-        userType: 'assistant',
+        ...doctorSafe,
+        userType: 'doctor',
+        // Identity = the linked doctor
+        id: assistant.linkedDoctorId,
+        sub: assistant.linkedDoctorId,
+        // Assistant markers (do not affect doctor endpoints)
+        isAssistant: true,
         assistantId: assistant.id,
+        assistantEmail: assistant.email,
+        assistantName: `${assistant.firstName} ${assistant.lastName}`,
         linkedDoctorId: assistant.linkedDoctorId,
-        effectiveDoctorId: assistant.linkedDoctorId,
         permissions,
       };
     }
