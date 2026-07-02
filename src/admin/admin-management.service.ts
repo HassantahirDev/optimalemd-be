@@ -1,4 +1,5 @@
 import { Injectable, BadRequestException, NotFoundException, ForbiddenException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 import { MailerService } from '../mailer/mailer.service';
 import * as bcrypt from 'bcrypt';
@@ -9,6 +10,7 @@ export class AdminManagementService {
   constructor(
     private prisma: PrismaService,
     private mailerService: MailerService,
+    private configService: ConfigService,
   ) {}
 
   async listAdmins() {
@@ -373,7 +375,7 @@ export class AdminManagementService {
 
     const hashedPassword = await bcrypt.hash(body.password, 12);
 
-    return this.prisma.doctorAssistant.create({
+    const created = await this.prisma.doctorAssistant.create({
       data: {
         email,
         password: hashedPassword,
@@ -387,6 +389,24 @@ export class AdminManagementService {
       },
       select: this.assistantSelect,
     });
+
+    // Email the assistant their credentials + login URL (non-fatal on failure)
+    try {
+      const frontendUrl = (this.configService.get<string>('FRONTEND_URL') || '')
+        .replace(/\/$/, '');
+      const loginUrl = `${frontendUrl}/doctor-login?tab=assistant`;
+      await this.mailerService.sendAssistantCreatedEmail(
+        email,
+        body.firstName.trim(),
+        body.password, // send the plaintext temp password provided by super admin
+        `${doctor.firstName} ${doctor.lastName}`,
+        loginUrl,
+      );
+    } catch (err) {
+      console.error('Failed to send assistant credentials email (non-fatal):', err);
+    }
+
+    return created;
   }
 
   async updateAssistant(

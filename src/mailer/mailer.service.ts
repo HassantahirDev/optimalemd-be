@@ -2143,6 +2143,61 @@ export class MailerService implements OnModuleInit {
     }
   }
 
+  async sendAssistantCreatedEmail(
+    to: string,
+    name: string,
+    password: string,
+    doctorName: string,
+    loginUrl: string,
+  ): Promise<void> {
+    const text = `Hi ${name},
+
+An Assistant Doctor account has been created for you at OptimaleMD, linked to Dr. ${doctorName}.
+
+Login URL: ${loginUrl}
+Email: ${to}
+Temporary Password: ${password}
+
+For your security, you will be asked to set a new password the first time you log in.
+
+Select the "Assistant Doctor" tab on the login page.
+
+— OptimaleMD`;
+
+    const html = `
+      <!DOCTYPE html>
+      <html>
+      <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+      <body style="font-family: Arial, sans-serif; line-height:1.6; margin:0; padding:20px; background-color:#f4f4f4; color:#333;">
+        <div style="max-width:600px; margin:0 auto; background:#fff; border-radius:10px; overflow:hidden; box-shadow:0 4px 6px rgba(0,0,0,.1);">
+          <div style="background:#000; color:#fff; padding:30px 20px; text-align:center;">
+            <h1 style="margin:0; font-size:26px;">OptimaleMD</h1>
+            <p style="margin:8px 0 0; opacity:.9;">Assistant Doctor Access</p>
+          </div>
+          <div style="padding:36px 30px;">
+            <h2 style="color:#000; font-size:22px; margin:0 0 16px;">Your account is ready</h2>
+            <p style="color:#555;">Hi ${name},</p>
+            <p style="color:#555;">An Assistant Doctor account has been created for you, linked to <strong>Dr. ${doctorName}</strong>. Use the credentials below to sign in.</p>
+            <div style="background:#f8f9fa; border:2px solid #e9ecef; border-radius:8px; padding:20px; margin:24px 0;">
+              <p style="margin:0 0 8px;"><strong>Email:</strong> ${to}</p>
+              <p style="margin:0;"><strong>Temporary Password:</strong> ${password}</p>
+            </div>
+            <div style="text-align:center; margin:28px 0;">
+              <a href="${loginUrl}" style="background:#e53935; color:#fff; text-decoration:none; padding:14px 28px; border-radius:8px; font-weight:600; display:inline-block;">Go to Login</a>
+            </div>
+            <p style="color:#555;">On the login page, choose the <strong>Assistant Doctor</strong> tab. For your security, you'll be asked to set a new password the first time you sign in.</p>
+          </div>
+          <div style="padding:20px 30px; text-align:center; color:#999; font-size:13px; border-top:1px solid #eee;">
+            <p style="margin:0;">This is an automated email, please do not reply.</p>
+            <p style="margin:6px 0 0;">&copy; ${new Date().getFullYear()} OptimaleMD</p>
+          </div>
+        </div>
+      </body>
+      </html>`;
+
+    await this.sendEmail(to, 'Your OptimaleMD Assistant Doctor Account', text, html);
+  }
+
   async sendAdminCreatedPatientEmail(to: string, name: string, password: string, verificationLink: string): Promise<void> {
     const html = `
       <!DOCTYPE html>

@@ -57,6 +57,28 @@ export class AuthController {
     return { success: true, data: { userType: u?.userType, id: u?.id } };
   }
 
+  @Post('assistant/change-password')
+  @UseGuards(JwtAuthGuard)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Assistant changes own password',
+    description: 'Used for the forced first-time password change. Clears the must-change flag.',
+  })
+  async assistantChangePassword(
+    @Req() req: any,
+    @Body() body: { currentPassword: string; newPassword: string },
+  ) {
+    if (!req.user?.isAssistant || !req.user?.assistantId) {
+      return { success: false, message: 'Only assistant accounts can use this endpoint' };
+    }
+    const result = await this.authService.changeAssistantPassword(
+      req.user.assistantId,
+      body.currentPassword,
+      body.newPassword,
+    );
+    return { success: true, message: result.message };
+  }
+
   @Post('register')
   @ApiOperation({
     summary: 'User Registration',

@@ -36,6 +36,12 @@ export class AssistantPermissionGuard implements CanActivate {
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const req = context.switchToHttp().getRequest();
 
+    // Auth/self routes (login, /auth/me, password change) are never gated by
+    // CRUD permissions — otherwise an assistant without "create" couldn't even
+    // change their own password.
+    const path: string = req.originalUrl || req.url || '';
+    if (path.includes('/auth/')) return true;
+
     const auth: string | undefined = req.headers?.authorization;
     if (!auth?.startsWith('Bearer ')) return true; // no token → not our concern
 

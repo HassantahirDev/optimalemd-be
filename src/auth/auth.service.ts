@@ -180,8 +180,43 @@ export class AuthService {
       assistant: assistantWithoutPassword,
       permissions,
       linkedDoctorId: assistant.linkedDoctorId,
+      mustChangePassword: assistant.mustChangePassword,
       userType: 'assistant' as any,
     } as any;
+  }
+
+  /**
+   * Assistant changes their own password (used for the forced first-time change).
+   * Clears mustChangePassword so subsequent logins go straight through.
+   */
+  async changeAssistantPassword(assistantId: string, currentPassword: string, newPassword: string) {
+    const assistant = await this.prisma.doctorAssistant.findUnique({ where: { id: assistantId } });
+    if (!assistant) {
+      throw new UnauthorizedException('Assistant not found');
+    }
+
+    const isValid = await bcrypt.compare(currentPassword, assistant.password);
+    if (!isValid) {
+      throw new BadRequestException('Current password is incorrect');
+    }
+
+    const errors: string[] = [];
+    if (newPassword.length < 8) errors.push('at least 8 characters');
+    if (!/[A-Z]/.test(newPassword)) errors.push('an uppercase letter');
+    if (!/[a-z]/.test(newPassword)) errors.push('a lowercase letter');
+    if (!/[0-9]/.test(newPassword)) errors.push('a number');
+    if (!/[^A-Za-z0-9]/.test(newPassword)) errors.push('a special character');
+    if (errors.length) {
+      throw new BadRequestException(`Password must contain: ${errors.join(', ')}`);
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 12);
+    await this.prisma.doctorAssistant.update({
+      where: { id: assistantId },
+      data: { password: hashedPassword, mustChangePassword: false },
+    });
+
+    return { message: 'Password changed successfully' };
   }
 
   /**

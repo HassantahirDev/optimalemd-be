@@ -228,6 +228,9 @@ model DoctorAssistant {
   canUpdate         Boolean  @default(false)
   canDelete         Boolean  @default(false)
 
+  // Force password change on first login
+  mustChangePassword Boolean @default(true)
+
   // Password reset fields
   resetToken        String?
   resetTokenExpiry  DateTime?
