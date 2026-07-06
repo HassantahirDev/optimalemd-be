@@ -95,4 +95,61 @@ export class AdminManagementController {
     );
     return { success: true, message: result.message };
   }
+
+  // ===================== Doctor Assistants (Super Admin) =====================
+
+  @Get('assistants')
+  @ApiOperation({ summary: 'List doctor assistants (optionally filter by ?doctorId=)' })
+  async listAssistants(@Req() req: any) {
+    const doctorId = req.query?.doctorId as string | undefined;
+    const data = await this.adminManagementService.listAssistants(doctorId);
+    return { success: true, data };
+  }
+
+  @Post('assistants')
+  @HttpCode(HttpStatus.CREATED)
+  @ApiOperation({ summary: 'Create a doctor assistant' })
+  async createAssistant(
+    @Body()
+    body: {
+      email: string;
+      password: string;
+      firstName: string;
+      lastName: string;
+      linkedDoctorId: string;
+      canCreate?: boolean;
+      canRead?: boolean;
+      canUpdate?: boolean;
+      canDelete?: boolean;
+    },
+  ) {
+    const data = await this.adminManagementService.createAssistant(body);
+    return { success: true, message: 'Assistant created successfully', data };
+  }
+
+  @Put('assistants/:id')
+  @ApiOperation({ summary: 'Update a doctor assistant (permissions / status / details)' })
+  async updateAssistant(@Param('id') id: string, @Body() body: any) {
+    const data = await this.adminManagementService.updateAssistant(id, body);
+    return { success: true, message: 'Assistant updated successfully', data };
+  }
+
+  @Put('assistants/:id/reset-password')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Reset a doctor assistant password' })
+  async resetAssistantPassword(
+    @Param('id') id: string,
+    @Body() body: { newPassword: string },
+  ) {
+    const result = await this.adminManagementService.resetAssistantPassword(id, body.newPassword);
+    return { success: true, message: result.message };
+  }
+
+  @Delete('assistants/:id')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Delete a doctor assistant' })
+  async deleteAssistant(@Param('id') id: string) {
+    const result = await this.adminManagementService.deleteAssistant(id);
+    return { success: true, message: result.message };
+  }
 }

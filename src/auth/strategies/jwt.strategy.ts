@@ -25,7 +25,50 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     }
 
     let account;
-    
+
+    if (userType === 'assistant') {
+      // Validate assistant doctor and resolve the linked doctor (act-as)
+      const assistant = await this.prisma.doctorAssistant.findUnique({
+        where: { id },
+        include: { linkedDoctor: true },
+      });
+
+      if (!assistant || !assistant.isActive) {
+        throw new UnauthorizedException('Assistant not found or inactive');
+      }
+      if (!assistant.linkedDoctor || !assistant.linkedDoctor.isActive) {
+        throw new UnauthorizedException('Linked doctor not available');
+      }
+
+      const permissions = {
+        canCreate: assistant.canCreate,
+        canRead: assistant.canRead,
+        canUpdate: assistant.canUpdate,
+        canDelete: assistant.canDelete,
+      };
+
+      const { password, ...doctorSafe } = assistant.linkedDoctor;
+      // "Act fully as the doctor": present req.user as the linked DOCTOR so every
+      // existing doctor endpoint (which checks userType === 'doctor' and
+      // appointment.doctorId === req.user.id) works unchanged — no per-endpoint
+      // edits, so the real doctor's flow is completely untouched.
+      // Assistant context is carried alongside for the guard, /auth/me and audit.
+      return {
+        ...doctorSafe,
+        userType: 'doctor',
+        // Identity = the linked doctor
+        id: assistant.linkedDoctorId,
+        sub: assistant.linkedDoctorId,
+        // Assistant markers (do not affect doctor endpoints)
+        isAssistant: true,
+        assistantId: assistant.id,
+        assistantEmail: assistant.email,
+        assistantName: `${assistant.firstName} ${assistant.lastName}`,
+        linkedDoctorId: assistant.linkedDoctorId,
+        permissions,
+      };
+    }
+
     if (userType === 'user') {
       // Validate user (patient)
       account = await this.prisma.user.findUnique({

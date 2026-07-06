@@ -198,8 +198,48 @@ model Doctor {
   bookings        Booking[]
   workingHours    WorkingHours[]
   labOrders       LabOrder[]
+  assistants      DoctorAssistant[]
 
   @@map("doctors")
+}
+
+// Assistant doctor — a delegated login that operates on a specific doctor's data.
+// Created and permission-controlled by super admin. Acts fully as the linked doctor;
+// access is gated by global CRUD flags.
+model DoctorAssistant {
+  id                String   @id @default(uuid())
+
+  // Authentication
+  email             String   @unique
+  password          String
+  isActive          Boolean  @default(true)
+
+  // Personal info
+  firstName         String
+  lastName          String
+
+  // The doctor whose data this assistant can access
+  linkedDoctorId    String
+  linkedDoctor      Doctor   @relation(fields: [linkedDoctorId], references: [id], onDelete: Cascade)
+
+  // Global CRUD permissions (super-admin controlled)
+  canCreate         Boolean  @default(false)
+  canRead           Boolean  @default(true)
+  canUpdate         Boolean  @default(false)
+  canDelete         Boolean  @default(false)
+
+  // Force password change on first login
+  mustChangePassword Boolean @default(true)
+
+  // Password reset fields
+  resetToken        String?
+  resetTokenExpiry  DateTime?
+
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([linkedDoctorId])
+  @@map("doctor_assistants")
 }
 
 // Admin model for super administrators

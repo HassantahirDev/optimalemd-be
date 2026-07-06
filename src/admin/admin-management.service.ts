@@ -1,4 +1,5 @@
 import { Injectable, BadRequestException, NotFoundException, ForbiddenException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 import { MailerService } from '../mailer/mailer.service';
 import * as bcrypt from 'bcrypt';
@@ -9,6 +10,7 @@ export class AdminManagementService {
   constructor(
     private prisma: PrismaService,
     private mailerService: MailerService,
+    private configService: ConfigService,
   ) {}
 
   async listAdmins() {
@@ -312,5 +314,162 @@ export class AdminManagementService {
     await this.prisma.admin.delete({ where: { id: adminId } });
 
     return { success: true, message: 'Admin deleted successfully' };
+  }
+
+  // ===================== Doctor Assistants =====================
+
+  private assistantSelect = {
+    id: true,
+    email: true,
+    firstName: true,
+    lastName: true,
+    isActive: true,
+    linkedDoctorId: true,
+    canCreate: true,
+    canRead: true,
+    canUpdate: true,
+    canDelete: true,
+    createdAt: true,
+    updatedAt: true,
+    linkedDoctor: {
+      select: { id: true, firstName: true, lastName: true, email: true, title: true },
+    },
+  };
+
+  async listAssistants(doctorId?: string) {
+    return this.prisma.doctorAssistant.findMany({
+      where: doctorId ? { linkedDoctorId: doctorId } : undefined,
+      orderBy: { createdAt: 'desc' },
+      select: this.assistantSelect,
+    });
+  }
+
+  async createAssistant(body: {
+    email: string;
+    password: string;
+    firstName: string;
+    lastName: string;
+    linkedDoctorId: string;
+    canCreate?: boolean;
+    canRead?: boolean;
+    canUpdate?: boolean;
+    canDelete?: boolean;
+  }) {
+    const email = body.email?.toLowerCase().trim();
+    if (!email || !body.password || !body.firstName || !body.lastName || !body.linkedDoctorId) {
+      throw new BadRequestException('email, password, firstName, lastName and linkedDoctorId are required');
+    }
+    if (body.password.length < 6) {
+      throw new BadRequestException('Password must be at least 6 characters');
+    }
+
+    const doctor = await this.prisma.doctor.findUnique({ where: { id: body.linkedDoctorId } });
+    if (!doctor) {
+      throw new NotFoundException('Linked doctor not found');
+    }
+
+    const existing = await this.prisma.doctorAssistant.findUnique({ where: { email } });
+    if (existing) {
+      throw new BadRequestException('An assistant with this email already exists');
+    }
+
+    const hashedPassword = await bcrypt.hash(body.password, 12);
+
+    const created = await this.prisma.doctorAssistant.create({
+      data: {
+        email,
+        password: hashedPassword,
+        firstName: body.firstName.trim(),
+        lastName: body.lastName.trim(),
+        linkedDoctorId: body.linkedDoctorId,
+        canCreate: body.canCreate ?? false,
+        canRead: body.canRead ?? true,
+        canUpdate: body.canUpdate ?? false,
+        canDelete: body.canDelete ?? false,
+      },
+      select: this.assistantSelect,
+    });
+
+    // Email the assistant their credentials + login URL (non-fatal on failure)
+    try {
+      const frontendUrl = (this.configService.get<string>('FRONTEND_URL') || '')
+        .replace(/\/$/, '');
+      const loginUrl = `${frontendUrl}/doctor-login?tab=assistant`;
+      await this.mailerService.sendAssistantCreatedEmail(
+        email,
+        body.firstName.trim(),
+        body.password, // send the plaintext temp password provided by super admin
+        `${doctor.firstName} ${doctor.lastName}`,
+        loginUrl,
+      );
+    } catch (err) {
+      console.error('Failed to send assistant credentials email (non-fatal):', err);
+    }
+
+    return created;
+  }
+
+  async updateAssistant(
+    assistantId: string,
+    body: Partial<{
+      firstName: string;
+      lastName: string;
+      isActive: boolean;
+      canCreate: boolean;
+      canRead: boolean;
+      canUpdate: boolean;
+      canDelete: boolean;
+      linkedDoctorId: string;
+    }>,
+  ) {
+    const assistant = await this.prisma.doctorAssistant.findUnique({ where: { id: assistantId } });
+    if (!assistant) {
+      throw new NotFoundException('Assistant not found');
+    }
+
+    if (body.linkedDoctorId) {
+      const doctor = await this.prisma.doctor.findUnique({ where: { id: body.linkedDoctorId } });
+      if (!doctor) throw new NotFoundException('Linked doctor not found');
+    }
+
+    return this.prisma.doctorAssistant.update({
+      where: { id: assistantId },
+      data: {
+        ...(body.firstName !== undefined && { firstName: body.firstName.trim() }),
+        ...(body.lastName !== undefined && { lastName: body.lastName.trim() }),
+        ...(body.isActive !== undefined && { isActive: body.isActive }),
+        ...(body.canCreate !== undefined && { canCreate: body.canCreate }),
+        ...(body.canRead !== undefined && { canRead: body.canRead }),
+        ...(body.canUpdate !== undefined && { canUpdate: body.canUpdate }),
+        ...(body.canDelete !== undefined && { canDelete: body.canDelete }),
+        ...(body.linkedDoctorId !== undefined && { linkedDoctorId: body.linkedDoctorId }),
+      },
+      select: this.assistantSelect,
+    });
+  }
+
+  async resetAssistantPassword(assistantId: string, newPassword: string) {
+    if (!newPassword || newPassword.length < 6) {
+      throw new BadRequestException('Password must be at least 6 characters');
+    }
+    const assistant = await this.prisma.doctorAssistant.findUnique({ where: { id: assistantId } });
+    if (!assistant) {
+      throw new NotFoundException('Assistant not found');
+    }
+    const hashedPassword = await bcrypt.hash(newPassword, 12);
+    await this.prisma.doctorAssistant.update({
+      where: { id: assistantId },
+      data: { password: hashedPassword },
+    });
+    return { message: 'Assistant password reset successfully' };
+  }
+
+  async deleteAssistant(assistantId: string) {
+    const assistant = await this.prisma.doctorAssistant.findUnique({ where: { id: assistantId } });
+    if (!assistant) {
+      throw new NotFoundException('Assistant not found');
+    }
+    await this.prisma.doctorAssistant.delete({ where: { id: assistantId } });
+    return { success: true, message: 'Assistant deleted successfully' };
   }
 }
