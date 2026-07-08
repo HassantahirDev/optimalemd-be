@@ -21,7 +21,7 @@ const prisma = new PrismaClient();
 
 const TC_INJECTION_RX = `Men's Hormone Replacement Therapy
 Hormone Replacement Therapy Treatment:
-Patient to monitor and record weekly blood pressure and heart rate for review at follow up. If blood pressure is consistently >150/90 or there are any notable side effects or concerns such as lumps/tenderness in the testicles, severe acne, oily skin, difficulty urinating, thinning hair, worsening fatigue, breast enlargement or tenderness, increased moodiness, etc., patient is to discontinue use of testosterone therapy and follow up with their OptimaleMD-affiliated physician for further evaluation and treatment.
+Patient to monitor and record weekly blood pressure and heart rate for review at follow up. If blood pressure is consistently >150/90 or there are any notable side effects or concerns such as lumps/tenderness in the testicles, severe acne, oily skin, difficulty urinating, thinning hair, worsening fatigue, breast enlargement or tenderness, increased moodiness, etc., patient is to discontinue use of testosterone therapy and follow up with their FormaMD-affiliated physician for further evaluation and treatment.
 Follow up labs and telemedicine consult in approximately 3 months. Labs to be drawn as instructed in email to follow. Care team will arrange subsequent lab testing and follow ups. If follow up labs are abnormal, repeat labs per company protocol prior to follow up consultation.
 Testosterone Cypionate (200mg/mL): Dispense one month supply with 3 refills and include injection supplies. Discussed with patient injection sites as well as injection methods. Ship directly to the patient's home address unless a local pharmacy is requested.
 IM/SQ injections: If the patient is prescribed IM injections and would like to switch to SQ injections or if the patient is prescribed SQ injections and would like to switch to IM injections, our team will modify the patient's next prescription refill to reflect the appropriate needles and syringes per company protocol.
@@ -30,7 +30,7 @@ Contraindications reviewed: known breast or prostate cancer, palpable prostate n
 
 const TC_TROCHE_RX = `Men's Hormone Replacement Therapy
 Hormone Replacement Therapy Treatment:
-Patient to monitor and record weekly blood pressure and heart rate for review at follow up. If blood pressure is consistently >150/90 or there are any notable side effects or concerns, patient is to discontinue use of testosterone therapy and follow up with their OptimaleMD-affiliated physician for further evaluation and treatment.
+Patient to monitor and record weekly blood pressure and heart rate for review at follow up. If blood pressure is consistently >150/90 or there are any notable side effects or concerns, patient is to discontinue use of testosterone therapy and follow up with their FormaMD-affiliated physician for further evaluation and treatment.
 Follow up labs and telemedicine consult in approximately 3 months.
 Testosterone Sublingual Troche: Dispense one month supply with 3 refills. Ship directly to the patient's home address.
 Testosterone Therapy: Reviewed mechanism of action and that through its use, there will be suppression of natural production of testosterone and semen (which may lead to infertility), and may lead to the shrinkage of the testicles. Discussion of the main side effects included: testicular shrinkage, infertility, acne, oily skin, hair loss, mood changes, breast development, deeper voice, hirsutism, lower HDL, stimulation of BPH/malignant prostate issues, elevation in red blood cell production, elevation in estrogen and need for an additional medication/supplement for inhibition.
@@ -38,7 +38,7 @@ Contraindications reviewed: known breast or prostate cancer, palpable prostate n
 
 const TC_CREAM_RX = `Men's Hormone Replacement Therapy
 Hormone Replacement Therapy Treatment:
-Patient to monitor and record weekly blood pressure and heart rate for review at follow up. If blood pressure is consistently >150/90 or there are any notable side effects, patient is to discontinue use and follow up with their OptimaleMD-affiliated physician.
+Patient to monitor and record weekly blood pressure and heart rate for review at follow up. If blood pressure is consistently >150/90 or there are any notable side effects, patient is to discontinue use and follow up with their FormaMD-affiliated physician.
 Follow up labs and telemedicine consult in approximately 3 months.
 Testosterone Cream: Apply 1 mL topically as directed by your physician — dispense one month supply with 3 refills. Application Instructions: apply directly to testicles, inner thighs or over the shoulders and cover with clothing; wash hands thoroughly after application or wear gloves (transference caution required). Ship directly to the patient's home address.
 The application of testosterone cream using an ungloved hand may lead to abnormal lab results. Recommend testing at a lab using venipuncture. Labs should be drawn on the same day but prior to cream application.
