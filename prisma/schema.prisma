@@ -1177,8 +1177,10 @@ model LabOrder {
   
   // Order details
   scheduledDate DateTime // Date and time selected by patient
-  status        String   @default("pending") // pending, scheduled, completed, cancelled
-  
+  status        String   @default("pending") // pending, scheduled, completed, cancelled, pending_review
+  source        String?  // null/clinic = normal clinic-ordered lab; "self_upload" = patient uploaded existing bloodwork
+  testDate      DateTime? @db.Date // For self-uploaded labs: the date the bloodwork was actually taken
+
   // Notes
   notes         String?  // Additional notes from patient
   
@@ -1196,7 +1198,8 @@ model LabOrder {
   doctor        Doctor?  @relation(fields: [doctorId], references: [id], onDelete: SetNull)
   items         LabOrderItem[]
   resultFiles   LabResultFile[] // Multiple result files
-  
+  documents     PatientDocument[] // Per-order paperwork/documents
+
   @@map("lab_orders")
 }
 
@@ -1313,8 +1316,12 @@ model PatientDocument {
   id           String   @id @default(cuid())
   patientId    String
   patient      User     @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  labOrderId   String?  // When set, this document belongs to a specific lab order (per-row paperwork)
+  labOrder     LabOrder? @relation(fields: [labOrderId], references: [id], onDelete: Cascade)
   filePath     String
   fileName     String
   originalName String?
   createdAt    DateTime @default(now())
+
+  @@index([labOrderId])
 }

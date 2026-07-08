@@ -2,20 +2,26 @@ import {
   Controller,
   Get,
   Post,
+  Patch,
   Delete,
   Body,
   Param,
   Query,
   UseGuards,
+  UseInterceptors,
+  UploadedFile,
   HttpStatus,
   HttpCode,
 } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 import {
   ApiTags,
   ApiOperation,
   ApiResponse,
   ApiBearerAuth,
   ApiParam,
+  ApiConsumes,
+  ApiBody,
 } from '@nestjs/swagger';
 import { LabOrdersService } from './lab-orders.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
@@ -76,6 +82,42 @@ export class LabOrdersController {
       data: order,
       timestamp: new Date().toISOString(),
       path: '/api/lab-orders',
+    };
+  }
+
+  @Post('self-upload')
+  @HttpCode(HttpStatus.CREATED)
+  @UseInterceptors(FileInterceptor('file'))
+  @ApiConsumes('multipart/form-data')
+  @ApiOperation({
+    summary: 'Upload existing bloodwork results',
+    description:
+      'Patient uploads an existing comprehensive bloodwork panel (taken within the last 3 months) for the team to review. Stored in the same tables as clinic labs. Results older than 3 months are rejected.',
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        file: { type: 'string', format: 'binary' },
+        testDate: { type: 'string', example: '2026-05-01', description: 'Date the bloodwork was taken (YYYY-MM-DD)' },
+      },
+    },
+  })
+  @ApiResponse({ status: 201, description: 'Results uploaded for review', type: LabOrderDto })
+  @ApiResponse({ status: 400, description: 'Results older than 3 months, or invalid file/date' })
+  async selfUploadLab(
+    @CurrentUser() user: any,
+    @UploadedFile() file: any,
+    @Body('testDate') testDate: string,
+  ): Promise<BaseApiResponse<LabOrderDto>> {
+    const order = await this.labOrdersService.createSelfUploadOrder(user.id, testDate, file);
+    return {
+      success: true,
+      statusCode: HttpStatus.CREATED,
+      message: 'Your results were uploaded. Our team will review and reach out.',
+      data: order,
+      timestamp: new Date().toISOString(),
+      path: '/api/lab-orders/self-upload',
     };
   }
 
@@ -184,6 +226,28 @@ export class LabOrdersController {
       data: result,
       timestamp: new Date().toISOString(),
       path: '/api/lab-orders/admin/all',
+    };
+  }
+
+  @Patch('admin/:orderId/status')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Update lab order status (Admin)',
+    description: 'Sets the status of a lab order (pending, scheduled, pending_review, completed, cancelled).',
+  })
+  @ApiParam({ name: 'orderId', description: 'Lab order ID' })
+  async updateLabOrderStatusAdmin(
+    @Param('orderId') orderId: string,
+    @Body('status') status: string,
+  ): Promise<BaseApiResponse<LabOrderDto>> {
+    const order = await this.labOrdersService.updateStatusAdmin(orderId, status);
+    return {
+      success: true,
+      statusCode: HttpStatus.OK,
+      message: 'Lab order status updated successfully',
+      data: order,
+      timestamp: new Date().toISOString(),
+      path: `/api/lab-orders/admin/${orderId}/status`,
     };
   }
 

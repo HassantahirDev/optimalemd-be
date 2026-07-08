@@ -7,6 +7,8 @@ import {
   Get,
   Delete,
   Param,
+  Body,
+  Query,
   HttpCode,
   HttpStatus,
   Res,
@@ -435,16 +437,20 @@ export class UploadsController {
   async uploadPatientDocumentAdmin(
     @Param('patientId') patientId: string,
     @UploadedFile() file: Express.Multer.File,
+    @Body('labOrderId') labOrderId?: string,
   ) {
-    const result = await this.uploadsService.uploadPatientDocument(patientId, file);
+    const result = await this.uploadsService.uploadPatientDocument(patientId, file, labOrderId);
     return { success: true, statusCode: HttpStatus.OK, message: 'Document uploaded successfully', data: result };
   }
 
   @Get('admin/documents/:patientId')
   @UseGuards(JwtAuthGuard)
-  @ApiOperation({ summary: 'List patient documents (Admin)' })
-  async getPatientDocumentsAdmin(@Param('patientId') patientId: string) {
-    const docs = await this.uploadsService.getPatientDocuments(patientId);
+  @ApiOperation({ summary: 'List patient documents (Admin). Pass ?labOrderId= to scope to one lab order.' })
+  async getPatientDocumentsAdmin(
+    @Param('patientId') patientId: string,
+    @Query('labOrderId') labOrderId?: string,
+  ) {
+    const docs = await this.uploadsService.getPatientDocuments(patientId, labOrderId);
     return { success: true, statusCode: HttpStatus.OK, data: docs };
   }
 

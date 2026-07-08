@@ -1,10 +1,76 @@
 import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { UploadsService } from '../uploads/uploads.service';
 import { CreateLabOrderDto, LabTestTypeDto, LabOrderDto } from './dto/lab-orders.dto';
 
 @Injectable()
 export class LabOrdersService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly uploadsService: UploadsService,
+  ) {}
+
+  /**
+   * Patient self-uploads an EXISTING comprehensive bloodwork panel (taken elsewhere)
+   * to potentially skip the clinic lab process. Stored in the SAME tables as clinic labs
+   * (LabOrder + LabResultFile), flagged source="self_upload" and status="pending_review"
+   * so the team can review and reach out. No "results ready" email is sent to the patient.
+   *
+   * Rule: results older than 3 months are rejected — the patient must request a new lab.
+   */
+  async createSelfUploadOrder(userId: string, testDateStr: string, file: any) {
+    if (!file) {
+      throw new BadRequestException('Please attach your lab results file.');
+    }
+    if (!testDateStr) {
+      throw new BadRequestException('Please provide the date the bloodwork was taken.');
+    }
+
+    const testDate = new Date(testDateStr);
+    if (isNaN(testDate.getTime())) {
+      throw new BadRequestException('Invalid test date.');
+    }
+
+    const today = new Date();
+    today.setHours(23, 59, 59, 999);
+    if (testDate.getTime() > today.getTime()) {
+      throw new BadRequestException('The test date cannot be in the future.');
+    }
+
+    // Must be within the last 3 months
+    const threeMonthsAgo = new Date();
+    threeMonthsAgo.setMonth(threeMonthsAgo.getMonth() - 3);
+    threeMonthsAgo.setHours(0, 0, 0, 0);
+    if (testDate.getTime() < threeMonthsAgo.getTime()) {
+      throw new BadRequestException(
+        'These results are more than 3 months old. Please request a new lab panel below.',
+      );
+    }
+
+    // Create the lab order record (same table as clinic-ordered labs)
+    const order = await this.prisma.labOrder.create({
+      data: {
+        patientId: userId,
+        scheduledDate: testDate,
+        testDate,
+        source: 'self_upload',
+        status: 'pending_review',
+        notes: 'Patient-uploaded existing bloodwork panel — pending team review to determine if additional labs are needed.',
+      },
+    });
+
+    // Store the file as a LabResultFile using the SAME storage logic, but do NOT
+    // email the patient (they uploaded their own results).
+    try {
+      await this.uploadsService.uploadLabResults(order.id, file, false);
+    } catch (err) {
+      // Roll back the order if the file failed to store, so we don't leave an empty record.
+      await this.prisma.labOrder.delete({ where: { id: order.id } }).catch(() => {});
+      throw err;
+    }
+
+    return this.getLabOrderById(order.id, userId);
+  }
 
   /**
    * Get all active lab test types
@@ -217,6 +283,35 @@ export class LabOrdersService {
     });
 
     return this.mapToLabOrderDto(updatedOrder);
+  }
+
+  /**
+   * Admin updates the status of a lab order.
+   */
+  private static readonly ALLOWED_STATUSES = [
+    'pending', 'scheduled', 'pending_review', 'confirmed', 'completed', 'cancelled',
+  ];
+
+  async updateStatusAdmin(orderId: string, status: string): Promise<LabOrderDto> {
+    const normalized = (status || '').toLowerCase().trim();
+    if (!LabOrdersService.ALLOWED_STATUSES.includes(normalized)) {
+      throw new BadRequestException(
+        `Invalid status. Must be one of: ${LabOrdersService.ALLOWED_STATUSES.join(', ')}`,
+      );
+    }
+
+    const order = await this.prisma.labOrder.findUnique({ where: { id: orderId } });
+    if (!order) {
+      throw new NotFoundException('Lab order not found');
+    }
+
+    const updated = await this.prisma.labOrder.update({
+      where: { id: orderId },
+      data: { status: normalized },
+      include: { items: { include: { labTestType: true } } },
+    });
+
+    return this.mapToLabOrderDto(updated);
   }
 
   /**
@@ -475,6 +570,8 @@ export class LabOrdersService {
       doctorId: order.doctorId || undefined,
       scheduledDate: order.scheduledDate,
       status: order.status,
+      source: order.source || undefined,
+      testDate: order.testDate || undefined,
       notes: order.notes || undefined,
       receiptPath: order.receiptPath || undefined,
       receiptFileName: order.receiptFileName || undefined,

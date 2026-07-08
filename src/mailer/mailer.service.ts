@@ -609,7 +609,7 @@ export class MailerService implements OnModuleInit {
       await this.transporter.sendMail({
         from: `"FormaMD" <${this.configService.get<string>('SMTP_FROM')}>`,
         to,
-        subject: 'Welcome to FormaMD!',
+        subject: 'Your FormaMD account is verified',
         html,
       });
       console.log(`Welcome email sent successfully to ${to}`);
@@ -2937,7 +2937,7 @@ Select the "Assistant Doctor" tab on the login page.
           </div>
           <div class="content">
             <h2 class="title">Payment Confirmed!</h2>
-            <p class="description">Hi ${name},</p>
+            <p class="description">Welcome to FormaMD${name && name !== 'Valued Customer' ? `, ${name}` : ''}!</p>
             <p class="description">Thank you for your purchase! Your payment has been successfully processed.</p>
             
             <div class="success-message">

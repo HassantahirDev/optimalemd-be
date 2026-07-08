@@ -162,7 +162,7 @@ export class UploadsService {
     return { filePath, fileName };
   }
 
-  async uploadLabResults(orderId: string, file: any): Promise<{ filePath: string; fileName: string; id: string }> {
+  async uploadLabResults(orderId: string, file: any, notifyPatient: boolean = true): Promise<{ filePath: string; fileName: string; id: string }> {
     // Validate file
     if (!file) {
       throw new BadRequestException('No file provided');
@@ -229,8 +229,10 @@ export class UploadsService {
       });
     }
 
-    // Send email to patient with attached results file (only for first upload)
-    if (existingResultFiles === 1 && labOrder.patient.primaryEmail) {
+    // Send email to patient with attached results file (only for first upload).
+    // Skipped for patient self-uploads — the patient is uploading their OWN existing
+    // results, so a "your results are ready" email would be wrong.
+    if (notifyPatient && existingResultFiles === 1 && labOrder.patient.primaryEmail) {
       try {
         const patientName = `${labOrder.patient.firstName} ${labOrder.patient.lastName}`;
         const testNames = labOrder.items.map(item => item.labTestType.name).join(', ');
@@ -408,7 +410,7 @@ export class UploadsService {
     return null;
   }
 
-  async uploadPatientDocument(patientId: string, file: any): Promise<{ id: string; filePath: string; fileName: string; originalName: string; createdAt: Date }> {
+  async uploadPatientDocument(patientId: string, file: any, labOrderId?: string): Promise<{ id: string; filePath: string; fileName: string; originalName: string; createdAt: Date }> {
     if (!file) throw new BadRequestException('No file provided');
 
     const allowedMimeTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'application/pdf'];
@@ -432,6 +434,7 @@ export class UploadsService {
     const doc = await (this.prisma as any).patientDocument.create({
       data: {
         patientId,
+        labOrderId: labOrderId || null,
         filePath,
         fileName,
         originalName: file.originalname,
@@ -441,12 +444,14 @@ export class UploadsService {
     return doc;
   }
 
-  async getPatientDocuments(patientId: string): Promise<any[]> {
+  // When labOrderId is provided, returns only that order's documents (per-row paperwork).
+  // Otherwise returns the patient's general (non-order) documents.
+  async getPatientDocuments(patientId: string, labOrderId?: string): Promise<any[]> {
     const user = await this.prisma.user.findUnique({ where: { id: patientId } });
     if (!user) throw new NotFoundException('User not found');
 
     return (this.prisma as any).patientDocument.findMany({
-      where: { patientId },
+      where: labOrderId ? { patientId, labOrderId } : { patientId, labOrderId: null },
       orderBy: { createdAt: 'desc' },
     });
   }

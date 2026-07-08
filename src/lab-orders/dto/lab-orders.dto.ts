@@ -104,6 +104,12 @@ export class LabOrderDto {
   status: string;
 
   @ApiPropertyOptional()
+  source?: string;
+
+  @ApiPropertyOptional()
+  testDate?: Date;
+
+  @ApiPropertyOptional()
   notes?: string;
 
   @ApiPropertyOptional()
