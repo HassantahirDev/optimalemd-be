@@ -1,6 +1,8 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import Stripe from 'stripe';
+import { PrismaService } from '../prisma/prisma.service';
+import { PaymentLedgerService } from '../payments/payment-ledger.service';
 
 type PosCartItem = {
   priceId?: string;
@@ -16,7 +18,11 @@ type PosCartItem = {
 export class StripePosService {
   private stripe: Stripe;
 
-  constructor(private readonly configService: ConfigService) {
+  constructor(
+    private readonly configService: ConfigService,
+    private readonly prisma: PrismaService,
+    private readonly paymentLedger: PaymentLedgerService,
+  ) {
     const stripeKey = this.configService.get<string>('STRIPE_POS_SECRET_KEY');
     if (!stripeKey) {
       throw new Error(
@@ -174,12 +180,14 @@ export class StripePosService {
     setupIntentId: string;
     oneTimeItems?: PosCartItem[];
     subscriptionItems?: PosCartItem[];
+    userId?: string | null; // optional link to a real patient (Part C)
   }) {
     const {
       customerId,
       setupIntentId,
       oneTimeItems = [],
       subscriptionItems = [],
+      userId = null,
     } = body;
 
     if (oneTimeItems.length === 0 && subscriptionItems.length === 0) {
@@ -233,6 +241,26 @@ export class StripePosService {
         generatedCardId,
         oneTimeInvoiceItems,
       );
+
+      // --- Part C: mirror this in-person one-time sale into the ledger ---
+      // One-time cart section maps to MEDICATION; med line items feed the
+      // active-medications lifecycle when linked to a real patient.
+      await this.paymentLedger.upsertFromStripe({
+        stripeInvoiceId: charged.invoiceId,
+        stripeCustomerId: customerId,
+        userId,
+        channel: 'POS',
+        category: 'MEDICATION',
+        billing: 'ONE_TIME',
+        amount: this.sumCartCents(oneTimeItems) / 100,
+        currency: 'usd',
+        status: charged.status === 'paid' ? 'SUCCEEDED' : 'PENDING',
+        paidAt: new Date(),
+        createdByType: 'payment_user',
+        note: 'In-person POS sale',
+        lineItems: this.cartToLineItems(oneTimeItems, false),
+      });
+
       return {
         ok: true,
         generatedCardId,
@@ -256,6 +284,35 @@ export class StripePosService {
 
     const latestInvoice = subscription.latest_invoice as Stripe.Invoice | null;
 
+    // --- Part C: mirror this in-person subscription into the ledger ---
+    // Subscription cart section maps to MEMBERSHIP. Any bundled one-time items
+    // are attached as additional line items on the same invoice/charge.
+    const subActive =
+      subscription.status === 'active' || subscription.status === 'trialing';
+    await this.paymentLedger.upsertFromStripe({
+      stripeInvoiceId: latestInvoice ? latestInvoice.id : null,
+      stripeSubscriptionId: subscription.id,
+      stripeCustomerId: customerId,
+      userId,
+      channel: 'POS',
+      category: 'MEMBERSHIP',
+      billing: 'SUBSCRIPTION',
+      amount:
+        (this.sumCartCents(subscriptionItems) + this.sumCartCents(oneTimeItems)) / 100,
+      currency: 'usd',
+      status: subActive ? 'SUCCEEDED' : 'PENDING',
+      paidAt: subActive ? new Date() : null,
+      createdByType: 'payment_user',
+      note:
+        oneTimeItems.length > 0
+          ? 'In-person POS membership (with one-time items)'
+          : 'In-person POS membership',
+      lineItems: [
+        ...this.cartToLineItems(subscriptionItems, true),
+        ...this.cartToLineItems(oneTimeItems, false),
+      ],
+    });
+
     return {
       ok: true,
       generatedCardId,
@@ -263,6 +320,49 @@ export class StripePosService {
       invoiceId: latestInvoice ? latestInvoice.id : null,
       status: subscription.status,
     };
+  }
+
+  // Sum a POS cart section's amounts (POS item.amount is in cents).
+  private sumCartCents(items: PosCartItem[]): number {
+    return items.reduce((s, i) => s + (Number(i.amount) || 0), 0);
+  }
+
+  // Map POS cart items → ledger line items (unitAmount in dollars).
+  private cartToLineItems(items: PosCartItem[], isSubscription: boolean) {
+    return items.map((i) => ({
+      description: i.name || (isSubscription ? 'Subscription item' : 'One-time item'),
+      unitAmount: (Number(i.amount) || 0) / 100,
+      quantity: 1,
+      isSubscription,
+      medicationId: null,
+    }));
+  }
+
+  // Search our own patients so the cashier can attach an in-person sale to a
+  // real account (distinct from the Stripe-customer search for walk-ins).
+  async searchPatients(q: string) {
+    const query = (q || '').trim();
+    if (query.length < 2) return [];
+    return this.prisma.user.findMany({
+      where: {
+        OR: [
+          { firstName: { contains: query, mode: 'insensitive' } },
+          { lastName: { contains: query, mode: 'insensitive' } },
+          { primaryEmail: { contains: query, mode: 'insensitive' } },
+          { email: { contains: query, mode: 'insensitive' } },
+          { patientId: { contains: query, mode: 'insensitive' } },
+        ],
+      },
+      take: 10,
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        primaryEmail: true,
+        email: true,
+        patientId: true,
+      },
+    });
   }
 
   private async chargeOneTimeOnly(

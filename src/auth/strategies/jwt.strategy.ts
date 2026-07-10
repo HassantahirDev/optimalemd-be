@@ -110,7 +110,21 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       // Remove password from response
       const { password, ...adminWithoutPassword } = account;
       return { ...adminWithoutPassword, userType: 'admin' };
-      
+
+    } else if (userType === 'payment') {
+      // Validate payment-portal user. This role can ONLY reach the payments
+      // portal — it is never an admin/doctor/patient.
+      account = await this.prisma.paymentUser.findUnique({
+        where: { id },
+      });
+
+      if (!account || !account.isActive) {
+        throw new UnauthorizedException('Payment user not found or inactive');
+      }
+
+      const { password, ...paymentUserSafe } = account;
+      return { ...paymentUserSafe, userType: 'payment', paymentUserId: account.id };
+
     } else {
       throw new UnauthorizedException('Invalid user type in token');
     }

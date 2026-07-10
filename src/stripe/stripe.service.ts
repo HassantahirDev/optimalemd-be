@@ -6,6 +6,7 @@ import { AppointmentsService } from '../appointments/appointments.service';
 import { MailerService } from '../mailer/mailer.service';
 import { GoogleCalendarService } from '../google-calendar/google-calendar.service';
 import { ReferralService } from '../referral/referral.service';
+import { PaymentLedgerService } from '../payments/payment-ledger.service';
 import { CreatePaymentIntentDto, ConfirmPaymentDto } from './dto';
 
 @Injectable()
@@ -19,6 +20,7 @@ export class StripeService {
     private mailerService: MailerService,
     private googleCalendarService: GoogleCalendarService,
     private referralService: ReferralService,
+    private paymentLedger: PaymentLedgerService,
   ) {
     const stripeKey = this.configService.get('STRIPE_SECRET_KEY');
     if (!stripeKey) {
@@ -206,12 +208,33 @@ export class StripeService {
     }
 
     // Update payment status
-    await this.prisma.payment.update({
+    const updatedPayment = await this.prisma.payment.update({
       where: { paymentIntent: paymentIntentId },
       data: {
         status: 'SUCCEEDED',
         paidAt: new Date(),
       },
+      select: { amount: true, appointmentId: true },
+    });
+
+    // --- Dual-write consult payment into the unified ledger (additive; Part A) ---
+    // Existing Payment logic above is untouched.
+    const paidAppt = await this.prisma.appointment.findUnique({
+      where: { id: updatedPayment.appointmentId },
+      select: { patientId: true },
+    });
+    await this.paymentLedger.upsertFromStripe({
+      stripePaymentIntentId: paymentIntentId,
+      userId: paidAppt?.patientId ?? null,
+      appointmentId: updatedPayment.appointmentId,
+      channel: 'PLATFORM',
+      category: 'APPOINTMENT',
+      billing: 'ONE_TIME',
+      amount: Number(updatedPayment.amount),
+      currency: 'usd',
+      status: 'SUCCEEDED',
+      paidAt: new Date(),
+      note: 'Consultation / appointment payment',
     });
     }
 
@@ -1753,15 +1776,39 @@ export class StripeService {
             : null,
       };
 
-      await this.prisma.subscriptionTransaction.upsert({
+      const subTxn = await this.prisma.subscriptionTransaction.upsert({
         where: { stripeInvoiceId: invoice.id },
         create: { stripeInvoiceId: invoice.id, ...data },
         update: data,
+        select: { id: true },
       });
 
       console.log(
         `🧾 [LEDGER] Recorded premium subscription transaction for invoice ${invoice.id} (${status})`,
       );
+
+      // --- Dual-write into the unified payment ledger (additive; Part A) ---
+      // Existing subscriptionTransaction logic above is untouched.
+      await this.paymentLedger.upsertFromStripe({
+        stripeInvoiceId: invoice.id,
+        stripePaymentIntentId: data.stripePaymentIntentId,
+        stripeSubscriptionId: data.stripeSubscriptionId,
+        stripeCustomerId: data.stripeCustomerId,
+        userId,
+        subscriptionTransactionId: subTxn.id,
+        channel: 'PLATFORM',
+        category: 'MEMBERSHIP',
+        billing: 'SUBSCRIPTION',
+        amount: data.amount,
+        currency: data.currency,
+        status,
+        cardBrand: data.cardBrand,
+        cardLast4: data.cardLast4,
+        receiptUrl: data.receiptUrl,
+        hostedInvoiceUrl: data.invoiceUrl,
+        paidAt: data.paidAt,
+        note: 'Premium membership subscription',
+      });
     } catch (e: any) {
       // Ledger must never break the webhook flow.
       console.error(`❌ [LEDGER] Failed to record subscription transaction: ${e.message}`);
@@ -1938,7 +1985,21 @@ export class StripeService {
         case 'invoice.payment_succeeded': {
           // This fires on successful monthly renewal payments
           const invoice = event.data.object as any;
-          
+
+          // --- Part D: platform-emitted invoices (channel=INVOICE) ---
+          // These carry our metadata and are NOT subscriptions. Flip the PENDING
+          // ledger record to SUCCEEDED and run the med lifecycle if applicable.
+          // Premium-subscription handling below is left byte-for-byte unchanged.
+          if (invoice.metadata?.formamd_category) {
+            await this.paymentLedger.markInvoiceStatus(invoice.id, 'SUCCEEDED', {
+              paidAt: invoice.status_transitions?.paid_at
+                ? new Date(invoice.status_transitions.paid_at * 1000)
+                : new Date(),
+              receiptUrl: invoice.hosted_invoice_url || null,
+            });
+            break;
+          }
+
           if (!invoice.subscription) {
             console.log('ℹ️  Invoice not related to subscription, skipping');
             return { received: true };
@@ -2025,7 +2086,13 @@ export class StripeService {
         case 'invoice.payment_failed': {
           // This fires when monthly renewal payment fails
           const invoice = event.data.object as any;
-          
+
+          // --- Part D: platform-emitted invoices (channel=INVOICE) ---
+          if (invoice.metadata?.formamd_category) {
+            await this.paymentLedger.markInvoiceStatus(invoice.id, 'FAILED');
+            break;
+          }
+
           if (!invoice.subscription) {
             console.log('ℹ️  Invoice not related to subscription, skipping');
             return { received: true };
@@ -2065,6 +2132,22 @@ export class StripeService {
 
           // Ledger: record this failed premium-subscription charge (no-op for non-premium invoices).
           await this.recordPremiumSubscriptionTransaction(invoice, sub, 'FAILED');
+          break;
+        }
+
+        case 'charge.refunded': {
+          // --- Part D: reflect refunds in the ledger (previously untracked) ---
+          const charge = event.data.object as any;
+          await this.paymentLedger.markRefunded(
+            {
+              stripeChargeId: charge.id,
+              stripePaymentIntentId:
+                typeof charge.payment_intent === 'string'
+                  ? charge.payment_intent
+                  : charge.payment_intent?.id || null,
+            },
+            charge.amount_refunded != null ? charge.amount_refunded / 100 : null,
+          );
           break;
         }
 
@@ -2893,6 +2976,37 @@ export class StripeService {
       // Log error but don't fail the payment confirmation
       console.error('Failed to send medication payment confirmation email:', emailError);
     }
+
+    // --- Dual-write into the unified payment ledger (additive; Part A + B) ---
+    // Existing medicationPayment logic above is untouched. Medication line items
+    // feed the set-based MedicationOrder lifecycle inside the ledger service.
+    const isMedSubscription = !!payment.stripeSubscriptionId;
+    await this.paymentLedger.upsertFromStripe({
+      stripePaymentIntentId: paymentIntentId,
+      stripeSubscriptionId: payment.stripeSubscriptionId,
+      stripeCustomerId: payment.stripeCustomerId,
+      userId,
+      appointmentId: payment.appointmentId,
+      medicationPaymentId: payment.id,
+      channel: 'PLATFORM',
+      category: 'MEDICATION',
+      billing: isMedSubscription ? 'SUBSCRIPTION' : 'ONE_TIME',
+      amount: Number(payment.amount),
+      currency: 'usd',
+      status: 'SUCCEEDED',
+      paidAt: new Date(),
+      note: 'Medication order',
+      lineItems: (invoice.items || []).map((it: any) => ({
+        description: [it.name, it.strength, it.dose].filter(Boolean).join(' '),
+        medicationId: it.medicationId ?? null,
+        quantity: 1,
+        unitAmount: Number(it.price ?? 0),
+        isSubscription: isMedSubscription,
+        dosageSnapshot: [it.strength, it.dose, it.frequency, it.route]
+          .filter(Boolean)
+          .join(' ') || null,
+      })),
+    });
 
     return {
       success: true,

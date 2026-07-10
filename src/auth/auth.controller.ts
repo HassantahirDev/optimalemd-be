@@ -79,6 +79,28 @@ export class AuthController {
     return { success: true, message: result.message };
   }
 
+  @Post('payment/change-password')
+  @UseGuards(JwtAuthGuard)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Payment-portal user changes own password',
+    description: 'Used for the forced first-time password change. Clears the must-change flag.',
+  })
+  async paymentChangePassword(
+    @Req() req: any,
+    @Body() body: { currentPassword: string; newPassword: string },
+  ) {
+    if (req.user?.userType !== 'payment' || !req.user?.paymentUserId) {
+      return { success: false, message: 'Only payment-portal accounts can use this endpoint' };
+    }
+    const result = await this.authService.changePaymentUserPassword(
+      req.user.paymentUserId,
+      body.currentPassword,
+      body.newPassword,
+    );
+    return { success: true, message: result.message };
+  }
+
   @Post('register')
   @ApiOperation({
     summary: 'User Registration',

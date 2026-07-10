@@ -13,6 +13,7 @@ import { PrismaModule } from '../prisma/prisma.module';
 import { MailerModule } from '../mailer/mailer.module';
 import { StripeModule } from '../stripe/stripe.module';
 import { ReferralModule } from '../referral/referral.module';
+import { PaymentsModule } from '../payments/payments.module';
 
 @Module({
   imports: [
@@ -20,6 +21,7 @@ import { ReferralModule } from '../referral/referral.module';
     MailerModule,
     StripeModule,
     ReferralModule,
+    PaymentsModule,
     PassportModule,
     ConfigModule,
     JwtModule.registerAsync({

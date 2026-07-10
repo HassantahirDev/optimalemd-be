@@ -130,6 +130,10 @@ model User {
   blogReactions      BlogReaction[]
   subscriptionTransactions SubscriptionTransaction[]
 
+  // Unified payments ledger (additive; existing payment relations untouched)
+  paymentRecords     PaymentRecord[]
+  medicationOrders   MedicationOrder[]
+
   @@map("users")
 }
 
@@ -604,6 +608,156 @@ model ProcessedStripeEvent {
   @@map("processed_stripe_events")
 }
 
+// =============================================================================
+// UNIFIED PAYMENT LEDGER (additive — DERIVED/MIRROR layer)
+// -----------------------------------------------------------------------------
+// One row per payment event across every channel (platform checkout, in-person
+// POS, emailed invoice). Stripe stays the source of truth for money; the
+// existing tables (Payment, MedicationPayment, SubscriptionTransaction,
+// WelcomeOrder) remain the source of truth for their current screens. These
+// tables are DUAL-WRITTEN (never migrated) and BACKFILLED (never mutate origin).
+// =============================================================================
+model PaymentRecord {
+  id String @id @default(uuid())
+
+  // Soft links back to origin rows for reconciliation (all optional)
+  userId                    String?
+  appointmentId             String?
+  medicationPaymentId       String?
+  welcomeOrderId            String?
+  subscriptionTransactionId String?
+
+  // Classification (the "track the difference" requirement)
+  channel  PaymentChannel
+  category PaymentCategory
+  billing  PaymentBilling @default(ONE_TIME)
+
+  // Money
+  amount         Decimal       @db.Decimal(10, 2)
+  currency       String        @default("usd")
+  status         PaymentStatus @default(PENDING)
+  refundedAmount Decimal?      @db.Decimal(10, 2)
+
+  // Stripe references (nullable; unique where 1:1 so upserts are idempotent)
+  stripePaymentIntentId String? @unique
+  stripeInvoiceId       String? @unique
+  stripeChargeId        String? @unique
+  stripeSubscriptionId  String? // NOT unique — many invoices share one subscription
+  stripeCustomerId      String?
+  receiptUrl            String?
+  hostedInvoiceUrl      String?
+
+  // Card / method
+  cardBrand         String?
+  cardLast4         String?
+  paymentMethodType String? // card | link | us_bank_account | ...
+
+  // Presentation (mirrored from Stripe for DB-served reads)
+  description  String? // Stripe charge/PI description ("Subscription update", …)
+  billingEmail String? // payer email from Stripe (for guests with no account)
+
+  // Audit
+  createdByType String? // patient | admin | payment_user | system
+  createdById   String?
+  note          String?
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  paidAt        DateTime?
+  stripeCreated DateTime? // the Stripe object's created time (for dashboard-order)
+
+  // Relations
+  user             User?             @relation(fields: [userId], references: [id], onDelete: SetNull)
+  lineItems        PaymentLineItem[]
+  medicationOrders MedicationOrder[] // med orders this record paid for
+
+  @@index([userId])
+  @@index([category, status])
+  @@index([channel])
+  @@index([stripeSubscriptionId])
+  @@index([stripeCreated])
+  @@index([billingEmail])
+  @@map("payment_records")
+}
+
+// Cart line items (supports POS multi-item carts and invoices)
+model PaymentLineItem {
+  id              String  @id @default(uuid())
+  paymentRecordId String
+  description     String
+  stripePriceId   String?
+  medicationId    String?
+  quantity        Int     @default(1)
+  unitAmount      Decimal @db.Decimal(10, 2)
+  isSubscription  Boolean @default(false)
+
+  paymentRecord PaymentRecord @relation(fields: [paymentRecordId], references: [id], onDelete: Cascade)
+
+  @@index([paymentRecordId])
+  @@map("payment_line_items")
+}
+
+// =============================================================================
+// ACTIVE MEDICATIONS (SET/ORDER based)
+// -----------------------------------------------------------------------------
+// Medications are bought as a set. The most recent paid order defines the
+// patient's current ACTIVE set; when a new order is paid, the whole previous
+// set flips to PAST (kept with its date range). At most one ACTIVE order/user.
+// =============================================================================
+model MedicationOrder {
+  id                    String                @id @default(uuid())
+  userId                String
+  status                MedicationOrderStatus @default(ACTIVE)
+  startedAt             DateTime              @default(now()) // paid date — the "since" anchor
+  endedAt               DateTime? // set when superseded
+  billing               PaymentBilling        @default(ONE_TIME)
+  sourcePaymentRecordId String? // the paying PaymentRecord
+  stripeSubscriptionId  String? // if the set is billed as a subscription
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user                User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sourcePaymentRecord PaymentRecord?        @relation(fields: [sourcePaymentRecordId], references: [id], onDelete: SetNull)
+  items               MedicationOrderItem[]
+
+  @@index([userId, status])
+  @@map("medication_orders")
+}
+
+model MedicationOrderItem {
+  id                String  @id @default(uuid())
+  medicationOrderId String
+  medicationId      String?
+  medicationName    String
+  quantity          Int     @default(1)
+  dosageSnapshot    String?
+
+  medicationOrder MedicationOrder @relation(fields: [medicationOrderId], references: [id], onDelete: Cascade)
+
+  @@index([medicationOrderId])
+  @@map("medication_order_items")
+}
+
+// =============================================================================
+// PAYMENT-AUTHORIZED USERS (payments.formamd.com portal — mirrors DoctorAssistant)
+// =============================================================================
+model PaymentUser {
+  id                 String   @id @default(uuid())
+  email              String   @unique
+  password           String
+  firstName          String?
+  lastName           String?
+  isActive           Boolean  @default(true)
+  mustChangePassword Boolean  @default(true)
+  role               String   @default("payment_staff") // payment_admin | payment_staff
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("payment_users")
+}
+
 model PrimaryService {
   id                String   @id @default(uuid())
   name              String
@@ -834,6 +988,34 @@ enum PaymentStatus {
   FAILED
   CANCELLED
   REFUNDED
+  DISPUTED
+  INCOMPLETE
+  UNCAPTURED
+}
+
+// --- Unified payment ledger classification (additive) ---
+enum PaymentChannel {
+  PLATFORM // website checkout
+  POS      // in-person Stripe Terminal
+  INVOICE  // emailed Stripe invoice
+}
+
+enum PaymentCategory {
+  MEDICATION
+  MEMBERSHIP
+  APPOINTMENT
+  SIGNUP
+  OTHER
+}
+
+enum PaymentBilling {
+  ONE_TIME
+  SUBSCRIPTION
+}
+
+enum MedicationOrderStatus {
+  ACTIVE
+  PAST
 }
 
 enum AppointmentStatus {

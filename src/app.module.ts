@@ -29,6 +29,7 @@ import { FollowUpIntakeModule } from './follow-up-intake/follow-up-intake.module
 import { BlogModule } from './blog/blog.module';
 import { NewsletterModule } from './newsletter/newsletter.module';
 import { AiModule } from './ai/ai.module';
+import { PaymentsModule } from './payments/payments.module';
 
 @Module({
   imports: [
@@ -62,6 +63,7 @@ import { AiModule } from './ai/ai.module';
     BlogModule,
     NewsletterModule,
     AiModule,
+    PaymentsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

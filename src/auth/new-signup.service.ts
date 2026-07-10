@@ -3,6 +3,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { JwtService } from '@nestjs/jwt';
 import { MailerService } from '../mailer/mailer.service';
 import { ReferralService } from '../referral/referral.service';
+import { PaymentLedgerService } from '../payments/payment-ledger.service';
 import * as bcrypt from 'bcrypt';
 import * as crypto from 'crypto';
 import { generateNextPatientId } from '../common/utils/patient-id.utils';
@@ -22,6 +23,7 @@ export class NewSignupService {
     private jwtService: JwtService,
     private mailerService: MailerService,
     private referralService: ReferralService,
+    private paymentLedger: PaymentLedgerService,
   ) {}
 
   // Generate unique order number
@@ -592,6 +594,24 @@ export class NewSignupService {
         status: status === PaymentStatus.SUCCEEDED ? WelcomeOrderStatus.IN_PROGRESS : WelcomeOrderStatus.PENDING,
       },
     });
+
+    // --- Dual-write signup payment into the unified ledger (additive; Part A) ---
+    // welcomeOrder logic above is untouched. Runs only on success.
+    if (status === PaymentStatus.SUCCEEDED) {
+      await this.paymentLedger.upsertFromStripe({
+        stripePaymentIntentId: paymentIntentId,
+        userId: welcomeOrder.userId ?? null,
+        welcomeOrderId: welcomeOrder.id,
+        channel: 'PLATFORM',
+        category: 'SIGNUP',
+        billing: 'ONE_TIME',
+        amount: Number(welcomeOrder.finalAmount),
+        currency: 'usd',
+        status: 'SUCCEEDED',
+        paidAt: welcomeOrder.paidAt ?? new Date(),
+        note: `Signup order ${welcomeOrder.orderNumber}`,
+      });
+    }
 
     // Send payment confirmation email if payment succeeded
     if (status === PaymentStatus.SUCCEEDED) {
