@@ -107,11 +107,12 @@ export class PaymentSyncService implements OnModuleInit {
       const ch = this.piCharge(pi);
       const email = this.piEmail(pi);
       const userId = email ? emailMap.get(email.toLowerCase())?.id ?? null : null;
-      const data = {
+
+      // Fields refreshed on every sync: money, status, card, receipt, links.
+      // NOTE: channel/category/description are deliberately NOT here — those are
+      // the record's "type", owned by whoever created it.
+      const common = {
         userId,
-        channel: (acct.label === 'pos' ? 'POS' : 'PLATFORM') as any,
-        category: 'OTHER' as any, // refined during invoice sync
-        billing: 'ONE_TIME' as any, // refined to SUBSCRIPTION during invoice sync
         amount: pi.amount / 100,
         currency: pi.currency,
         status: this.piStatus(pi) as any,
@@ -122,18 +123,35 @@ export class PaymentSyncService implements OnModuleInit {
         cardBrand: ch?.payment_method_details?.card?.brand ?? null,
         cardLast4: ch?.payment_method_details?.card?.last4 ?? null,
         paymentMethodType: ch?.payment_method_details?.type ?? null,
-        description: ch?.description ?? pi.description ?? null,
         billingEmail: email,
         paidAt: pi.status === 'succeeded' ? new Date((ch?.created ?? pi.created) * 1000) : null,
         stripeCreated: new Date(pi.created * 1000),
-        createdByType: 'system',
       };
 
-      await this.prisma.paymentRecord.upsert({
+      const existing = await this.prisma.paymentRecord.findUnique({
         where: { stripePaymentIntentId: pi.id },
-        create: { stripePaymentIntentId: pi.id, ...data },
-        update: data,
+        select: { id: true },
       });
+
+      if (existing) {
+        // Already in our DB — created by an app flow (portal invoice, POS,
+        // premium, medication, signup…) OR a previous import. KEEP its type:
+        // never overwrite channel/category/description/createdByType here.
+        await this.prisma.paymentRecord.update({ where: { id: existing.id }, data: common });
+      } else {
+        // New to us: it never originated in our app → imported from Stripe.
+        await this.prisma.paymentRecord.create({
+          data: {
+            stripePaymentIntentId: pi.id,
+            ...common,
+            channel: 'IMPORTED' as any,
+            category: 'OTHER' as any,
+            billing: 'ONE_TIME' as any,
+            description: ch?.description ?? pi.description ?? null,
+            createdByType: 'system',
+          },
+        });
+      }
       piCount++;
       } catch (e: any) {
         piErrors++;
@@ -198,6 +216,7 @@ export class PaymentSyncService implements OnModuleInit {
         lines: { description: string; quantity: number; unitAmount: number; isSubscription: boolean }[];
         isSubscription: boolean;
         subscriptionId: string | null;
+        invoiceId: string | null;
         hostedInvoiceUrl: string | null;
       }
     >();
@@ -228,7 +247,33 @@ export class PaymentSyncService implements OnModuleInit {
       // they can't be linked; the succeeded sibling shows the items.)
       for (const ip of inv.payments?.data || []) {
         const piId = ip.payment?.payment_intent;
-        if (piId) byPI.set(piId, { lines, isSubscription, subscriptionId, hostedInvoiceUrl });
+        if (piId) byPI.set(piId, { lines, isSubscription, subscriptionId, invoiceId: inv.id || null, hostedInvoiceUrl });
+      }
+    }
+
+    // Which of these invoices/subscriptions came from OUR portal's "send invoice"
+    // flow? The invoicing service writes an INVOICE-channel row for each at
+    // creation time — its presence is the reliable "portal-created" signal. We use
+    // it to (a) label the charge as an Online Invoice and (b) drop the empty
+    // placeholder so there is exactly ONE row per payment.
+    const invIds = Array.from(new Set(Array.from(byPI.values()).map((m) => m.invoiceId).filter((x): x is string => !!x)));
+    const subIds = Array.from(new Set(Array.from(byPI.values()).map((m) => m.subscriptionId).filter((x): x is string => !!x)));
+    const portalByInvoice = new Map<string, string>(); // invoiceId → staff-picked category
+    const portalBySub = new Map<string, string>(); // subscriptionId → staff-picked category
+    if (invIds.length || subIds.length) {
+      const invoiceRows = await this.prisma.paymentRecord.findMany({
+        where: {
+          channel: 'INVOICE' as any,
+          OR: [
+            ...(invIds.length ? [{ stripeInvoiceId: { in: invIds } }] : []),
+            ...(subIds.length ? [{ stripeSubscriptionId: { in: subIds } }] : []),
+          ],
+        },
+        select: { stripeInvoiceId: true, stripeSubscriptionId: true, category: true },
+      });
+      for (const r of invoiceRows) {
+        if (r.stripeInvoiceId) portalByInvoice.set(r.stripeInvoiceId, r.category as any);
+        if (r.stripeSubscriptionId) portalBySub.set(r.stripeSubscriptionId, r.category as any);
       }
     }
 
@@ -255,7 +300,7 @@ export class PaymentSyncService implements OnModuleInit {
       try {
         const rec = await this.prisma.paymentRecord.findUnique({
           where: { stripePaymentIntentId: pi.id },
-          select: { id: true },
+          select: { id: true, channel: true },
         });
         if (!rec) continue;
 
@@ -272,15 +317,70 @@ export class PaymentSyncService implements OnModuleInit {
         });
         lineCount += match.lines.length;
 
-        await this.prisma.paymentRecord.update({
-          where: { id: rec.id },
-          data: {
-            category: this.guessCategory(match.lines.map((l) => l.description)) as any,
-            billing: (match.isSubscription ? 'SUBSCRIPTION' : 'ONE_TIME') as any,
-            stripeSubscriptionId: match.subscriptionId ?? undefined,
-            hostedInvoiceUrl: match.hostedInvoiceUrl ?? undefined,
-          },
-        });
+        // The description always carries the item names.
+        const itemDesc = match.lines.map((l) => l.description).filter(Boolean).join(', ') || undefined;
+
+        // Portal "send invoice" payment? Then this charge IS the Online Invoice
+        // (channel INVOICE). Promote this real charge row to the single canonical
+        // record and delete the empty PENDING placeholder the invoicing service
+        // wrote at creation time.
+        const portalCategory =
+          (match.invoiceId && portalByInvoice.get(match.invoiceId)) ||
+          (match.subscriptionId && portalBySub.get(match.subscriptionId)) ||
+          null;
+        const isPortalInvoice = !!portalCategory;
+
+        if (isPortalInvoice) {
+          // Free the unique invoiceId held by the placeholder before we claim it.
+          await this.prisma.paymentRecord.deleteMany({
+            where: {
+              id: { not: rec.id },
+              channel: 'INVOICE' as any,
+              stripePaymentIntentId: null,
+              OR: [
+                ...(match.invoiceId ? [{ stripeInvoiceId: match.invoiceId }] : []),
+                ...(match.subscriptionId
+                  ? [{ stripeSubscriptionId: match.subscriptionId, stripeInvoiceId: null }]
+                  : []),
+              ],
+            },
+          });
+          await this.prisma.paymentRecord.update({
+            where: { id: rec.id },
+            data: {
+              channel: 'INVOICE' as any,
+              category: portalCategory as any,
+              billing: (match.isSubscription ? 'SUBSCRIPTION' : 'ONE_TIME') as any,
+              stripeSubscriptionId: match.subscriptionId ?? undefined,
+              stripeInvoiceId: match.invoiceId ?? undefined,
+              hostedInvoiceUrl: match.hostedInvoiceUrl ?? undefined,
+              description: itemDesc,
+            },
+          });
+        } else if (rec.channel === 'IMPORTED') {
+          // Imported from Stripe: refine its guessed category/billing from the
+          // invoice, and set the item-name description.
+          await this.prisma.paymentRecord.update({
+            where: { id: rec.id },
+            data: {
+              category: this.guessCategory(match.lines.map((l) => l.description)) as any,
+              billing: (match.isSubscription ? 'SUBSCRIPTION' : 'ONE_TIME') as any,
+              stripeSubscriptionId: match.subscriptionId ?? undefined,
+              hostedInvoiceUrl: match.hostedInvoiceUrl ?? undefined,
+              description: itemDesc,
+            },
+          });
+        } else {
+          // App-created (PLATFORM / POS / etc.): KEEP its type. Only enrich the
+          // description with item names + the invoice link.
+          await this.prisma.paymentRecord.update({
+            where: { id: rec.id },
+            data: {
+              hostedInvoiceUrl: match.hostedInvoiceUrl ?? undefined,
+              description: itemDesc,
+            },
+          });
+        }
       } catch (e: any) {
         this.logger.warn(`[sync] line-item write failed for ${pi.id}: ${e?.message}`);
       }

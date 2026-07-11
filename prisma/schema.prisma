@@ -998,6 +998,7 @@ enum PaymentChannel {
   PLATFORM // website checkout
   POS      // in-person Stripe Terminal
   INVOICE  // emailed Stripe invoice
+  IMPORTED // pulled from Stripe by the sync; never originated in our app
 }
 
 enum PaymentCategory {

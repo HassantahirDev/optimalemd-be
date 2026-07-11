@@ -71,6 +71,19 @@ export class PaymentsController {
     return this.portal.listInvoices();
   }
 
+  @Post('subscriptions/:id/cancel')
+  cancelSubscription(
+    @Param('id') id: string,
+    @Body() body: { immediate?: boolean },
+  ) {
+    return this.portal.cancelSubscription(id, !!body?.immediate);
+  }
+
+  @Post('subscriptions/:id/reactivate')
+  reactivateSubscription(@Param('id') id: string) {
+    return this.portal.reactivateSubscription(id);
+  }
+
   @Get('patients/search')
   searchPatients(@Query('q') q: string) {
     return this.portal.searchPatients(q || '');

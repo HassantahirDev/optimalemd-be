@@ -1,4 +1,10 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  Logger,
+  NotFoundException,
+  OnModuleInit,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import Stripe from 'stripe';
 import { PrismaService } from '../prisma/prisma.service';
@@ -248,25 +254,23 @@ export class PaymentsPortalService implements OnModuleInit {
   // Headline KPIs — computed from the SYNCED DB (fast). Numbers stay aligned to
   // Stripe because the sync mirrors Stripe's dashboard status buckets.
   private async computeOverview() {
-    // Exclude INVOICE-channel records: those are the invoice view; the actual
-    // money is captured as its transaction (charge/PI), so counting invoices too
-    // would double-count.
-    const notInvoice = { channel: { not: 'INVOICE' as any } };
+    // All channels count — the sync dedupes every payment to a single row (an
+    // online invoice's charge is ONE record, not an invoice + a charge), so there
+    // is no double-counting to guard against.
     const [byStatus, byCategory, byChannel, capturedAgg, refundAgg] = await Promise.all([
-      this.prisma.paymentRecord.groupBy({ by: ['status'], where: notInvoice, _count: { _all: true } } as any),
+      this.prisma.paymentRecord.groupBy({ by: ['status'], _count: { _all: true } } as any),
       this.prisma.paymentRecord.groupBy({
         by: ['category'],
-        where: notInvoice,
         _count: { _all: true },
         _sum: { amount: true },
       } as any),
-      this.prisma.paymentRecord.groupBy({ by: ['channel'], where: notInvoice, _count: { _all: true } } as any),
+      this.prisma.paymentRecord.groupBy({ by: ['channel'], _count: { _all: true } } as any),
       this.prisma.paymentRecord.aggregate({
-        where: { status: { in: ['SUCCEEDED', 'REFUNDED', 'DISPUTED'] as any }, ...notInvoice },
+        where: { status: { in: ['SUCCEEDED', 'REFUNDED', 'DISPUTED'] as any } },
         _sum: { amount: true },
       }),
       this.prisma.paymentRecord.aggregate({
-        where: { status: 'REFUNDED' as any, ...notInvoice },
+        where: { status: 'REFUNDED' as any },
         _sum: { refundedAmount: true },
       }),
     ]);
@@ -326,10 +330,10 @@ export class PaymentsPortalService implements OnModuleInit {
     const pageSize = Math.min(100, Math.max(1, Number(params.pageSize) || 25));
 
     const where: any = {};
-    // Transactions = actual charges. Invoice records live in the Invoices tab;
-    // only surface them here if the user explicitly filters channel=INVOICE.
+    // One unified feed: platform self-checkout, in-clinic POS, AND online (staff)
+    // invoices all live here. Payments are deduped to one row each by the sync, so
+    // nothing double-counts. Filter by channel only when explicitly requested.
     if (params.channel) where.channel = params.channel;
-    else where.channel = { not: 'INVOICE' };
     if (params.category) where.category = params.category;
     if (params.status) where.status = params.status;
     if (params.search) {
@@ -660,7 +664,12 @@ export class PaymentsPortalService implements OnModuleInit {
         // NOTE: expand only to price (data.items.data.price = 4 levels, the max).
         // Product names are resolved separately via a cache.
         const list = await cust.client.subscriptions
-          .list({ customer: cust.id, status: 'all', limit: 100, expand: ['data.items.data.price'] })
+          .list({
+            customer: cust.id,
+            status: 'all',
+            limit: 100,
+            expand: ['data.items.data.price', 'data.latest_invoice'],
+          })
           .autoPagingToArray({ limit: 100 });
         for (const sub of list as any[]) {
           if (!sub.id || seen.has(sub.id)) continue;
@@ -682,25 +691,45 @@ export class PaymentsPortalService implements OnModuleInit {
             }),
           );
           const amount = items.reduce((s: number, i: any) => s + i.unitAmount * i.quantity, 0);
+
+          // A send-invoice subscription reports `active` in Stripe even while its
+          // first (or a renewal) invoice is still unpaid. Cross-check the latest
+          // invoice so we don't show "Active" for something that was never paid.
+          const li: any = sub.latest_invoice && typeof sub.latest_invoice === 'object' ? sub.latest_invoice : null;
+          const invoiceUnpaid =
+            !!li &&
+            li.status !== 'paid' &&
+            li.status !== 'void' &&
+            Number(li.amount_remaining ?? li.amount_due ?? 0) > 0;
+
+          let status: string =
+            sub.status === 'active' || sub.status === 'trialing'
+              ? 'ACTIVE'
+              : sub.status === 'canceled'
+              ? 'CANCELLED'
+              : sub.status === 'past_due' || sub.status === 'unpaid'
+              ? 'PAST_DUE'
+              : sub.status === 'incomplete' || sub.status === 'incomplete_expired'
+              ? 'INCOMPLETE'
+              : (sub.status || 'ACTIVE').toUpperCase();
+          // Honest state: created/active but the invoice hasn't actually been paid.
+          if (status === 'ACTIVE' && invoiceUnpaid) status = 'UNPAID';
+
           out.push({
             id: sub.id,
             createdAt: new Date(sub.created * 1000).toISOString(),
-            status:
-              sub.status === 'active' || sub.status === 'trialing'
-                ? 'ACTIVE'
-                : sub.status === 'canceled'
-                ? 'CANCELLED'
-                : sub.status === 'past_due' || sub.status === 'unpaid'
-                ? 'PAST_DUE'
-                : sub.status === 'incomplete' || sub.status === 'incomplete_expired'
-                ? 'INCOMPLETE'
-                : (sub.status || 'ACTIVE').toUpperCase(),
+            status,
             stripeStatus: sub.status,
             amount,
             currency: sub.currency,
             interval: items[0]?.interval || 'month',
             currentPeriodEnd: sub.current_period_end ? new Date(sub.current_period_end * 1000).toISOString() : null,
             cancelAtPeriodEnd: !!sub.cancel_at_period_end,
+            invoiceUnpaid,
+            invoiceStatus: li?.status || null,
+            hostedInvoiceUrl: li?.hosted_invoice_url || null,
+            // The UI shows actions only when we can actually manage it in Stripe.
+            canManage: sub.status !== 'canceled' && sub.status !== 'incomplete_expired',
             products: items.map((i: any) => i.name),
             items,
           });
@@ -711,6 +740,56 @@ export class PaymentsPortalService implements OnModuleInit {
     }
     out.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
     return out;
+  }
+
+  // Find which Stripe account owns a subscription (main vs POS), so we can manage
+  // it without the caller needing to know the account.
+  private async findSubscriptionAcct(id: string) {
+    for (const acct of this.stripeAccounts) {
+      try {
+        const sub = await acct.client.subscriptions.retrieve(id);
+        if (sub) return { client: acct.client, sub };
+      } catch {
+        /* not on this account — try the next */
+      }
+    }
+    return null;
+  }
+
+  // Cancel a subscription. Default is graceful (stops at period end, reversible);
+  // `immediate` ends it now — used for never-paid (incomplete/unpaid) ones.
+  async cancelSubscription(id: string, immediate = false) {
+    const found = await this.findSubscriptionAcct(id);
+    if (!found) throw new NotFoundException('Subscription not found in Stripe');
+    if (found.sub.status === 'canceled') {
+      return { id, status: 'canceled', cancelAtPeriodEnd: false, alreadyCanceled: true };
+    }
+    const updated = immediate
+      ? await found.client.subscriptions.cancel(id)
+      : await found.client.subscriptions.update(id, { cancel_at_period_end: true });
+    return {
+      id: updated.id,
+      status: updated.status,
+      cancelAtPeriodEnd: updated.cancel_at_period_end,
+      canceledAt: updated.canceled_at ? new Date(updated.canceled_at * 1000).toISOString() : null,
+    };
+  }
+
+  // Undo a scheduled cancellation (only possible while it hasn't fully ended).
+  async reactivateSubscription(id: string) {
+    const found = await this.findSubscriptionAcct(id);
+    if (!found) throw new NotFoundException('Subscription not found in Stripe');
+    if (found.sub.status === 'canceled') {
+      throw new BadRequestException(
+        'This subscription has already fully canceled and cannot be reactivated — create a new one.',
+      );
+    }
+    const updated = await found.client.subscriptions.update(id, { cancel_at_period_end: false });
+    return {
+      id: updated.id,
+      status: updated.status,
+      cancelAtPeriodEnd: updated.cancel_at_period_end,
+    };
   }
 
   // Read-only: every Stripe invoice for this patient (across accounts), for the
