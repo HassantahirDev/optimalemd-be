@@ -303,6 +303,12 @@ export class InvoicingService {
     }
 
     // Mirror into the ledger immediately (sync/webhook reconciles on payment).
+    // The description carries the product/item names right away — the "Online
+    // Invoice" tag already conveys that it was emailed, so no "Emailed invoice".
+    const itemNames = invoiceLines
+      .map((l: any) => l.description || l.price?.nickname || l.plan?.nickname)
+      .filter(Boolean)
+      .join(', ');
     const paid = stripeStatus === 'paid';
     await this.ledger.upsertFromStripe({
       stripeInvoiceId: invoiceId || null,
@@ -316,7 +322,7 @@ export class InvoicingService {
       currency: 'usd',
       status: paid ? 'SUCCEEDED' : 'PENDING',
       hostedInvoiceUrl,
-      note: input.note || (recurring.length ? 'Subscription invoice' : 'Emailed invoice'),
+      note: itemNames || input.note || (recurring.length ? 'Subscription invoice' : 'Emailed invoice'),
       createdByType: 'payment_user',
       paidAt: paid ? new Date() : null,
       lineItems: invoiceLines.map((l: any) => ({
