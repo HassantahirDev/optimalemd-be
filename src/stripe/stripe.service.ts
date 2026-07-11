@@ -604,7 +604,7 @@ export class StripeService {
           save_default_payment_method: 'on_subscription',
           payment_method_types: ['card'],
         },
-        expand: ['latest_invoice.payment_intent'],
+        expand: ['latest_invoice.confirmation_secret'],
         description: `Premium Subscription – ${`${user.firstName || ''} ${user.lastName || ''}`.trim()}`,
         metadata: {
           userId: user.id,
@@ -620,119 +620,64 @@ export class StripeService {
       );
     }
 
-    // Extract payment intent from the expanded invoice
+    // The invoice's OWN payment. The clover API exposes it as
+    // invoice.confirmation_secret (invoice.payment_intent was removed). We rely on
+    // this SINGLE payment intent and NEVER create another one, so the customer can
+    // never be charged twice for one subscription.
     const invoiceRaw = subscription.latest_invoice;
-    let paymentIntent: Stripe.PaymentIntent | null = null;
-    let clientSecret: string | null = null;
-    
-    const invoiceId = typeof invoiceRaw === 'string' ? invoiceRaw : (invoiceRaw as Stripe.Invoice)?.id;
+    const invoiceId =
+      typeof invoiceRaw === 'string' ? invoiceRaw : (invoiceRaw as Stripe.Invoice)?.id;
     console.log(`📋 Processing subscription ${subscription.id} - Invoice: ${invoiceId}`);
 
-    // Handle case where invoice is an object (expanded)
-    if (invoiceRaw && typeof invoiceRaw === 'object' && 'id' in invoiceRaw) {
-      const invoice = invoiceRaw as Stripe.Invoice;
-      
-      // Check if payment_intent is directly on invoice
-      if ('payment_intent' in invoice && invoice.payment_intent) {
-        if (typeof invoice.payment_intent === 'object') {
-          paymentIntent = invoice.payment_intent as Stripe.PaymentIntent;
-          clientSecret = paymentIntent.client_secret || null;
-          console.log(`✅ Found payment intent in expanded invoice: ${paymentIntent.id}`);
-        } else if (typeof invoice.payment_intent === 'string') {
-          // Payment intent is an ID string, need to retrieve it
-          try {
-            paymentIntent = await this.stripe.paymentIntents.retrieve(invoice.payment_intent);
-            clientSecret = paymentIntent.client_secret || null;
-            console.log(`✅ Retrieved payment intent: ${paymentIntent.id}`);
-          } catch (error: any) {
-            console.error(`❌ Failed to retrieve payment intent: ${error.message}`);
-          }
-        }
-      }
-    }
+    let clientSecret: string | null =
+      invoiceRaw && typeof invoiceRaw === 'object'
+        ? ((invoiceRaw as any).confirmation_secret?.client_secret ?? null)
+        : null;
 
-    // If still no client secret, retrieve invoice separately
+    // Fallback: re-fetch the invoice with its confirmation secret expanded.
     if (!clientSecret && invoiceId) {
       try {
-        console.log(`🔍 Retrieving invoice ${invoiceId} to find payment intent...`);
-        const fullInvoice = await this.stripe.invoices.retrieve(invoiceId, {
-          expand: ['payment_intent'],
-        }) as Stripe.Invoice & { payment_intent?: Stripe.PaymentIntent | string };
-        
-        if (fullInvoice.payment_intent) {
-          if (typeof fullInvoice.payment_intent === 'object') {
-            paymentIntent = fullInvoice.payment_intent as Stripe.PaymentIntent;
-            clientSecret = paymentIntent.client_secret || null;
-            console.log(`✅ Found payment intent in invoice: ${paymentIntent.id}`);
-          } else if (typeof fullInvoice.payment_intent === 'string') {
-            // Payment intent is an ID, retrieve it
-            paymentIntent = await this.stripe.paymentIntents.retrieve(fullInvoice.payment_intent);
-            clientSecret = paymentIntent.client_secret || null;
-            console.log(`✅ Retrieved payment intent from invoice: ${paymentIntent.id}`);
-          }
-        } else {
-          console.log(`⚠️  Invoice ${invoiceId} has no payment intent attached`);
-        }
+        const fullInvoice = (await this.stripe.invoices.retrieve(invoiceId, {
+          expand: ['confirmation_secret'],
+        })) as any;
+        clientSecret = fullInvoice.confirmation_secret?.client_secret ?? null;
       } catch (error: any) {
-        console.error(`❌ Failed to retrieve invoice: ${error.message}`);
-      }
-    }
-
-    // If still no client secret, create payment intent manually for the invoice
-    if (!clientSecret && invoiceId) {
-      try {
-        console.log(`💰 Creating payment intent manually for invoice ${invoiceId}...`);
-        
-        // Retrieve invoice to get amount and customer
-        const invoiceForPayment = await this.stripe.invoices.retrieve(invoiceId);
-        const amountDue = invoiceForPayment.amount_due / 100; // Convert from cents to dollars
-        
-        if (!invoiceForPayment.amount_due || invoiceForPayment.amount_due === 0) {
-          throw new BadRequestException('Invoice has no amount due');
-        }
-        
-        // Create payment intent for the invoice
-        const customerId = typeof invoiceForPayment.customer === 'string' 
-          ? invoiceForPayment.customer 
-          : invoiceForPayment.customer?.id;
-          
-        if (!customerId) {
-          throw new BadRequestException('Invoice has no customer');
-        }
-        
-        const patientFullName = `${user.firstName || ''} ${user.lastName || ''}`.trim();
-        const patientEmail = user.primaryEmail || user.email || '';
-        paymentIntent = await this.stripe.paymentIntents.create({
-          amount: invoiceForPayment.amount_due,
-          currency: invoiceForPayment.currency || 'usd',
-          customer: customerId,
-          description: `Premium Subscription | Patient: ${patientFullName}`,
-          receipt_email: patientEmail,
-          metadata: {
-            invoiceId: invoiceId,
-            subscriptionId: subscription.id,
-            userId: user.id,
-            patientName: patientFullName,
-            patientEmail,
-            type: 'premium_subscription',
-          },
-          setup_future_usage: 'off_session',
-        });
-        
-        clientSecret = paymentIntent.client_secret || null;
-        console.log(`✅ Created payment intent ${paymentIntent.id} for $${amountDue.toFixed(2)}`);
-        
-      } catch (error: any) {
-        console.error(`❌ Failed to create payment intent: ${error.message}`);
-        throw new BadRequestException(
-          `Failed to create payment intent: ${error.message}`
-        );
+        console.error(`❌ Failed to retrieve invoice confirmation secret: ${error.message}`);
       }
     }
 
     if (!clientSecret) {
-      console.error(`❌ Failed to generate payment client secret for subscription ${subscription.id}`);
-      throw new BadRequestException('Failed to generate payment client secret for subscription');
+      // Fail loudly rather than fall back to creating a second payment intent —
+      // that fallback is exactly what double-charged customers.
+      console.error(`❌ No confirmation secret for subscription ${subscription.id}`);
+      throw new BadRequestException(
+        'Failed to obtain the subscription payment secret from Stripe',
+      );
+    }
+
+    // The confirmation secret is a PaymentIntent client secret (pi_..._secret_...).
+    const paymentIntentId = clientSecret.startsWith('pi_')
+      ? clientSecret.split('_secret_')[0]
+      : null;
+
+    // Tag the invoice's payment intent with our metadata so confirm-payment can
+    // verify ownership and resolve the subscription (a native invoice PI does not
+    // carry our metadata otherwise).
+    if (paymentIntentId) {
+      try {
+        await this.stripe.paymentIntents.update(paymentIntentId, {
+          metadata: {
+            invoiceId: invoiceId || '',
+            subscriptionId: subscription.id,
+            userId: user.id,
+            patientName: `${user.firstName || ''} ${user.lastName || ''}`.trim(),
+            patientEmail: user.primaryEmail || user.email || '',
+            type: 'premium_subscription',
+          },
+        });
+      } catch (metaErr: any) {
+        console.error(`Failed to tag subscription PI metadata: ${metaErr.message}`);
+      }
     }
 
     // Update user subscription status
@@ -760,7 +705,7 @@ export class StripeService {
     return {
       subscriptionId: subscription.id,
       clientSecret: clientSecret,
-      paymentIntentId: paymentIntent?.id,
+      paymentIntentId: paymentIntentId ?? undefined,
       status: subscription.status,
     };
   }
@@ -913,6 +858,53 @@ export class StripeService {
     });
 
     console.log(`✅ User subscription updated successfully in database`);
+
+    // Write the premium payment into the unified ledger IMMEDIATELY, so it shows
+    // in the payments platform right away — not only after a webhook/sync. This is
+    // idempotent on the payment-intent id, so the webhook (which also writes the
+    // old SubscriptionTransaction table) and the sync later update the SAME row —
+    // no duplicate, and the sync won't relabel it IMPORTED because the type is set.
+    try {
+      let cardBrand: string | null = null;
+      let cardLast4: string | null = null;
+      const chargeId =
+        typeof paymentIntent.latest_charge === 'string'
+          ? paymentIntent.latest_charge
+          : (paymentIntent.latest_charge as any)?.id;
+      if (chargeId) {
+        try {
+          const charge = await this.stripe.charges.retrieve(chargeId);
+          cardBrand = charge.payment_method_details?.card?.brand ?? null;
+          cardLast4 = charge.payment_method_details?.card?.last4 ?? null;
+        } catch {
+          /* card details are non-critical; the sync fills them later */
+        }
+      }
+      await this.paymentLedger.upsertFromStripe({
+        stripePaymentIntentId: paymentIntentId,
+        stripeInvoiceId: invoiceId || null,
+        stripeSubscriptionId: subscriptionId,
+        stripeCustomerId:
+          typeof paymentIntent.customer === 'string'
+            ? paymentIntent.customer
+            : (paymentIntent.customer as any)?.id ?? null,
+        userId,
+        channel: 'PLATFORM',
+        category: 'MEMBERSHIP',
+        billing: 'SUBSCRIPTION',
+        amount: paymentIntent.amount / 100,
+        currency: paymentIntent.currency || 'usd',
+        status: 'SUCCEEDED',
+        cardBrand,
+        cardLast4,
+        note: 'Premium membership subscription',
+        paidAt: new Date(),
+        createdByType: 'patient',
+      });
+      console.log(`🧾 [LEDGER] Premium subscription payment written for user ${userId}`);
+    } catch (ledgerErr: any) {
+      console.error('[ledger] premium confirm dual-write failed:', ledgerErr.message);
+    }
 
     // Send subscription confirmation email
     try {
