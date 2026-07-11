@@ -692,6 +692,20 @@ export class PaymentsPortalService implements OnModuleInit {
           );
           const amount = items.reduce((s: number, i: any) => s + i.unitAmount * i.quantity, 0);
 
+          // In the clover API `current_period_end` moved onto the subscription
+          // items; fall back through the possible locations so "Renews/Cancels
+          // {date}" always has a value.
+          const periodEndEpoch =
+            sub.current_period_end ??
+            sub.items?.data?.[0]?.current_period_end ??
+            (sub.latest_invoice && typeof sub.latest_invoice === 'object'
+              ? (sub.latest_invoice as any).period_end
+              : null) ??
+            null;
+          // When set to cancel at period end, Stripe fills `cancel_at` with the
+          // exact stop date — use it for the "Cancels {date}" label.
+          const cancelAtEpoch = sub.cancel_at ?? (sub.cancel_at_period_end ? periodEndEpoch : null);
+
           // A send-invoice subscription reports `active` in Stripe even while its
           // first (or a renewal) invoice is still unpaid. Cross-check the latest
           // invoice so we don't show "Active" for something that was never paid.
@@ -723,7 +737,8 @@ export class PaymentsPortalService implements OnModuleInit {
             amount,
             currency: sub.currency,
             interval: items[0]?.interval || 'month',
-            currentPeriodEnd: sub.current_period_end ? new Date(sub.current_period_end * 1000).toISOString() : null,
+            currentPeriodEnd: periodEndEpoch ? new Date(periodEndEpoch * 1000).toISOString() : null,
+            cancelAt: cancelAtEpoch ? new Date(cancelAtEpoch * 1000).toISOString() : null,
             cancelAtPeriodEnd: !!sub.cancel_at_period_end,
             invoiceUnpaid,
             invoiceStatus: li?.status || null,
