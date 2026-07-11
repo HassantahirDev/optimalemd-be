@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import Stripe from 'stripe';
 import { PrismaService } from '../prisma/prisma.service';
 import { MedicationsCombinedService } from './medications-combined.service';
+import { PaymentFlowsCombinedService } from './payment-flows-combined.service';
 
 const STATUS_MAP: Record<string, string> = {
   succeeded: 'SUCCEEDED',
@@ -37,6 +38,7 @@ export class PaymentsPortalService implements OnModuleInit {
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
     private readonly medsCombined: MedicationsCombinedService,
+    private readonly flowsCombined: PaymentFlowsCombinedService,
   ) {
     const mainKey = this.configService.get<string>('STRIPE_SECRET_KEY');
     const posKey = this.configService.get<string>('STRIPE_POS_SECRET_KEY');
@@ -513,6 +515,7 @@ export class PaymentsPortalService implements OnModuleInit {
         invoices: [],
         lifetimePaid: 0,
         combinedMedications: combinedMeds,
+        paymentFlows: { appointments: [], signup: [], membership: [] },
       };
     }
 
@@ -583,6 +586,20 @@ export class PaymentsPortalService implements OnModuleInit {
           category: r.category === 'OTHER' ? null : r.category,
         }));
 
+    // Old payment flows (appointment consult, signup order, premium membership)
+    // read from their own source tables — deduped against the synced ledger by
+    // Stripe payment-intent so a charge is never shown or counted twice.
+    const ledgerIntentIds = new Set(
+      txnRecords
+        .map((r) => r.stripePaymentIntentId)
+        .filter((id): id is string => !!id),
+    );
+    const paymentFlows = await this.flowsCombined.getCombined(
+      userId,
+      emails,
+      ledgerIntentIds,
+    );
+
     return {
       user,
       payments,
@@ -590,6 +607,7 @@ export class PaymentsPortalService implements OnModuleInit {
       invoices: invoicesOut,
       lifetimePaid: Math.round(lifetimePaid * 100) / 100,
       combinedMedications: combinedMeds,
+      paymentFlows,
     };
   }
 

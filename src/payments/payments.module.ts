@@ -5,6 +5,7 @@ import { PaymentsPortalService } from './payments-portal.service';
 import { PaymentSyncService } from './payment-sync.service';
 import { InvoicingService } from './invoicing.service';
 import { MedicationsCombinedService } from './medications-combined.service';
+import { PaymentFlowsCombinedService } from './payment-flows-combined.service';
 import { PaymentsController } from './payments.controller';
 import { MedicationsController } from './medications.controller';
 
@@ -21,6 +22,7 @@ import { MedicationsController } from './medications.controller';
     PaymentSyncService,
     InvoicingService,
     MedicationsCombinedService,
+    PaymentFlowsCombinedService,
   ],
   exports: [PaymentLedgerService],
 })
