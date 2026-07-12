@@ -8,6 +8,7 @@ import { MedicationsCombinedService } from './medications-combined.service';
 import { PaymentFlowsCombinedService } from './payment-flows-combined.service';
 import { PaymentsController } from './payments.controller';
 import { MedicationsController } from './medications.controller';
+import { MeBillingController } from './me-billing.controller';
 
 // Part A foundation + Part F portal reads. Exports the dual-write helper so
 // existing success points (Stripe premium/medication, signup, appointments) and
@@ -15,7 +16,7 @@ import { MedicationsController } from './medications.controller';
 // The PaymentsController is gated to payment-portal users only.
 @Module({
   imports: [PrismaModule],
-  controllers: [PaymentsController, MedicationsController],
+  controllers: [PaymentsController, MedicationsController, MeBillingController],
   providers: [
     PaymentLedgerService,
     PaymentsPortalService,
