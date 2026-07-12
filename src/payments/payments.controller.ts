@@ -1,9 +1,15 @@
-import { Body, Controller, Get, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { PaymentUserGuard } from '../auth/guards/payment-user.guard';
 import { PaymentsPortalService } from './payments-portal.service';
 import { PaymentSyncService } from './payment-sync.service';
 import { CreateInvoiceInput, InvoicingService } from './invoicing.service';
+import {
+  ChangePriceInput,
+  CreateProductInput,
+  ProductsService,
+  UpdateProductInput,
+} from './products.service';
 
 /**
  * Payments portal API (payments.formamd.com). EVERY route is gated by
@@ -17,6 +23,7 @@ export class PaymentsController {
     private readonly portal: PaymentsPortalService,
     private readonly invoicing: InvoicingService,
     private readonly sync: PaymentSyncService,
+    private readonly products: ProductsService,
   ) {}
 
   @Post('sync')
@@ -108,5 +115,36 @@ export class PaymentsController {
   @Post('invoices/send')
   sendInvoice(@Body() body: CreateInvoiceInput) {
     return this.invoicing.createInvoice(body);
+  }
+
+  // --- Products: Stripe-backed catalog with ledger-derived sales stats ---
+  @Get('products')
+  listProducts() {
+    return this.products.list();
+  }
+
+  @Post('products')
+  createProduct(@Body() body: CreateProductInput) {
+    return this.products.create(body);
+  }
+
+  @Patch('products/:id')
+  updateProduct(@Param('id') id: string, @Body() body: UpdateProductInput) {
+    return this.products.update(id, body);
+  }
+
+  @Post('products/:id/price')
+  changeProductPrice(@Param('id') id: string, @Body() body: ChangePriceInput) {
+    return this.products.changePrice(id, body);
+  }
+
+  @Post('products/:id/archive')
+  archiveProduct(@Param('id') id: string) {
+    return this.products.setArchived(id, true);
+  }
+
+  @Post('products/:id/activate')
+  activateProduct(@Param('id') id: string) {
+    return this.products.setArchived(id, false);
   }
 }
