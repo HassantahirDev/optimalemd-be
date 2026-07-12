@@ -581,7 +581,7 @@ export class StripeService {
           save_default_payment_method: 'on_subscription',
           payment_method_types: ['card'],
         },
-        expand: ['latest_invoice.payment_intent'],
+        expand: ['latest_invoice.confirmation_secret'],
         description: `Premium Subscription – ${`${user.firstName || ''} ${user.lastName || ''}`.trim()}`,
         metadata: {
           userId: user.id,
@@ -597,119 +597,64 @@ export class StripeService {
       );
     }
 
-    // Extract payment intent from the expanded invoice
+    // The invoice's OWN payment. The clover API exposes it as
+    // invoice.confirmation_secret (invoice.payment_intent was removed). We rely on
+    // this SINGLE payment intent and NEVER create another one, so the customer can
+    // never be charged twice for one subscription.
     const invoiceRaw = subscription.latest_invoice;
-    let paymentIntent: Stripe.PaymentIntent | null = null;
-    let clientSecret: string | null = null;
-    
-    const invoiceId = typeof invoiceRaw === 'string' ? invoiceRaw : (invoiceRaw as Stripe.Invoice)?.id;
+    const invoiceId =
+      typeof invoiceRaw === 'string' ? invoiceRaw : (invoiceRaw as Stripe.Invoice)?.id;
     console.log(`📋 Processing subscription ${subscription.id} - Invoice: ${invoiceId}`);
 
-    // Handle case where invoice is an object (expanded)
-    if (invoiceRaw && typeof invoiceRaw === 'object' && 'id' in invoiceRaw) {
-      const invoice = invoiceRaw as Stripe.Invoice;
-      
-      // Check if payment_intent is directly on invoice
-      if ('payment_intent' in invoice && invoice.payment_intent) {
-        if (typeof invoice.payment_intent === 'object') {
-          paymentIntent = invoice.payment_intent as Stripe.PaymentIntent;
-          clientSecret = paymentIntent.client_secret || null;
-          console.log(`✅ Found payment intent in expanded invoice: ${paymentIntent.id}`);
-        } else if (typeof invoice.payment_intent === 'string') {
-          // Payment intent is an ID string, need to retrieve it
-          try {
-            paymentIntent = await this.stripe.paymentIntents.retrieve(invoice.payment_intent);
-            clientSecret = paymentIntent.client_secret || null;
-            console.log(`✅ Retrieved payment intent: ${paymentIntent.id}`);
-          } catch (error: any) {
-            console.error(`❌ Failed to retrieve payment intent: ${error.message}`);
-          }
-        }
-      }
-    }
+    let clientSecret: string | null =
+      invoiceRaw && typeof invoiceRaw === 'object'
+        ? ((invoiceRaw as any).confirmation_secret?.client_secret ?? null)
+        : null;
 
-    // If still no client secret, retrieve invoice separately
+    // Fallback: re-fetch the invoice with its confirmation secret expanded.
     if (!clientSecret && invoiceId) {
       try {
-        console.log(`🔍 Retrieving invoice ${invoiceId} to find payment intent...`);
-        const fullInvoice = await this.stripe.invoices.retrieve(invoiceId, {
-          expand: ['payment_intent'],
-        }) as Stripe.Invoice & { payment_intent?: Stripe.PaymentIntent | string };
-        
-        if (fullInvoice.payment_intent) {
-          if (typeof fullInvoice.payment_intent === 'object') {
-            paymentIntent = fullInvoice.payment_intent as Stripe.PaymentIntent;
-            clientSecret = paymentIntent.client_secret || null;
-            console.log(`✅ Found payment intent in invoice: ${paymentIntent.id}`);
-          } else if (typeof fullInvoice.payment_intent === 'string') {
-            // Payment intent is an ID, retrieve it
-            paymentIntent = await this.stripe.paymentIntents.retrieve(fullInvoice.payment_intent);
-            clientSecret = paymentIntent.client_secret || null;
-            console.log(`✅ Retrieved payment intent from invoice: ${paymentIntent.id}`);
-          }
-        } else {
-          console.log(`⚠️  Invoice ${invoiceId} has no payment intent attached`);
-        }
+        const fullInvoice = (await this.stripe.invoices.retrieve(invoiceId, {
+          expand: ['confirmation_secret'],
+        })) as any;
+        clientSecret = fullInvoice.confirmation_secret?.client_secret ?? null;
       } catch (error: any) {
-        console.error(`❌ Failed to retrieve invoice: ${error.message}`);
-      }
-    }
-
-    // If still no client secret, create payment intent manually for the invoice
-    if (!clientSecret && invoiceId) {
-      try {
-        console.log(`💰 Creating payment intent manually for invoice ${invoiceId}...`);
-        
-        // Retrieve invoice to get amount and customer
-        const invoiceForPayment = await this.stripe.invoices.retrieve(invoiceId);
-        const amountDue = invoiceForPayment.amount_due / 100; // Convert from cents to dollars
-        
-        if (!invoiceForPayment.amount_due || invoiceForPayment.amount_due === 0) {
-          throw new BadRequestException('Invoice has no amount due');
-        }
-        
-        // Create payment intent for the invoice
-        const customerId = typeof invoiceForPayment.customer === 'string' 
-          ? invoiceForPayment.customer 
-          : invoiceForPayment.customer?.id;
-          
-        if (!customerId) {
-          throw new BadRequestException('Invoice has no customer');
-        }
-        
-        const patientFullName = `${user.firstName || ''} ${user.lastName || ''}`.trim();
-        const patientEmail = user.primaryEmail || user.email || '';
-        paymentIntent = await this.stripe.paymentIntents.create({
-          amount: invoiceForPayment.amount_due,
-          currency: invoiceForPayment.currency || 'usd',
-          customer: customerId,
-          description: `Premium Subscription | Patient: ${patientFullName}`,
-          receipt_email: patientEmail,
-          metadata: {
-            invoiceId: invoiceId,
-            subscriptionId: subscription.id,
-            userId: user.id,
-            patientName: patientFullName,
-            patientEmail,
-            type: 'premium_subscription',
-          },
-          setup_future_usage: 'off_session',
-        });
-        
-        clientSecret = paymentIntent.client_secret || null;
-        console.log(`✅ Created payment intent ${paymentIntent.id} for $${amountDue.toFixed(2)}`);
-        
-      } catch (error: any) {
-        console.error(`❌ Failed to create payment intent: ${error.message}`);
-        throw new BadRequestException(
-          `Failed to create payment intent: ${error.message}`
-        );
+        console.error(`❌ Failed to retrieve invoice confirmation secret: ${error.message}`);
       }
     }
 
     if (!clientSecret) {
-      console.error(`❌ Failed to generate payment client secret for subscription ${subscription.id}`);
-      throw new BadRequestException('Failed to generate payment client secret for subscription');
+      // Fail loudly rather than fall back to creating a second payment intent —
+      // that fallback is exactly what double-charged customers.
+      console.error(`❌ No confirmation secret for subscription ${subscription.id}`);
+      throw new BadRequestException(
+        'Failed to obtain the subscription payment secret from Stripe',
+      );
+    }
+
+    // The confirmation secret is a PaymentIntent client secret (pi_..._secret_...).
+    const paymentIntentId = clientSecret.startsWith('pi_')
+      ? clientSecret.split('_secret_')[0]
+      : null;
+
+    // Tag the invoice's payment intent with our metadata so confirm-payment can
+    // verify ownership and resolve the subscription (a native invoice PI does not
+    // carry our metadata otherwise).
+    if (paymentIntentId) {
+      try {
+        await this.stripe.paymentIntents.update(paymentIntentId, {
+          metadata: {
+            invoiceId: invoiceId || '',
+            subscriptionId: subscription.id,
+            userId: user.id,
+            patientName: `${user.firstName || ''} ${user.lastName || ''}`.trim(),
+            patientEmail: user.primaryEmail || user.email || '',
+            type: 'premium_subscription',
+          },
+        });
+      } catch (metaErr: any) {
+        console.error(`Failed to tag subscription PI metadata: ${metaErr.message}`);
+      }
     }
 
     // Update user subscription status
@@ -737,7 +682,7 @@ export class StripeService {
     return {
       subscriptionId: subscription.id,
       clientSecret: clientSecret,
-      paymentIntentId: paymentIntent?.id,
+      paymentIntentId: paymentIntentId ?? undefined,
       status: subscription.status,
     };
   }
@@ -2509,7 +2454,7 @@ export class StripeService {
             save_default_payment_method: 'on_subscription',
             payment_method_types: ['card'],
           },
-          expand: ['latest_invoice.payment_intent'],
+          expand: ['latest_invoice.confirmation_secret'],
           description: `Monthly Medications – ${patientFullName} | ${medNames.substring(0, 200)}`,
           metadata: {
             appointmentId,
@@ -2570,114 +2515,69 @@ export class StripeService {
       }
     }
 
-    // Extract payment intent from the expanded invoice
+    // The invoice's OWN payment — a single PaymentIntent. The clover API exposes
+    // it via invoice.confirmation_secret (invoice.payment_intent was removed). We
+    // rely ONLY on this and NEVER create a second PI, so a medication subscription
+    // can never double-charge.
     const invoiceRaw = subscription.latest_invoice;
-    let paymentIntent: Stripe.PaymentIntent | null = null;
-    let clientSecret: string | null = null;
-
     const invoiceId = typeof invoiceRaw === 'string' ? invoiceRaw : (invoiceRaw as Stripe.Invoice)?.id;
     console.log(`📋 Processing medication subscription ${subscription.id} - Invoice: ${invoiceId}`);
 
-    // Handle case where invoice is an object (expanded)
-    if (invoiceRaw && typeof invoiceRaw === 'object' && 'id' in invoiceRaw) {
-      const invoice = invoiceRaw as Stripe.Invoice;
-      
-      // Check if payment_intent is directly on invoice
-      if ('payment_intent' in invoice && invoice.payment_intent) {
-        if (typeof invoice.payment_intent === 'object') {
-          paymentIntent = invoice.payment_intent as Stripe.PaymentIntent;
-          clientSecret = paymentIntent.client_secret || null;
-          console.log(`✅ Found payment intent in expanded invoice: ${paymentIntent.id}`);
-        } else if (typeof invoice.payment_intent === 'string') {
-          // Payment intent is an ID string, need to retrieve it
-          try {
-            paymentIntent = await this.stripe.paymentIntents.retrieve(invoice.payment_intent);
-          clientSecret = paymentIntent.client_secret || null;
-            console.log(`✅ Retrieved payment intent: ${paymentIntent.id}`);
-          } catch (error: any) {
-            console.error(`❌ Failed to retrieve payment intent: ${error.message}`);
-          }
-        }
-      }
-    }
+    let clientSecret: string | null =
+      invoiceRaw && typeof invoiceRaw === 'object'
+        ? ((invoiceRaw as any).confirmation_secret?.client_secret ?? null)
+        : null;
 
-    // If still no client secret, retrieve invoice separately
+    // Fallback: re-fetch the invoice with its confirmation secret expanded.
     if (!clientSecret && invoiceId) {
       try {
-        console.log(`🔍 Retrieving invoice ${invoiceId} to find payment intent...`);
-        const fullInvoice = await this.stripe.invoices.retrieve(invoiceId, {
-          expand: ['payment_intent'],
-        }) as Stripe.Invoice & { payment_intent?: Stripe.PaymentIntent | string };
-        
-        if (fullInvoice.payment_intent) {
-          if (typeof fullInvoice.payment_intent === 'object') {
-            paymentIntent = fullInvoice.payment_intent as Stripe.PaymentIntent;
-            clientSecret = paymentIntent.client_secret || null;
-            console.log(`✅ Found payment intent in invoice: ${paymentIntent.id}`);
-          } else if (typeof fullInvoice.payment_intent === 'string') {
-            // Payment intent is an ID, retrieve it
-            paymentIntent = await this.stripe.paymentIntents.retrieve(fullInvoice.payment_intent);
-            clientSecret = paymentIntent.client_secret || null;
-            console.log(`✅ Retrieved payment intent from invoice: ${paymentIntent.id}`);
-          }
-        } else {
-          console.log(`⚠️  Invoice ${invoiceId} has no payment intent attached`);
-        }
+        const fullInvoice = (await this.stripe.invoices.retrieve(invoiceId, {
+          expand: ['confirmation_secret'],
+        })) as any;
+        clientSecret = fullInvoice.confirmation_secret?.client_secret ?? null;
       } catch (error: any) {
-        console.error(`❌ Failed to retrieve invoice: ${error.message}`);
+        console.error(`❌ Failed to retrieve invoice confirmation secret: ${error.message}`);
       }
     }
 
-    // If still no client secret, create payment intent manually for the invoice
-    if (!clientSecret && invoiceId) {
+    if (!clientSecret) {
+      // Fail loudly rather than fall back to creating a second payment intent —
+      // that fallback is exactly what double-charged customers.
+      console.error(`❌ No confirmation secret for medication subscription ${subscription.id}`);
+      throw new BadRequestException(
+        'Failed to obtain the medication subscription payment secret from Stripe',
+      );
+    }
+
+    // The confirmation secret is a PaymentIntent client secret (pi_..._secret_...).
+    const resolvedPaymentIntentId = clientSecret.startsWith('pi_')
+      ? clientSecret.split('_secret_')[0]
+      : null;
+    let paymentIntent: Stripe.PaymentIntent | null = null;
+    if (resolvedPaymentIntentId) {
       try {
-        console.log(`💰 Creating payment intent manually for invoice ${invoiceId}...`);
-        
-        // Retrieve invoice to get amount and customer
-        const invoiceForPayment = await this.stripe.invoices.retrieve(invoiceId);
-        const amountDue = invoiceForPayment.amount_due / 100; // Convert from cents to dollars
-        
-        if (!invoiceForPayment.amount_due || invoiceForPayment.amount_due === 0) {
-          throw new BadRequestException('Invoice has no amount due');
-        }
-        
-        // Create payment intent for the invoice
-        const invoiceCustomerId = typeof invoiceForPayment.customer === 'string' 
-          ? invoiceForPayment.customer 
-          : invoiceForPayment.customer?.id;
-          
-        if (!invoiceCustomerId) {
-          throw new BadRequestException('Invoice has no customer');
-        }
-        
-        paymentIntent = await this.stripe.paymentIntents.create({
-          amount: invoiceForPayment.amount_due,
-          currency: invoiceForPayment.currency || 'usd',
-          customer: invoiceCustomerId,
+        // Tag the invoice's PI with our metadata so confirm can verify + resolve it.
+        paymentIntent = await this.stripe.paymentIntents.update(resolvedPaymentIntentId, {
           metadata: {
-            invoiceId: invoiceId,
+            invoiceId: invoiceId || '',
             subscriptionId: subscription.id,
             appointmentId,
             userId,
             type: 'medication',
           },
-          description: `Payment for medication subscription ${subscription.id}`,
-          setup_future_usage: 'off_session', // Save payment method for future subscription payments
         });
-        
-        clientSecret = paymentIntent.client_secret || null;
-        console.log(`✅ Created payment intent ${paymentIntent.id} for $${amountDue.toFixed(2)}`);
-        
-      } catch (error: any) {
-        console.error(`❌ Failed to create payment intent: ${error.message}`);
-        throw new BadRequestException(
-          `Failed to create payment intent: ${error.message}`
-        );
+      } catch (metaErr: any) {
+        console.error(`Failed to tag medication PI metadata: ${metaErr.message}`);
+        try {
+          paymentIntent = await this.stripe.paymentIntents.retrieve(resolvedPaymentIntentId);
+        } catch {
+          /* fall through to the guard below */
+        }
       }
     }
 
     if (!clientSecret || !paymentIntent) {
-      console.error(`❌ Failed to generate payment client secret for medication subscription ${subscription.id}`);
+      console.error(`❌ Failed to resolve payment intent for medication subscription ${subscription.id}`);
       throw new BadRequestException('Failed to generate payment client secret for subscription');
     }
 
