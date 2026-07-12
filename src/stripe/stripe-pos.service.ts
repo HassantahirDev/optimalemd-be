@@ -4,6 +4,13 @@ import Stripe from 'stripe';
 import { PrismaService } from '../prisma/prisma.service';
 import { PaymentLedgerService } from '../payments/payment-ledger.service';
 
+type LedgerCategory =
+  | 'MEDICATION'
+  | 'MEMBERSHIP'
+  | 'APPOINTMENT'
+  | 'SIGNUP'
+  | 'OTHER';
+
 type PosCartItem = {
   priceId?: string;
   productId?: string;
@@ -12,6 +19,8 @@ type PosCartItem = {
   amount?: number;
   currency?: string;
   interval?: string;
+  /** Staff-assigned classification for this product line (obligatory at checkout). */
+  category?: LedgerCategory;
 };
 
 @Injectable()
@@ -243,14 +252,15 @@ export class StripePosService {
       );
 
       // --- Part C: mirror this in-person one-time sale into the ledger ---
-      // One-time cart section maps to MEDICATION; med line items feed the
-      // active-medications lifecycle when linked to a real patient.
+      // Record-level category is DERIVED from the staff-assigned per-line tags:
+      // if every line shares one category use it, otherwise fall back to
+      // MEDICATION (one-time cart) and keep each line's own tag individually.
       await this.paymentLedger.upsertFromStripe({
         stripeInvoiceId: charged.invoiceId,
         stripeCustomerId: customerId,
         userId,
         channel: 'POS',
-        category: 'MEDICATION',
+        category: this.deriveCategory(oneTimeItems, 'MEDICATION'),
         billing: 'ONE_TIME',
         amount: this.sumCartCents(oneTimeItems) / 100,
         currency: 'usd',
@@ -295,7 +305,10 @@ export class StripePosService {
       stripeCustomerId: customerId,
       userId,
       channel: 'POS',
-      category: 'MEMBERSHIP',
+      category: this.deriveCategory(
+        [...subscriptionItems, ...oneTimeItems],
+        'MEMBERSHIP',
+      ),
       billing: 'SUBSCRIPTION',
       amount:
         (this.sumCartCents(subscriptionItems) + this.sumCartCents(oneTimeItems)) / 100,
@@ -327,7 +340,8 @@ export class StripePosService {
     return items.reduce((s, i) => s + (Number(i.amount) || 0), 0);
   }
 
-  // Map POS cart items → ledger line items (unitAmount in dollars).
+  // Map POS cart items → ledger line items (unitAmount in dollars), carrying the
+  // staff-assigned per-line category through to `PaymentLineItem.category`.
   private cartToLineItems(items: PosCartItem[], isSubscription: boolean) {
     return items.map((i) => ({
       description: i.name || (isSubscription ? 'Subscription item' : 'One-time item'),
@@ -335,7 +349,17 @@ export class StripePosService {
       quantity: 1,
       isSubscription,
       medicationId: null,
+      category: (i.category || (isSubscription ? 'MEMBERSHIP' : 'MEDICATION')) as LedgerCategory,
     }));
+  }
+
+  // Derive the record-level category from the per-line tags: one distinct tag
+  // across all lines → use it; a mixed cart → the section fallback.
+  private deriveCategory(items: PosCartItem[], fallback: LedgerCategory): LedgerCategory {
+    const distinct = Array.from(
+      new Set(items.map((i) => i.category).filter(Boolean) as LedgerCategory[]),
+    );
+    return distinct.length === 1 ? distinct[0] : fallback;
   }
 
   // Search our own patients so the cashier can attach an in-person sale to a
