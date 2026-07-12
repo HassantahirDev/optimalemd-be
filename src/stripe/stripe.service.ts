@@ -2658,6 +2658,7 @@ export class StripeService {
         ? ((invoiceRaw as any).confirmation_secret?.client_secret ?? null)
         : null;
 
+    // Fallback: re-fetch the invoice with its confirmation secret expanded.
     if (!clientSecret && invoiceId) {
       try {
         const fullInvoice = (await this.stripe.invoices.retrieve(invoiceId, {
@@ -2670,6 +2671,8 @@ export class StripeService {
     }
 
     if (!clientSecret) {
+      // Fail loudly rather than fall back to creating a second payment intent —
+      // that fallback is exactly what double-charged customers.
       console.error(`❌ No confirmation secret for medication subscription ${subscription.id}`);
       throw new BadRequestException(
         'Failed to obtain the medication subscription payment secret from Stripe',
@@ -2677,14 +2680,14 @@ export class StripeService {
     }
 
     // The confirmation secret is a PaymentIntent client secret (pi_..._secret_...).
-    const paymentIntentId = clientSecret.startsWith('pi_')
+    const resolvedPaymentIntentId = clientSecret.startsWith('pi_')
       ? clientSecret.split('_secret_')[0]
       : null;
     let paymentIntent: Stripe.PaymentIntent | null = null;
-    if (paymentIntentId) {
+    if (resolvedPaymentIntentId) {
       try {
         // Tag the invoice's PI with our metadata so confirm can verify + resolve it.
-        paymentIntent = await this.stripe.paymentIntents.update(paymentIntentId, {
+        paymentIntent = await this.stripe.paymentIntents.update(resolvedPaymentIntentId, {
           metadata: {
             invoiceId: invoiceId || '',
             subscriptionId: subscription.id,
@@ -2696,7 +2699,7 @@ export class StripeService {
       } catch (metaErr: any) {
         console.error(`Failed to tag medication PI metadata: ${metaErr.message}`);
         try {
-          paymentIntent = await this.stripe.paymentIntents.retrieve(paymentIntentId);
+          paymentIntent = await this.stripe.paymentIntents.retrieve(resolvedPaymentIntentId);
         } catch {
           /* fall through to the guard below */
         }
