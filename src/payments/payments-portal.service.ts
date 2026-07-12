@@ -539,56 +539,88 @@ export class PaymentsPortalService implements OnModuleInit {
     const txnRecords = records.filter((r) => r.channel !== 'INVOICE');
     const invoiceRecords = records.filter((r) => r.channel === 'INVOICE');
 
+    const catOrNull = (c: any) => (c === 'OTHER' ? null : c);
+    const mapItems = (lineItems: any[]) =>
+      (lineItems || []).map((li: any) => ({
+        description: li.description,
+        quantity: li.quantity,
+        amount: Number(li.unitAmount) * li.quantity,
+        isSubscription: li.isSubscription,
+        category: catOrNull(li.category),
+      }));
+
     let lifetimePaid = 0;
-    const payments = txnRecords.map((r) => {
+    // Payment history = the COMPLETE ledger for this patient (every channel, every
+    // status). One row per payment (deduped by the sync), so nothing double-counts.
+    const payments = records.map((r) => {
       if (['SUCCEEDED', 'REFUNDED', 'DISPUTED'].includes(r.status as any)) {
         lifetimePaid += Number(r.amount) - Number(r.refundedAmount || 0);
       }
       return {
-        id: r.stripePaymentIntentId || r.id,
+        id: r.stripePaymentIntentId || r.stripeInvoiceId || r.id,
         createdAt: (r.stripeCreated || r.createdAt).toISOString(),
         amount: Number(r.amount),
         currency: r.currency,
         status: r.status,
-        category: r.category === 'OTHER' ? null : r.category,
+        category: catOrNull(r.category),
         channel: r.channel,
         cardBrand: r.cardBrand,
         cardLast4: r.cardLast4,
         paymentMethodType: r.paymentMethodType,
         receiptUrl: r.receiptUrl,
         description: r.description || r.note || null,
-        items: (r.lineItems || []).map((li: any) => ({
-          description: li.description,
-          quantity: li.quantity,
-          amount: Number(li.unitAmount) * li.quantity,
-          isSubscription: li.isSubscription,
-        })),
+        items: mapItems(r.lineItems),
       };
     });
 
-    // Subscriptions: the patient's ACTUAL Stripe subscription objects — the
-    // recurring products only, with the real recurring amount, status & renewal.
+    // Subscriptions: the patient's ACTUAL Stripe subscription objects.
     const subscriptions = await this.fetchPatientSubscriptions(user.stripeCustomerId, emails);
 
-    // Invoices: ALL of this patient's Stripe invoices (display only — excluded
-    // from the money totals above, which come from the transactions/charges).
-    // Portal-created invoices are real Stripe invoices, so they appear here too.
-    const invoices = await this.fetchPatientInvoices(user.stripeCustomerId, emails);
-
-    // Fall back to the DB invoice records if Stripe is unreachable.
-    const invoicesOut = invoices.length
-      ? invoices
-      : invoiceRecords.map((r) => ({
-          id: r.stripeInvoiceId,
-          number: null,
-          createdAt: (r.stripeCreated || r.createdAt).toISOString(),
-          amount: Number(r.amount),
-          amountPaid: r.status === 'SUCCEEDED' ? Number(r.amount) : 0,
-          currency: r.currency,
-          status: r.status,
-          hostedInvoiceUrl: r.hostedInvoiceUrl,
-          category: r.category === 'OTHER' ? null : r.category,
-        }));
+    // Invoices = EVERY Stripe invoice for this patient (so subscription-renewal
+    // invoices show too, not only portal "send invoice" ones). Each is enriched
+    // from our ledger by invoice id, so a portal invoice's category + status stay
+    // consistent with the Transactions view.
+    const invoicesLive = await this.fetchPatientInvoices(user.stripeCustomerId, emails);
+    const ledgerByInvoice = new Map(
+      invoiceRecords
+        .filter((r) => r.stripeInvoiceId)
+        .map((r) => [r.stripeInvoiceId as string, r]),
+    );
+    const enrichInvoice = (iv: any) => {
+      const led = ledgerByInvoice.get(iv.id);
+      if (!led) return iv; // subscription/external invoice — keep the live Stripe data
+      const lineCats = Array.from(
+        new Set((led.lineItems || []).map((li: any) => li.category).filter((c: any) => c && c !== 'OTHER')),
+      );
+      return {
+        ...iv,
+        status: led.status, // ledger status (updated by webhook/sync) → matches Transactions
+        category: catOrNull(led.category),
+        categories: lineCats.length ? lineCats : catOrNull(led.category) ? [led.category] : iv.categories || [],
+        items: mapItems(led.lineItems),
+        source: 'PLATFORM', // matched a portal INVOICE ledger row → definitely ours
+      };
+    };
+    const invoicesOut = invoicesLive.length
+      ? invoicesLive.map(enrichInvoice)
+      : invoiceRecords.map((r) => {
+          const lineCats = Array.from(
+            new Set((r.lineItems || []).map((li: any) => li.category).filter((c: any) => c && c !== 'OTHER')),
+          );
+          return {
+            id: r.stripeInvoiceId || r.id,
+            number: null,
+            createdAt: (r.stripeCreated || r.createdAt).toISOString(),
+            amount: Number(r.amount),
+            amountPaid: r.status === 'SUCCEEDED' ? Number(r.amount) : 0,
+            currency: r.currency,
+            status: r.status,
+            hostedInvoiceUrl: r.hostedInvoiceUrl,
+            category: catOrNull(r.category),
+            categories: lineCats.length ? lineCats : catOrNull(r.category) ? [r.category] : [],
+            items: mapItems(r.lineItems),
+          };
+        });
 
     // Old payment flows (appointment consult, signup order, premium membership)
     // read from their own source tables — deduped against the synced ledger by
@@ -841,6 +873,14 @@ export class PaymentsPortalService implements OnModuleInit {
           if (!inv.id || seenInv.has(inv.id)) continue;
           seenInv.add(inv.id);
           const lines = inv.lines?.data || [];
+          // Distinct per-line categories (staff tags) → the UI shows all of them.
+          const lineCategories: string[] = Array.from(
+            new Set(
+              lines
+                .map((l: any) => l.metadata?.formamd_line_category)
+                .filter((c: any): c is string => !!c && c !== 'OTHER'),
+            ),
+          );
           out.push({
             id: inv.id,
             number: inv.number || null,
@@ -851,6 +891,14 @@ export class PaymentsPortalService implements OnModuleInit {
             status: STATUS_MAP[inv.status || 'open'] || 'PENDING',
             hostedInvoiceUrl: inv.hosted_invoice_url || null,
             category: inv.metadata?.formamd_category || null,
+            categories: lineCategories.length
+              ? lineCategories
+              : inv.metadata?.formamd_category && inv.metadata.formamd_category !== 'OTHER'
+              ? [inv.metadata.formamd_category]
+              : [],
+            // Origin: created/sent from our portal (carries our metadata) vs made
+            // directly in Stripe (dashboard or an auto subscription-renewal invoice).
+            source: (inv.metadata?.formamd_category || inv.metadata?.formamd_user_id) ? 'PLATFORM' : 'STRIPE',
             items: lines.map((l: any) => ({
               description: l.description || l.price?.nickname || l.plan?.nickname || 'Item',
               quantity: l.quantity || 1,

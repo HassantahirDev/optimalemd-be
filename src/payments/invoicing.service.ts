@@ -10,10 +10,12 @@ export interface OneTimeItemInput {
   description?: string; // custom line
   unitAmount?: number; // dollars (custom)
   quantity?: number;
+  category?: LedgerCategory; // staff-assigned per-line tag
 }
 export interface RecurringItemInput {
   priceId: string; // catalog recurring price
   quantity?: number;
+  category?: LedgerCategory; // staff-assigned per-line tag
 }
 
 export interface CreateInvoiceInput {
@@ -164,7 +166,20 @@ export class InvoicingService {
     }
 
     const collectionMethod = input.collectionMethod || 'send_invoice';
-    const category = input.category || (recurring.length ? 'MEMBERSHIP' : 'OTHER');
+    // Invoice-level category is DERIVED from the line tags: if every line shares
+    // one category, use it (so a single-medication invoice reads "Medication",
+    // not "Other"); mixed carts keep the caller default. Per-line tags are still
+    // stored/shown individually.
+    const lineCats = Array.from(
+      new Set([
+        ...oneTime.map((i) => i.category),
+        ...recurring.map((r) => r.category || 'MEMBERSHIP'),
+      ].filter(Boolean) as LedgerCategory[]),
+    );
+    const category: LedgerCategory =
+      lineCats.length === 1
+        ? lineCats[0]
+        : input.category || (recurring.length ? 'MEMBERSHIP' : 'OTHER');
 
     // Resolve recipient + customer.
     let email = input.email?.trim() || null;
@@ -222,7 +237,11 @@ export class InvoicingService {
       // ----- Subscription path (real recurring billing) -----
       const sub = await this.stripe.subscriptions.create({
         customer: customerId,
-        items: recurring.map((r) => ({ price: r.priceId, quantity: r.quantity || 1 })),
+        items: recurring.map((r) => ({
+          price: r.priceId,
+          quantity: r.quantity || 1,
+          metadata: { formamd_line_category: r.category || 'MEMBERSHIP' },
+        })),
         add_invoice_items: oneTime
           .filter((i) => i.priceId)
           .map((i) => ({ price: i.priceId!, quantity: i.quantity || 1 })),
@@ -241,6 +260,16 @@ export class InvoicingService {
         total = (inv.amount_due ?? inv.total ?? 0) / 100;
         stripeStatus = inv.status || '';
         invoiceLines = inv.lines?.data || [];
+        // A subscription's invoice is created by Stripe and does NOT inherit our
+        // metadata — stamp it so the invoice.payment_succeeded webhook recognizes
+        // it (formamd_category) and flips the ledger record to SUCCEEDED.
+        if (inv.id) {
+          try {
+            await this.stripe.invoices.update(inv.id, { metadata });
+          } catch (e: any) {
+            this.logger.warn(`[invoicing] set subscription invoice metadata failed: ${e?.message}`);
+          }
+        }
         if (collectionMethod === 'send_invoice' && inv.id && inv.status !== 'paid') {
           try {
             if (inv.status === 'draft') await this.stripe.invoices.finalizeInvoice(inv.id);
@@ -266,12 +295,14 @@ export class InvoicingService {
 
       for (const item of oneTime) {
         const qty = item.quantity && item.quantity > 0 ? item.quantity : 1;
+        const lineMeta = { formamd_line_category: item.category || 'OTHER' };
         if (item.priceId) {
           await this.stripe.invoiceItems.create({
             customer: customerId,
             invoice: invoiceId,
             pricing: { price: item.priceId },
             quantity: qty,
+            metadata: lineMeta,
           } as any);
         } else {
           const amountCents = Math.round((item.unitAmount || 0) * qty * 100);
@@ -281,6 +312,7 @@ export class InvoicingService {
             amount: amountCents,
             currency: 'usd',
             description: item.description || 'Item',
+            metadata: lineMeta,
           });
         }
       }
@@ -309,6 +341,27 @@ export class InvoicingService {
       .map((l: any) => l.description || l.price?.nickname || l.plan?.nickname)
       .filter(Boolean)
       .join(', ');
+
+    // Resolve each finalized invoice line back to its staff-assigned category:
+    // Stripe line metadata → matched by price id → matched by custom description
+    // → the invoice-level category. This is what the payments platform tags per line.
+    const priceToCat = new Map<string, LedgerCategory>();
+    for (const i of oneTime) if (i.priceId && i.category) priceToCat.set(i.priceId, i.category);
+    for (const r of recurring) if (r.priceId) priceToCat.set(r.priceId, r.category || 'MEMBERSHIP');
+    const descToCat = new Map<string, LedgerCategory>();
+    for (const i of oneTime) if (!i.priceId && i.description && i.category) descToCat.set(i.description, i.category);
+    const lineCategory = (l: any): LedgerCategory => {
+      const meta = l.metadata?.formamd_line_category as LedgerCategory | undefined;
+      const priceId = l.price?.id || l.pricing?.price_details?.price;
+      return (
+        meta ||
+        (priceId && priceToCat.get(priceId)) ||
+        (l.description && descToCat.get(l.description)) ||
+        category ||
+        'OTHER'
+      ) as LedgerCategory;
+    };
+
     const paid = stripeStatus === 'paid';
     await this.ledger.upsertFromStripe({
       stripeInvoiceId: invoiceId || null,
@@ -330,6 +383,7 @@ export class InvoicingService {
         quantity: l.quantity || 1,
         unitAmount: (l.amount || 0) / 100 / (l.quantity || 1),
         isSubscription: !!(l.price?.recurring || l.plan),
+        category: lineCategory(l),
       })),
     });
 

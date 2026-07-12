@@ -26,6 +26,8 @@ export interface LedgerLineItemInput {
   quantity?: number;
   unitAmount: number; // dollars
   isSubscription?: boolean;
+  /** Per-line classification (Monthly subscription / Medication / Other). */
+  category?: LedgerCategory;
   /** Snapshot of dose/strength text for the medication-order item, if known. */
   dosageSnapshot?: string | null;
 }

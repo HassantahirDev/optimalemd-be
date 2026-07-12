@@ -690,6 +690,9 @@ model PaymentLineItem {
   quantity        Int     @default(1)
   unitAmount      Decimal @db.Decimal(10, 2)
   isSubscription  Boolean @default(false)
+  // Staff-assigned classification of THIS line (Monthly subscription / Medication
+  // / Other), captured when the invoice is built so each line tracks 100%.
+  category        PaymentCategory @default(OTHER)
 
   paymentRecord PaymentRecord @relation(fields: [paymentRecordId], references: [id], onDelete: Cascade)
 

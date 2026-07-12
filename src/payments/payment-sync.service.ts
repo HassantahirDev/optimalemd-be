@@ -174,11 +174,17 @@ export class PaymentSyncService implements OnModuleInit {
     return { piCount, lineCount };
   }
 
-  // Flip our PENDING INVOICE records to paid/cancelled by checking Stripe —
-  // a safety net so status updates even if the payment webhook isn't delivered.
+  // Flip our not-yet-settled INVOICE records to paid/cancelled by checking Stripe
+  // — a safety net so status updates even if the payment webhook isn't delivered.
+  // Covers PENDING (placeholder) AND INCOMPLETE (promoted charge whose PI hadn't
+  // been paid when first synced) — the latter is what left paid invoices stuck.
   private async reconcilePendingInvoices(acct: { label: 'main' | 'pos'; client: Stripe }) {
     const pending = await this.prisma.paymentRecord.findMany({
-      where: { channel: 'INVOICE' as any, status: 'PENDING' as any, stripeInvoiceId: { not: null } },
+      where: {
+        channel: 'INVOICE' as any,
+        status: { in: ['PENDING', 'INCOMPLETE', 'UNCAPTURED'] as any },
+        stripeInvoiceId: { not: null },
+      },
       select: { id: true, stripeInvoiceId: true },
     });
     for (const rec of pending) {
@@ -213,7 +219,7 @@ export class PaymentSyncService implements OnModuleInit {
     const byPI = new Map<
       string,
       {
-        lines: { description: string; quantity: number; unitAmount: number; isSubscription: boolean }[];
+        lines: { description: string; quantity: number; unitAmount: number; isSubscription: boolean; category: string | null }[];
         isSubscription: boolean;
         subscriptionId: string | null;
         invoiceId: string | null;
@@ -228,6 +234,9 @@ export class PaymentSyncService implements OnModuleInit {
         unitAmount: (l.amount || 0) / 100 / (l.quantity || 1),
         // recurring vs one-time is a PER-LINE property (each line has its own price)
         isSubscription: !!(l.price?.recurring || l.plan),
+        // Per-line category the invoice builder stamped as metadata (100% for our
+        // portal invoices); null → resolved from the existing row / a guess below.
+        category: (l.metadata?.formamd_line_category as string) || null,
       }));
       if (!lines.length) continue;
 
@@ -304,7 +313,17 @@ export class PaymentSyncService implements OnModuleInit {
         });
         if (!rec) continue;
 
-        // Replace this record's line items (idempotent).
+        // Preserve any per-line category already stored (e.g. written by the
+        // invoice builder) before we replace the rows, so re-syncing never loses
+        // the staff-assigned tag when the Stripe line carries no metadata.
+        const prevItems = await this.prisma.paymentLineItem.findMany({
+          where: { paymentRecordId: rec.id },
+          select: { description: true, category: true },
+        });
+        const prevCat = new Map(prevItems.map((p) => [p.description, p.category as string]));
+
+        // Replace this record's line items (idempotent). Category resolution:
+        // Stripe line metadata → previously stored → name-based guess.
         await this.prisma.paymentLineItem.deleteMany({ where: { paymentRecordId: rec.id } });
         await this.prisma.paymentLineItem.createMany({
           data: match.lines.map((li) => ({
@@ -313,6 +332,7 @@ export class PaymentSyncService implements OnModuleInit {
             quantity: li.quantity,
             unitAmount: li.unitAmount,
             isSubscription: li.isSubscription,
+            category: (li.category || prevCat.get(li.description) || this.guessCategory([li.description])) as any,
           })),
         });
         lineCount += match.lines.length;

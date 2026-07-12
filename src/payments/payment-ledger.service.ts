@@ -323,6 +323,7 @@ export class PaymentLedgerService {
       quantity: li.quantity ?? 1,
       unitAmount: this.round2(li.unitAmount),
       isSubscription: li.isSubscription ?? false,
+      category: (li.category ?? 'OTHER') as any,
     };
   }
 
