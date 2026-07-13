@@ -2375,72 +2375,62 @@ export class StripeService {
     // appointment + amount reuse the same Stripe objects instead of creating duplicates.
     const idemBase = `med-${appointmentId}-${Math.round(invoice.total * 100)}`;
 
-    // For dynamic pricing, we create a new price each time since the amount varies
-    // We use a base product name but create unique prices for each appointment's medication set
-    // Check if we already have a product for this appointment (in case of retries)
-    let productId: string | undefined;
-    try {
-      // Try to find existing product for this appointment
-      const products = await this.stripe.products.search({
-        query: `metadata['appointmentId']:'${appointmentId}' AND metadata['type']:'medication'`,
-        limit: 1,
-      });
-      
-      if (products.data.length > 0) {
-        productId = products.data[0].id;
-        console.log(`✅ Reusing existing product ${productId} for appointment ${appointmentId}`);
-      }
-    } catch (error) {
-      console.log('Could not search for existing product, will create new one');
-    }
-
     // Build readable medication list for Stripe description
     const patientFullName = `${user.firstName || ''} ${user.lastName || ''}`.trim();
     const medNames = invoice.items.map((item: any) => item.name).join(', ');
 
-    // Create product if it doesn't exist
-    let product: Stripe.Product;
-    if (productId) {
-      product = await this.stripe.products.retrieve(productId);
-    } else {
-      product = await this.stripe.products.create(
+    // Build ONE monthly Stripe price per medication — each under a product named
+    // after that medication — so the invoice AND the Stripe dashboard itemize
+    // every medication (name, unit price, amount) instead of a single lump sum.
+    // Idempotency keys are scoped per (appointment, total, medication) so retries
+    // reuse the same products/prices and never double-create.
+    const subscriptionItems: Stripe.SubscriptionCreateParams.Item[] = [];
+    for (let i = 0; i < invoice.items.length; i++) {
+      const item: any = invoice.items[i];
+      const amountCents = Math.round(Number(item.price) * 100);
+      if (amountCents <= 0) continue; // skip any $0 lines
+      const medKey = item.medicationId || `idx${i}`;
+
+      const medProduct = await this.stripe.products.create(
         {
-          name: `Medications – ${patientFullName}`,
+          name: item.name,
           metadata: {
             appointmentId,
             userId,
+            medicationId: item.medicationId || '',
             patientName: patientFullName,
             patientEmail: email,
             type: 'medication',
-            medications: medNames.substring(0, 500),
           },
         },
-        { idempotencyKey: `${idemBase}-product` },
+        { idempotencyKey: `${idemBase}-prod-${medKey}` },
       );
-      console.log(`✅ Created new product ${product.id} for appointment ${appointmentId}`);
+
+      const medPrice = await this.stripe.prices.create(
+        {
+          unit_amount: amountCents,
+          currency: invoice.currency,
+          recurring: { interval: 'month' },
+          product: medProduct.id,
+          metadata: {
+            appointmentId,
+            userId,
+            type: 'medication',
+            medicationId: item.medicationId || '',
+          },
+        },
+        { idempotencyKey: `${idemBase}-price-${medKey}` },
+      );
+
+      subscriptionItems.push({ price: medPrice.id, quantity: 1 });
     }
 
-    // Create a new price with the current invoice total (amounts can change)
-    // This allows for dynamic pricing per appointment. (No volatile fields in metadata so the
-    // idempotency key reliably reuses the same price on concurrent/retried requests.)
-    const price = await this.stripe.prices.create(
-      {
-        unit_amount: Math.round(invoice.total * 100), // Convert to cents
-        currency: invoice.currency,
-        recurring: {
-          interval: 'month',
-        },
-        product: product.id, // Use existing product
-        metadata: {
-          appointmentId,
-          userId,
-          type: 'medication',
-          invoiceTotal: invoice.total.toString(),
-        },
-      },
-      { idempotencyKey: `${idemBase}-price` },
+    if (subscriptionItems.length === 0) {
+      throw new BadRequestException('No billable medication items to charge.');
+    }
+    console.log(
+      `✅ Prepared ${subscriptionItems.length} itemized medication line(s) for appointment ${appointmentId} (total $${invoice.total})`,
     );
-    console.log(`✅ Created new price ${price.id} for $${invoice.total} (appointment ${appointmentId})`);
 
     // Create subscription with payment intent
     let subscription: Stripe.Subscription;
@@ -2448,7 +2438,7 @@ export class StripeService {
       subscription = await this.stripe.subscriptions.create(
         {
           customer: customerId,
-          items: [{ price: price.id }],
+          items: subscriptionItems,
           payment_behavior: 'default_incomplete',
           payment_settings: {
             save_default_payment_method: 'on_subscription',
@@ -2491,13 +2481,13 @@ export class StripeService {
         subscription = await this.stripe.subscriptions.create(
           {
             customer: customerId,
-            items: [{ price: price.id }],
+            items: subscriptionItems,
             payment_behavior: 'default_incomplete',
             payment_settings: {
               save_default_payment_method: 'on_subscription',
               payment_method_types: ['card'],
             },
-            expand: ['latest_invoice.payment_intent'],
+            expand: ['latest_invoice.confirmation_secret'],
             description: `Monthly Medications – ${patientFullName} | ${medNames.substring(0, 200)}`,
             metadata: {
               appointmentId,
