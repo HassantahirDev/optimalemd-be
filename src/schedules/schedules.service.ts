@@ -329,6 +329,64 @@ export class SchedulesService {
       }
     }
 
+    // Merge in CUSTOM (out-of-slot) appointments — these have no slot, so they
+    // wouldn't otherwise appear on the schedule. Surface them as booked entries
+    // (with patient + service) so a custom booking shows just like a booked slot.
+    const customAppointments = await this.prisma.appointment.findMany({
+      where: {
+        slotId: null,
+        status: { not: 'CANCELLED' as any },
+        appointmentDate: {
+          gte: getUTCMidnight(dateStringToUTC(startDate)),
+          lte: getUTCEndOfDay(dateStringToUTC(endDate || startDate)),
+        },
+        ...(doctorId ? { doctorId } : {}),
+      },
+      select: {
+        id: true,
+        doctorId: true,
+        appointmentDate: true,
+        appointmentTime: true,
+        duration: true,
+        status: true,
+        visitStatus: true,
+        checkedInAt: true,
+        doctor: { select: { id: true, firstName: true, lastName: true, specialization: true } },
+        patient: { select: { id: true, firstName: true, lastName: true } },
+        service: { select: { name: true } },
+      },
+    });
+    const addMinutes = (time: string, mins: number): string => {
+      const [h, m] = (time || '0:0').split(':').map((n) => parseInt(n, 10));
+      const total = (h || 0) * 60 + (m || 0) + (mins || 0);
+      const hh = Math.floor((total % 1440) / 60);
+      const mm = total % 60;
+      return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+    };
+    for (const a of customAppointments) {
+      if (!a.doctorId || !a.doctor) continue;
+      const dateKey = toISODateString(a.appointmentDate);
+      if (!byDate.has(dateKey)) byDate.set(dateKey, new Map());
+      const byDoctor = byDate.get(dateKey)!;
+      if (!byDoctor.has(a.doctorId)) byDoctor.set(a.doctorId, { doctor: a.doctor, slots: [] });
+      byDoctor.get(a.doctorId).slots.push({
+        id: `custom-${a.id}`,
+        startTime: a.appointmentTime,
+        endTime: addMinutes(a.appointmentTime, a.duration),
+        isAvailable: false,
+        isCustom: true,
+        appointment: {
+          id: a.id,
+          status: a.status,
+          visitStatus: a.visitStatus,
+          checkedInAt: a.checkedInAt,
+          appointmentTime: a.appointmentTime,
+          patient: a.patient,
+          service: a.service,
+        },
+      });
+    }
+
     return Array.from(byDate.entries())
       .sort((a, b) => a[0].localeCompare(b[0]))
       .map(([date, byDoctor]) => ({
