@@ -1,4 +1,7 @@
-name: Build and Deploy Node.js app to Azure Web App - optimalemd
+# Docs for the Azure Web Apps Deploy action: https://github.com/Azure/webapps-deploy
+# More GitHub Actions for Azure: https://github.com/Azure/actions
+
+name: Build and deploy Node.js app to Azure Web App - optimaleproduction
 
 on:
   push:
@@ -9,74 +12,54 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read #This is required for actions/checkout
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Node.js version
+      - name: Set up Node.js version
         uses: actions/setup-node@v3
         with:
           node-version: '20.x'
 
-      - name: Install dependencies
-        run: npm install
+      - name: npm install, build, and test
+        run: |
+          npm install
+          npm run build --if-present
+          npm run test --if-present
 
-      - name: Build app
-        run: npm run build --if-present
-
-      - name: Run Prisma generate
-        run: npx prisma generate
-
-      - name: Upload artifact for deployment
+      - name: Upload artifact for deployment job
         uses: actions/upload-artifact@v4
         with:
           name: node-app
-          path: |
-            .
-            !node_modules/
+          path: .
 
   deploy:
     runs-on: ubuntu-latest
     needs: build
     permissions:
-      id-token: write
-      contents: read
+      id-token: write #This is required for requesting the JWT
+      contents: read #This is required for actions/checkout
 
     steps:
       - name: Download artifact from build job
         uses: actions/download-artifact@v4
         with:
           name: node-app
-
-      - name: Install dependencies (for Prisma)
-        run: npm install --production
-
-      - name: Run Prisma generate
-        run: npx prisma generate
-
+      
       - name: Login to Azure
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_AC8CAFE5540F4219A78EB9794174B5F9 }}
-          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_5E5431D0876D4A8392FA8278B9B323A5 }}
-          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_84972767FF404269B732C89451184FE0 }}
-      - name: Deploy to Azure Web App
+          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_B06A738464C849A78E22466E7A761104 }}
+          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_F72175BF0B2C4CDE87BA2A4A67C3F8CF }}
+          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_39831DD86F0D4CE685E0A26BB01DBB1A }}
+
+      - name: 'Deploy to Azure Web App'
         id: deploy-to-webapp
         uses: azure/webapps-deploy@v3
         with:
           app-name: 'optimaleproduction'
           slot-name: 'Production'
           package: .
-
-      - name: Set post-deployment startup command
-        uses: azure/appservice-settings@v1
-        with:
-          app-name: 'optimaleproduction'
-          slot-name: 'Production'
-          app-settings-json: |
-            [
-              {
-                "name": "POST_DEPLOYMENT_COMMAND",
-                "value": "npx prisma generate"
-              }
-            ]
+          
