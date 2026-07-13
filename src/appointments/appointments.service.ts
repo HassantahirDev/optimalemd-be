@@ -1195,7 +1195,7 @@ export class AppointmentsService {
    * Reschedule appointment
    */
   async rescheduleAppointment(id: string, rescheduleAppointmentDto: RescheduleAppointmentDto, rescheduledBy?: string): Promise<AppointmentResponseDto> {
-    const { newSlotId, reason, patientTimezone } = rescheduleAppointmentDto;
+    const { newSlotId, reason, patientTimezone, newDate: customDate, newTime: customTime, duration: customDuration } = rescheduleAppointmentDto;
 
     const appointment = await this.prisma.appointment.findUnique({
       where: { id },
@@ -1235,37 +1235,76 @@ export class AppointmentsService {
       throw new BadRequestException('Completed appointments cannot be rescheduled');
     }
 
-    // Check if new slot exists and is available
-    const newSlot = await this.prisma.slot.findUnique({
-      where: { id: newSlotId },
-      include: { schedule: true }
-    });
-    if (!newSlot) {
-      throw new NotFoundException('New slot not found');
-    }
-    if (!newSlot.isAvailable) {
-      throw new BadRequestException('New slot is not available');
-    }
+    // Resolve the target time: either an existing slot, or a custom out-of-slot
+    // time (admin front-desk reschedule). We compute a common (newScheduleDate,
+    // newStartTime) so the rest of the flow is shared.
+    const isCustomReschedule = !newSlotId;
+    let newSlot: any = null;
+    let newScheduleDate: Date;
+    let newStartTime: string;
 
-    // Check if new slot duration is sufficient
-    const service = await this.prisma.service.findUnique({
-      where: { id: appointment.serviceId },
-      select: { duration: true }
-    });
-    if (service) {
-      const slotStart = new Date(`2000-01-01T${newSlot.startTime}`);
-      const slotEnd = new Date(`2000-01-01T${newSlot.endTime}`);
-      const slotDuration = (slotEnd.getTime() - slotStart.getTime()) / (1000 * 60);
-      if (slotDuration < service.duration) {
-        throw new BadRequestException('New slot duration is insufficient for this service');
+    if (!isCustomReschedule) {
+      // Check if new slot exists and is available
+      newSlot = await this.prisma.slot.findUnique({
+        where: { id: newSlotId },
+        include: { schedule: true }
+      });
+      if (!newSlot) {
+        throw new NotFoundException('New slot not found');
+      }
+      if (!newSlot.isAvailable) {
+        throw new BadRequestException('New slot is not available');
+      }
+
+      // Check if new slot duration is sufficient
+      const service = await this.prisma.service.findUnique({
+        where: { id: appointment.serviceId },
+        select: { duration: true }
+      });
+      if (service) {
+        const slotStart = new Date(`2000-01-01T${newSlot.startTime}`);
+        const slotEnd = new Date(`2000-01-01T${newSlot.endTime}`);
+        const slotDuration = (slotEnd.getTime() - slotStart.getTime()) / (1000 * 60);
+        if (slotDuration < service.duration) {
+          throw new BadRequestException('New slot duration is insufficient for this service');
+        }
+      }
+      newScheduleDate = newSlot.schedule.date;
+      newStartTime = newSlot.startTime;
+    } else {
+      // Custom (out-of-slot) reschedule — no slot required.
+      if (!customDate || !customTime) {
+        throw new BadRequestException('A new slot, or a custom date and time, is required');
+      }
+      newScheduleDate = dateStringToUTC(customDate);
+      newStartTime = customTime;
+
+      // Reject if the custom time overlaps a slot already in the doctor's
+      // schedule for that day — the admin should book that slot instead
+      // (mirrors the create-appointment guard, prevents double-booking).
+      const toMin = (t: string) => {
+        const [h, m] = (t || '0:0').split(':').map((n) => parseInt(n, 10));
+        return (h || 0) * 60 + (m || 0);
+      };
+      const startMin = toMin(newStartTime);
+      const endMin = startMin + (Number(customDuration) || appointment.duration || 0);
+      const daySlots = await this.prisma.slot.findMany({
+        where: { schedule: { doctorId: appointment.doctorId || undefined, date: newScheduleDate } },
+        select: { startTime: true, endTime: true },
+      });
+      const clash = daySlots.find((s) => toMin(s.startTime) < endMin && startMin < toMin(s.endTime));
+      if (clash) {
+        throw new BadRequestException(
+          `A slot already exists in the schedule for ${clash.startTime}–${clash.endTime} on this date. Please book that slot instead of a custom time.`,
+        );
       }
     }
 
     // Store old appointment details for email
     const oldDate = appointment.appointmentDate.toISOString().split('T')[0];
     const oldTime = appointment.appointmentTime;
-    const newDate = newSlot.schedule.date.toISOString().split('T')[0];
-    const newTime = newSlot.startTime;
+    const newDate = newScheduleDate.toISOString().split('T')[0];
+    const newTime = newStartTime;
 
     // Prepare patient and doctor names
     const patientName = `${appointment.patient.firstName} ${appointment.patient.lastName}`;
@@ -1288,8 +1327,8 @@ export class AppointmentsService {
       // No valid Meet link yet — generate a fresh Google Calendar event
       console.log('📅 No existing Meet link, creating new Google Calendar event...');
       meetResult = await this.googleCalendarService.generateMeetLink(
-        newSlot.schedule.date,
-        newSlot.startTime,
+        newScheduleDate,
+        newStartTime,
         appointment.duration,
         doctorName,
         patientName,
@@ -1312,24 +1351,26 @@ export class AppointmentsService {
         });
       }
 
-      // Update appointment with new slot and new Google Meet link and event ID
+      // Update appointment with new slot/custom time and Google Meet link + event ID
       const updatedAppointment = await prisma.appointment.update({
         where: { id },
         data: {
-          slotId: newSlotId,
-          appointmentDate: newSlot.schedule.date,
-          appointmentTime: newSlot.startTime,
+          slotId: isCustomReschedule ? null : newSlotId,
+          appointmentDate: newScheduleDate,
+          appointmentTime: newStartTime,
           status: AppointmentStatus.CONFIRMED, // Keep as confirmed since payment was already made
           googleMeetLink: meetResult.meetLink,
           googleEventId: meetResult.eventId || null,
         }
       });
 
-      // Make new slot unavailable
-      await prisma.slot.update({
-        where: { id: newSlotId },
-        data: { isAvailable: false }
-      });
+      // Make new slot unavailable (slot-based reschedule only)
+      if (!isCustomReschedule) {
+        await prisma.slot.update({
+          where: { id: newSlotId },
+          data: { isAvailable: false }
+        });
+      }
 
       // Record the reschedule in the audit log so the original date/time stays
       // visible in the patient chart (the appointment row itself is mutated in place).
@@ -1338,8 +1379,8 @@ export class AppointmentsService {
           appointmentId: id,
           fromDate: appointment.appointmentDate,
           fromTime: oldTime,
-          toDate: newSlot.schedule.date,
-          toTime: newSlot.startTime,
+          toDate: newScheduleDate,
+          toTime: newStartTime,
           reason: reason || null,
           rescheduledBy: rescheduledBy || null,
         },
@@ -1938,6 +1979,27 @@ export class AppointmentsService {
       const slot = await this.prisma.slot.findUnique({ where: { id: slotId }, select: { id: true, isAvailable: true } });
       if (!slot || !slot.isAvailable) {
         throw new BadRequestException('Selected slot is not available');
+      }
+    } else {
+      // Custom / out-of-slot time: reject if it overlaps a slot that already
+      // exists in the doctor's schedule for that day. If a slot is already there,
+      // the admin should book that slot instead of creating an overlapping custom
+      // appointment (prevents double-booking from the appointment side).
+      const toMin = (t: string) => {
+        const [h, m] = (t || '0:0').split(':').map((n) => parseInt(n, 10));
+        return (h || 0) * 60 + (m || 0);
+      };
+      const startMin = toMin(appointmentTime);
+      const endMin = startMin + (Number(duration) || 0);
+      const daySlots = await this.prisma.slot.findMany({
+        where: { schedule: { doctorId, date: dateStringToUTC(appointmentDate) } },
+        select: { startTime: true, endTime: true },
+      });
+      const clash = daySlots.find((s) => toMin(s.startTime) < endMin && startMin < toMin(s.endTime));
+      if (clash) {
+        throw new BadRequestException(
+          `A slot already exists in the schedule for ${clash.startTime}–${clash.endTime} on this date. Please book that slot instead of creating a custom time.`,
+        );
       }
     }
 

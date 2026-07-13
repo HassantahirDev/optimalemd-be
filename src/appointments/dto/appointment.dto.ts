@@ -202,10 +202,26 @@ export class CancelAppointmentDto {
 }
 
 export class RescheduleAppointmentDto {
-  @ApiProperty({ description: 'New slot ID', example: '123e4567-e89b-12d3-a456-426614174000' })
+  @ApiProperty({ description: 'New slot ID (omit for a custom out-of-slot time)', required: false })
+  @IsOptional()
   @IsString()
-  @IsNotEmpty()
-  newSlotId: string;
+  newSlotId?: string;
+
+  @ApiProperty({ description: 'Custom new date (YYYY-MM-DD) — required when no newSlotId', required: false })
+  @IsOptional()
+  @IsDateString()
+  newDate?: string;
+
+  @ApiProperty({ description: 'Custom new time (HH:MM, UTC) — required when no newSlotId', required: false })
+  @IsOptional()
+  @IsString()
+  newTime?: string;
+
+  @ApiProperty({ description: 'Custom duration in minutes (out-of-slot reschedule)', required: false })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  duration?: number;
 
   @ApiProperty({ description: 'Rescheduling reason', example: 'Doctor unavailable', required: false })
   @IsOptional()
