@@ -34,6 +34,11 @@ jobs:
         with:
           name: node-app
           path: .
+          # Prisma's generated client lives in node_modules/.prisma (a dot-folder).
+          # upload-artifact@v4 skips hidden files by default, which drops the
+          # generated client and crashes the app on Azure with
+          # "Cannot find module '.prisma/client/default'". Include hidden files.
+          include-hidden-files: true
 
   deploy:
     runs-on: ubuntu-latest
