@@ -1235,21 +1235,11 @@ export class NewSignupService {
         }
       });
 
-      // Send welcome email
-      try {
-        if (user.primaryEmail) {
-          await this.mailerService.sendWelcomeEmail(
-            user.primaryEmail,
-            user.firstName || 'User'
-          );
-          console.log('Welcome email sent successfully');
-        } else {
-          console.error('No primary email found for user');
-        }
-      } catch (error) {
-        console.error('Failed to send welcome email:', error);
-        // Don't fail the process if email fails
-      }
+      // NOTE: Do NOT send the "Welcome / account verified" email here. At this
+      // point the user has NOT verified their email yet. The welcome email
+      // (which says the account is verified & active) is sent by verifyEmail()
+      // AFTER the user clicks the verification link. Sending it now told users
+      // their email was verified when it wasn't.
 
       // Send email verification email
       try {
