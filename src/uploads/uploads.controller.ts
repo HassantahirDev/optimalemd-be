@@ -71,6 +71,17 @@ export class UploadsController {
     }
   }
 
+  @Post('admin/migrate-legacy-files')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('superadmin')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'One-time migration: copy all files from the legacy backend onto this server (superadmin only)' })
+  async migrateLegacyFiles(@Req() req: Request) {
+    const authHeader = (req.headers['authorization'] as string) || '';
+    const result = await this.uploadsService.migrateLegacyFiles(authHeader);
+    return { success: true, statusCode: HttpStatus.OK, message: 'Legacy file migration complete', data: result };
+  }
+
   @Post('driving-license')
   @HttpCode(HttpStatus.OK)
   @UseInterceptors(FileInterceptor('file'))
