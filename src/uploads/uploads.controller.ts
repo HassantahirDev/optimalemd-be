@@ -44,22 +44,29 @@ export class UploadsController {
    */
   private async proxyToLegacy(req: Request, res: Response): Promise<boolean> {
     const legacyOrigin = process.env.LEGACY_BACKEND_URL?.replace(/\/+$/, '');
-    if (!legacyOrigin) return false;
+    if (!legacyOrigin) {
+      console.warn('[legacy-proxy] LEGACY_BACKEND_URL is NOT set — cannot proxy', req.originalUrl);
+      return false;
+    }
+    const url = `${legacyOrigin}${req.originalUrl}`;
     try {
-      const url = `${legacyOrigin}${req.originalUrl}`;
-      const upstream = await fetch(url, {
-        headers: { Authorization: (req.headers['authorization'] as string) || '' },
-      });
-      if (!upstream.ok) return false;
+      const auth = (req.headers['authorization'] as string) || '';
+      console.log(`[legacy-proxy] → ${url} (auth: ${auth ? 'present' : 'MISSING'})`);
+      const upstream = await fetch(url, { headers: { Authorization: auth } });
+      if (!upstream.ok) {
+        console.warn(`[legacy-proxy] ✗ upstream ${upstream.status} ${upstream.statusText} for ${url}`);
+        return false;
+      }
       const contentType = upstream.headers.get('content-type');
       if (contentType) res.setHeader('Content-Type', contentType);
       const disposition = upstream.headers.get('content-disposition');
       if (disposition) res.setHeader('Content-Disposition', disposition);
       const buf = Buffer.from(await upstream.arrayBuffer());
+      console.log(`[legacy-proxy] ✓ served ${buf.length} bytes from ${url}`);
       res.send(buf);
       return true;
     } catch (error) {
-      console.error('Legacy file proxy failed:', error);
+      console.error(`[legacy-proxy] ✗ error for ${url}:`, error?.message || error);
       return false;
     }
   }

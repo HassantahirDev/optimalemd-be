@@ -33,7 +33,7 @@ import { FileInterceptor } from '@nestjs/platform-express';
 import { diskStorage } from 'multer';
 import * as fs from 'fs';
 import * as path from 'path';
-import { Response } from 'express';
+import { Request, Response } from 'express';
 
 const BLOG_IMAGE_DIR = path.join(process.cwd(), 'uploads', 'blogs');
 
@@ -206,10 +206,24 @@ export class BlogController {
   }
 
   @Get('images/:filename')
-  getImage(@Param('filename') filename: string, @Res() res: Response) {
+  async getImage(@Param('filename') filename: string, @Req() req: Request, @Res() res: Response) {
     const safeName = path.basename(filename);
     const fullPath = path.join(BLOG_IMAGE_DIR, safeName);
     if (!fs.existsSync(fullPath)) {
+      // 🔁 Legacy fallback — blog image uploaded on the old backend. Proxy it.
+      const legacyOrigin = process.env.LEGACY_BACKEND_URL?.replace(/\/+$/, '');
+      if (legacyOrigin) {
+        try {
+          const upstream = await fetch(`${legacyOrigin}${req.originalUrl}`);
+          if (upstream.ok) {
+            const contentType = upstream.headers.get('content-type');
+            if (contentType) res.setHeader('Content-Type', contentType);
+            return res.send(Buffer.from(await upstream.arrayBuffer()));
+          }
+        } catch (error) {
+          console.error('Legacy blog image proxy failed:', error);
+        }
+      }
       throw new NotFoundException('Image not found');
     }
     return res.sendFile(fullPath);
