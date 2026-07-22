@@ -5,6 +5,7 @@ import {
   Get,
   Headers,
   Post,
+  Query,
   UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiBody, ApiOperation, ApiTags } from '@nestjs/swagger';
@@ -52,6 +53,25 @@ export class AiController {
     return {
       success: true,
       data: await this.aiService.generateSample(body.prompt),
+    };
+  }
+
+  @Get('lab-trends/stored')
+  @ApiOperation({
+    summary: 'Get stored AI lab-trend analyses (read-only). Patients get their own; clinicians pass ?patientId=',
+  })
+  async getStoredLabTrends(
+    @CurrentUser() user: any,
+    @Query('patientId') patientId?: string,
+  ) {
+    // Patients can only ever see their own trends.
+    const targetPatientId = user.userType === 'user' ? user.id : patientId;
+    if (!targetPatientId) {
+      throw new ForbiddenException('patientId is required');
+    }
+    return {
+      success: true,
+      data: await this.aiService.getStoredLabTrendsForPatient(targetPatientId),
     };
   }
 

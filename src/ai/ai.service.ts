@@ -590,6 +590,58 @@ Required JSON shape:
       .digest('hex');
   }
 
+  /**
+   * Read-only: return the AI lab-trend analyses already stored for a patient (the
+   * notes doctors have generated). Never calls Gemini. De-duplicated by content —
+   * because the writer replicates the latest note across the patient's appointments,
+   * this typically yields the single current trend. Empty array => no trends.
+   */
+  async getStoredLabTrendsForPatient(patientId: string) {
+    const appointments = await this.prisma.appointment.findMany({
+      where: { patientId, labTrendAnalysisNote: { not: null } },
+      select: {
+        id: true,
+        appointmentDate: true,
+        labTrendAnalysisNote: true,
+        labTrendAnalysisAt: true,
+      },
+      orderBy: { labTrendAnalysisAt: 'desc' },
+    });
+
+    const seen = new Set<string>();
+    const trends: Array<{
+      appointmentId: string;
+      appointmentDate: Date;
+      analyzedAt: Date | null;
+      trendData: LabTrendAnalysisResult;
+    }> = [];
+
+    for (const appt of appointments) {
+      if (this.isUnreadableLabTrendNote(appt.labTrendAnalysisNote)) continue;
+      const trendData = appt.labTrendAnalysisNote
+        ? this.tryParseLabTrendAnalysis(appt.labTrendAnalysisNote)
+        : null;
+      if (!trendData) continue;
+
+      // De-dupe replicated notes (same content across appointments).
+      const dedupeKey = JSON.stringify({
+        overallImpression: trendData.overallImpression,
+        categories: trendData.categories,
+      });
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+
+      trends.push({
+        appointmentId: appt.id,
+        appointmentDate: appt.appointmentDate,
+        analyzedAt: appt.labTrendAnalysisAt,
+        trendData,
+      });
+    }
+
+    return trends;
+  }
+
   private tryParseLabTrendAnalysis(rawText: string): LabTrendAnalysisResult | null {
     try {
       return this.parseLabTrendAnalysis(rawText);
