@@ -677,5 +677,101 @@ export class UploadsService {
       }
     }
   }
+
+  /**
+   * 🚚 ONE-TIME MIGRATION — pull every stored file from the OLD (optimalemd) backend
+   * onto THIS (formamd) backend's disk, so the platform no longer depends on the old
+   * server. Runs server-side here, fetching each file from LEGACY_BACKEND_URL using
+   * the calling superadmin's token, and writing it to the exact stored path.
+   * Idempotent: files already present locally are skipped. Never deletes anything.
+   */
+  async migrateLegacyFiles(authHeader: string): Promise<any> {
+    const legacyOrigin = process.env.LEGACY_BACKEND_URL?.replace(/\/+$/, '');
+    if (!legacyOrigin) {
+      throw new BadRequestException('LEGACY_BACKEND_URL is not set on this server');
+    }
+
+    // Build the job list: { storedPath, fetchPath } for every file-bearing record.
+    const jobs: { storedPath: string; fetchPath: string; kind: string }[] = [];
+
+    const users = await this.prisma.user.findMany({
+      where: { OR: [{ drivingLicensePath: { not: null } }, { photoPath: { not: null } }] },
+      select: { id: true, drivingLicensePath: true, photoPath: true },
+    });
+    for (const u of users) {
+      if (u.drivingLicensePath) jobs.push({ storedPath: u.drivingLicensePath, fetchPath: `/api/uploads/admin/drivingLicense/${u.id}`, kind: 'drivingLicense' });
+      if (u.photoPath) jobs.push({ storedPath: u.photoPath, fetchPath: `/api/uploads/admin/photo/${u.id}`, kind: 'photo' });
+    }
+
+    const labOrders = await this.prisma.labOrder.findMany({
+      where: { OR: [{ receiptPath: { not: null } }, { resultsPath: { not: null } }] },
+      select: { id: true, receiptPath: true, resultsPath: true },
+    });
+    for (const o of labOrders) {
+      if (o.receiptPath) jobs.push({ storedPath: o.receiptPath, fetchPath: `/api/uploads/lab-order/${o.id}`, kind: 'labReceipt' });
+      if (o.resultsPath) jobs.push({ storedPath: o.resultsPath, fetchPath: `/api/uploads/lab-results/${o.id}`, kind: 'labResultsLegacy' });
+    }
+
+    const resultFiles = await (this.prisma as any).labResultFile.findMany({ select: { id: true, filePath: true } });
+    for (const f of resultFiles) {
+      if (f.filePath) jobs.push({ storedPath: f.filePath, fetchPath: `/api/uploads/lab-result-file/${f.id}`, kind: 'labResultFile' });
+    }
+
+    const patientDocs = await (this.prisma as any).patientDocument.findMany({ select: { id: true, filePath: true } });
+    for (const d of patientDocs) {
+      if (d.filePath) jobs.push({ storedPath: d.filePath, fetchPath: `/api/uploads/admin/documents/file/${d.id}`, kind: 'patientDocument' });
+    }
+
+    const appts = await this.prisma.appointment.findMany({
+      where: { reportPdfPath: { not: null } },
+      select: { id: true, reportPdfPath: true },
+    });
+    for (const a of appts) {
+      if (a.reportPdfPath) jobs.push({ storedPath: a.reportPdfPath, fetchPath: `/api/reports/view/${a.id}`, kind: 'report' });
+    }
+
+    const summary = { total: jobs.length, copied: 0, skippedExists: 0, failed: 0, byKind: {} as Record<string, number>, errors: [] as string[] };
+
+    for (const job of jobs) {
+      summary.byKind[job.kind] = (summary.byKind[job.kind] || 0) + 1;
+
+      // Skip if we already have it locally (exact path or basename fallback).
+      if (this.resolveStoredPath(job.storedPath)) {
+        summary.skippedExists++;
+        continue;
+      }
+
+      try {
+        const res = await fetch(`${legacyOrigin}${job.fetchPath}`, {
+          headers: { Authorization: authHeader || '' },
+        });
+        if (!res.ok) {
+          summary.failed++;
+          if (summary.errors.length < 50) summary.errors.push(`${job.kind} ${job.fetchPath} -> ${res.status}`);
+          continue;
+        }
+        const buf = Buffer.from(await res.arrayBuffer());
+        // Write to the location the retrieval code actually reads from.
+        // Reports are read by EXACT path; everything else (all live in uploadsDir)
+        // is read by exact-path OR basename-in-uploadsDir (see resolveStoredPath),
+        // so we must land the file under uploadsDir by basename — this also fixes
+        // records whose stored path is a stale local-dev absolute path.
+        let target: string;
+        if (job.kind === 'report') {
+          target = job.storedPath;
+        } else {
+          target = path.join(this.uploadsDir, path.basename(job.storedPath));
+        }
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, buf);
+        summary.copied++;
+      } catch (e: any) {
+        summary.failed++;
+        if (summary.errors.length < 50) summary.errors.push(`${job.kind} ${job.fetchPath} -> ${e?.message || e}`);
+      }
+    }
+
+    return summary;
+  }
 }
 

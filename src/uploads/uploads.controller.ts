@@ -11,10 +11,11 @@ import {
   Query,
   HttpCode,
   HttpStatus,
+  Req,
   Res,
   StreamableFile,
 } from '@nestjs/common';
-import { Response } from 'express';
+import { Request, Response } from 'express';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth, ApiConsumes, ApiBody } from '@nestjs/swagger';
 import { UploadsService } from './uploads.service';
@@ -30,6 +31,56 @@ import * as fs from 'fs';
 @ApiBearerAuth('JWT-auth')
 export class UploadsController {
   constructor(private readonly uploadsService: UploadsService) {}
+
+  /**
+   * 🔁 Legacy file fallback. Files uploaded on the OLD (optimalemd) backend live on
+   * that server's disk, so they aren't present on this (formamd) server after the
+   * move. When a file isn't found locally, forward the SAME request (path +
+   * Authorization header) to the old backend and stream its response back. Both
+   * backends share the same DB + JWT secret, so the caller's token authorizes the
+   * exact same file there (patient sees own doc; admin sees any).
+   * Configured via LEGACY_BACKEND_URL (origin only, no trailing /api).
+   * Returns true if it served the file; false if it couldn't (caller then 404s).
+   */
+  private async proxyToLegacy(req: Request, res: Response): Promise<boolean> {
+    const legacyOrigin = process.env.LEGACY_BACKEND_URL?.replace(/\/+$/, '');
+    if (!legacyOrigin) {
+      console.warn('[legacy-proxy] LEGACY_BACKEND_URL is NOT set — cannot proxy', req.originalUrl);
+      return false;
+    }
+    const url = `${legacyOrigin}${req.originalUrl}`;
+    try {
+      const auth = (req.headers['authorization'] as string) || '';
+      console.log(`[legacy-proxy] → ${url} (auth: ${auth ? 'present' : 'MISSING'})`);
+      const upstream = await fetch(url, { headers: { Authorization: auth } });
+      if (!upstream.ok) {
+        console.warn(`[legacy-proxy] ✗ upstream ${upstream.status} ${upstream.statusText} for ${url}`);
+        return false;
+      }
+      const contentType = upstream.headers.get('content-type');
+      if (contentType) res.setHeader('Content-Type', contentType);
+      const disposition = upstream.headers.get('content-disposition');
+      if (disposition) res.setHeader('Content-Disposition', disposition);
+      const buf = Buffer.from(await upstream.arrayBuffer());
+      console.log(`[legacy-proxy] ✓ served ${buf.length} bytes from ${url}`);
+      res.send(buf);
+      return true;
+    } catch (error) {
+      console.error(`[legacy-proxy] ✗ error for ${url}:`, error?.message || error);
+      return false;
+    }
+  }
+
+  @Post('admin/migrate-legacy-files')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('superadmin')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'One-time migration: copy all files from the legacy backend onto this server (superadmin only)' })
+  async migrateLegacyFiles(@Req() req: Request) {
+    const authHeader = (req.headers['authorization'] as string) || '';
+    const result = await this.uploadsService.migrateLegacyFiles(authHeader);
+    return { success: true, statusCode: HttpStatus.OK, message: 'Legacy file migration complete', data: result };
+  }
 
   @Post('driving-license')
   @HttpCode(HttpStatus.OK)
@@ -143,6 +194,7 @@ export class UploadsController {
   async getDrivingLicense(
     @CurrentUser() user: any,
     @Param('userId') userId: string,
+    @Req() req: Request,
     @Res() res: Response,
   ) {
     // Users can only view their own documents
@@ -154,6 +206,7 @@ export class UploadsController {
       const filePath = await this.uploadsService.getFilePath(userId, 'drivingLicense');
       return res.sendFile(filePath);
     } catch (error) {
+      if (await this.proxyToLegacy(req, res)) return;
       return res.status(HttpStatus.NOT_FOUND).json({ message: 'File not found' });
     }
   }
@@ -166,6 +219,7 @@ export class UploadsController {
   async getPhoto(
     @CurrentUser() user: any,
     @Param('userId') userId: string,
+    @Req() req: Request,
     @Res() res: Response,
   ) {
     // Users can only view their own documents
@@ -177,6 +231,7 @@ export class UploadsController {
       const filePath = await this.uploadsService.getFilePath(userId, 'photo');
       return res.sendFile(filePath);
     } catch (error) {
+      if (await this.proxyToLegacy(req, res)) return;
       return res.status(HttpStatus.NOT_FOUND).json({ message: 'File not found' });
     }
   }
@@ -252,6 +307,7 @@ export class UploadsController {
   @ApiResponse({ status: 404, description: 'File not found' })
   async getLabOrder(
     @Param('orderId') orderId: string,
+    @Req() req: Request,
     @Res() res: Response,
   ) {
     try {
@@ -269,6 +325,7 @@ export class UploadsController {
 
       return res.sendFile(filePath);
     } catch (error) {
+      if (await this.proxyToLegacy(req, res)) return;
       return res.status(HttpStatus.NOT_FOUND).json({ message: 'File not found' });
     }
   }
@@ -280,6 +337,7 @@ export class UploadsController {
   @ApiResponse({ status: 404, description: 'File not found' })
   async getLabResults(
     @Param('orderId') orderId: string,
+    @Req() req: Request,
     @Res() res: Response,
   ) {
     try {
@@ -304,6 +362,7 @@ export class UploadsController {
       
       return res.sendFile(filePath);
     } catch (error) {
+      if (await this.proxyToLegacy(req, res)) return;
       return res.status(HttpStatus.NOT_FOUND).json({ message: 'File not found' });
     }
   }
@@ -331,6 +390,7 @@ export class UploadsController {
   @ApiResponse({ status: 404, description: 'File not found' })
   async getLabResultFile(
     @Param('resultFileId') resultFileId: string,
+    @Req() req: Request,
     @Res() res: Response,
   ) {
     try {
@@ -354,6 +414,7 @@ export class UploadsController {
 
       return res.sendFile(filePath);
     } catch (error) {
+      if (await this.proxyToLegacy(req, res)) return;
       return res.status(HttpStatus.NOT_FOUND).json({ message: 'File not found' });
     }
   }
@@ -365,6 +426,7 @@ export class UploadsController {
   @ApiResponse({ status: 404, description: 'File not found' })
   async getDrivingLicenseAdmin(
     @Param('userId') userId: string,
+    @Req() req: Request,
     @Res() res: Response,
   ) {
     try {
@@ -389,6 +451,7 @@ export class UploadsController {
       
       return res.sendFile(filePath);
     } catch (error) {
+      if (await this.proxyToLegacy(req, res)) return;
       return res.status(HttpStatus.NOT_FOUND).json({ message: 'File not found' });
     }
   }
@@ -400,6 +463,7 @@ export class UploadsController {
   @ApiResponse({ status: 404, description: 'File not found' })
   async getPhotoAdmin(
     @Param('userId') userId: string,
+    @Req() req: Request,
     @Res() res: Response,
   ) {
     try {
@@ -424,6 +488,7 @@ export class UploadsController {
       
       return res.sendFile(filePath);
     } catch (error) {
+      if (await this.proxyToLegacy(req, res)) return;
       return res.status(HttpStatus.NOT_FOUND).json({ message: 'File not found' });
     }
   }
@@ -459,6 +524,7 @@ export class UploadsController {
   @ApiOperation({ summary: 'View a patient document file (Admin)' })
   async viewPatientDocumentAdmin(
     @Param('documentId') documentId: string,
+    @Req() req: Request,
     @Res() res: Response,
   ) {
     try {
@@ -472,6 +538,7 @@ export class UploadsController {
       res.setHeader('Content-Type', contentType);
       return res.sendFile(filePath);
     } catch (error) {
+      if (await this.proxyToLegacy(req, res)) return;
       return res.status(HttpStatus.NOT_FOUND).json({ message: 'File not found' });
     }
   }

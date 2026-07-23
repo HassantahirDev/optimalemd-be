@@ -20,7 +20,7 @@ type LabTrendSourceFile = {
   mimeType: string;
   fileSize: number | null;
   createdAt: Date;
-  remoteUrl: string | null;
+  remotePath: string | null;
 };
 
 type LabTrendAnalysisResult = {
@@ -49,7 +49,21 @@ export class AiService {
   private readonly defaultLocation = 'us-central1';
   private readonly defaultModel = 'gemini-2.5-pro';
 
-  private readonly productionApiBaseUrl = 'https://formamd.com/api';
+  // When a lab file isn't on THIS server's disk, try fetching it from each of these
+  // backends in order (a file may live on the new OR the old backend). These MUST be
+  // real API origins (…azurewebsites.net/api), NOT the frontend domain (formamd.com
+  // returns the SPA's HTML for /api/*, which would corrupt the analysis).
+  // Overridable via LAB_FILE_REMOTE_BASE_URLS (comma-separated).
+  private readonly remoteApiBaseUrls: string[] = (
+    process.env.LAB_FILE_REMOTE_BASE_URLS ||
+    [
+      'https://formamd-production-cpbfg3cdewf9grat.canadacentral-01.azurewebsites.net/api',
+      'https://optimaleproduction-ckfmbfgyccfjg3dc.canadacentral-01.azurewebsites.net/api',
+    ].join(',')
+  )
+    .split(',')
+    .map((s) => s.trim().replace(/\/+$/, ''))
+    .filter(Boolean);
   private readonly labTrendAnalysisVersion = 'lab-trends-v3-structured-json-ui';
 
   constructor(
@@ -179,7 +193,7 @@ export class AiService {
         mimeType: file.mimeType || this.getMimeType(file.filePath),
         fileSize: file.fileSize ?? null,
         createdAt: file.createdAt,
-        remoteUrl: `${this.productionApiBaseUrl}/uploads/lab-result-file/${file.id}`,
+        remotePath: `/uploads/lab-result-file/${file.id}`,
       }));
 
       if (resultFiles.length > 0 || !order.resultsPath) {
@@ -196,7 +210,7 @@ export class AiService {
           mimeType: this.getMimeType(order.resultsPath),
           fileSize: null,
           createdAt: order.updatedAt,
-          remoteUrl: `${this.productionApiBaseUrl}/uploads/lab-results/${order.id}`,
+          remotePath: `/uploads/lab-results/${order.id}`,
         },
       ];
     });
@@ -213,7 +227,7 @@ export class AiService {
       fileName: file.fileName,
       localPath: file.filePath,
       localExists: fs.existsSync(file.filePath),
-      remoteUrl: file.remoteUrl,
+      remotePath: file.remotePath,
       mimeType: file.mimeType,
       fileSize: file.fileSize,
     })));
@@ -576,6 +590,58 @@ Required JSON shape:
       .digest('hex');
   }
 
+  /**
+   * Read-only: return the AI lab-trend analyses already stored for a patient (the
+   * notes doctors have generated). Never calls Gemini. De-duplicated by content —
+   * because the writer replicates the latest note across the patient's appointments,
+   * this typically yields the single current trend. Empty array => no trends.
+   */
+  async getStoredLabTrendsForPatient(patientId: string) {
+    const appointments = await this.prisma.appointment.findMany({
+      where: { patientId, labTrendAnalysisNote: { not: null } },
+      select: {
+        id: true,
+        appointmentDate: true,
+        labTrendAnalysisNote: true,
+        labTrendAnalysisAt: true,
+      },
+      orderBy: { labTrendAnalysisAt: 'desc' },
+    });
+
+    const seen = new Set<string>();
+    const trends: Array<{
+      appointmentId: string;
+      appointmentDate: Date;
+      analyzedAt: Date | null;
+      trendData: LabTrendAnalysisResult;
+    }> = [];
+
+    for (const appt of appointments) {
+      if (this.isUnreadableLabTrendNote(appt.labTrendAnalysisNote)) continue;
+      const trendData = appt.labTrendAnalysisNote
+        ? this.tryParseLabTrendAnalysis(appt.labTrendAnalysisNote)
+        : null;
+      if (!trendData) continue;
+
+      // De-dupe replicated notes (same content across appointments).
+      const dedupeKey = JSON.stringify({
+        overallImpression: trendData.overallImpression,
+        categories: trendData.categories,
+      });
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+
+      trends.push({
+        appointmentId: appt.id,
+        appointmentDate: appt.appointmentDate,
+        analyzedAt: appt.labTrendAnalysisAt,
+        trendData,
+      });
+    }
+
+    return trends;
+  }
+
   private tryParseLabTrendAnalysis(rawText: string): LabTrendAnalysisResult | null {
     try {
       return this.parseLabTrendAnalysis(rawText);
@@ -806,47 +872,69 @@ Required JSON shape:
       return buffer.toString('base64');
     }
 
-    if (!file.remoteUrl) {
+    if (!file.remotePath || this.remoteApiBaseUrls.length === 0) {
       throw new Error(`Lab result file is missing locally: ${file.fileName}`);
     }
 
-    console.log('[AI lab trends] Fetching production lab file:', {
-      fileName: file.fileName,
-      remoteUrl: file.remoteUrl,
-      localPath: file.filePath,
-      hasAuthorizationHeader: Boolean(authorization),
-    });
+    // The file may live on either backend (new or old). Try each in order and
+    // accept the first that returns a real file (a valid status AND not the SPA's
+    // HTML page — formamd.com/api/* returns text/html which must be rejected).
+    const failures: string[] = [];
+    for (const baseUrl of this.remoteApiBaseUrls) {
+      const remoteUrl = `${baseUrl}${file.remotePath}`;
+      try {
+        console.log('[AI lab trends] Fetching remote lab file:', {
+          fileName: file.fileName,
+          remoteUrl,
+          localPath: file.filePath,
+          hasAuthorizationHeader: Boolean(authorization),
+        });
 
-    const response = await fetch(file.remoteUrl, {
-      headers: authorization ? { Authorization: authorization } : undefined,
-    });
+        const response = await fetch(remoteUrl, {
+          headers: authorization ? { Authorization: authorization } : undefined,
+        });
 
-    console.log('[AI lab trends] Production lab file response:', {
-      fileName: file.fileName,
-      remoteUrl: file.remoteUrl,
-      status: response.status,
-      contentType: response.headers.get('content-type'),
-      contentLength: response.headers.get('content-length'),
-    });
+        const contentType = response.headers.get('content-type');
+        console.log('[AI lab trends] Remote lab file response:', {
+          fileName: file.fileName,
+          remoteUrl,
+          status: response.status,
+          contentType,
+          contentLength: response.headers.get('content-length'),
+        });
 
-    if (!response.ok) {
-      throw new Error(
-        `Unable to fetch production lab result file "${file.fileName}" (${response.status}).`,
-      );
+        if (!response.ok) {
+          failures.push(`${remoteUrl} -> ${response.status}`);
+          continue;
+        }
+        // Reject HTML (e.g. a frontend SPA responding 200 with its index page).
+        if (contentType && contentType.includes('text/html')) {
+          failures.push(`${remoteUrl} -> got HTML, not a file`);
+          continue;
+        }
+
+        const buffer = Buffer.from(await response.arrayBuffer());
+        if (buffer.length === 0) {
+          failures.push(`${remoteUrl} -> empty`);
+          continue;
+        }
+        if (contentType && contentType !== 'application/octet-stream') {
+          file.mimeType = contentType.split(';')[0];
+        }
+        console.log('[AI lab trends] Remote lab file fetched:', {
+          fileName: file.fileName,
+          remoteUrl,
+          mimeType: file.mimeType,
+          bytes: buffer.length,
+        });
+        return buffer.toString('base64');
+      } catch (e: any) {
+        failures.push(`${remoteUrl} -> ${e?.message || e}`);
+      }
     }
 
-    const contentType = response.headers.get('content-type');
-    if (contentType && contentType !== 'application/octet-stream') {
-      file.mimeType = contentType.split(';')[0];
-    }
-
-    const buffer = Buffer.from(await response.arrayBuffer());
-    console.log('[AI lab trends] Production lab file fetched:', {
-      fileName: file.fileName,
-      remoteUrl: file.remoteUrl,
-      mimeType: file.mimeType,
-      bytes: buffer.length,
-    });
-    return buffer.toString('base64');
+    throw new Error(
+      `Unable to fetch lab result file "${file.fileName}" from any backend. Tried: ${failures.join('; ')}`,
+    );
   }
 }
