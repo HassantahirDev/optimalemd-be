@@ -1,6 +1,5 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Cron } from '@nestjs/schedule';
 import Stripe from 'stripe';
 import { PrismaService } from '../prisma/prisma.service';
 
@@ -24,21 +23,22 @@ export class PaymentSyncService implements OnModuleInit {
   private readonly accounts: { label: 'main' | 'pos'; client: Stripe }[] = [];
   private running = false;
 
-  // Warm recent data shortly after boot (quick, not full — a full sync only
-  // runs when triggered from the button).
+  // 🚫 AUTO-SYNC DISABLED (per request) — all Stripe→DB syncing is now MANUAL,
+  // triggered from the dashboard buttons (POST /payments/sync). No boot sync, no
+  // cron. Re-enable the block below to restore automatic syncing.
   onModuleInit() {
-    setTimeout(
-      () => this.syncAll({ sinceDays: 3 }).catch((e) => this.logger.warn(`[sync] boot sync failed: ${e?.message}`)),
-      8000,
-    );
+    // setTimeout(
+    //   () => this.syncAll({ sinceDays: 3 }).catch((e) => this.logger.warn(`[sync] boot sync failed: ${e?.message}`)),
+    //   8000,
+    // );
   }
 
-  // Quick incremental sync — only the last few days, runs every 30 minutes.
-  // Full sync is manual only (the "Full sync" button / POST /payments/sync).
-  @Cron('0 */30 * * * *') // every 30 minutes
-  async scheduledQuickSync() {
-    await this.syncAll({ sinceDays: 3 }).catch((e) => this.logger.warn(`[sync] quick cron failed: ${e?.message}`));
-  }
+  // Quick incremental sync — DISABLED. Was: @Cron('0 */30 * * * *') every 30 min.
+  // Kept as a callable method so the manual button/endpoint can still use syncAll.
+  // @Cron('0 */30 * * * *')
+  // async scheduledQuickSync() {
+  //   await this.syncAll({ sinceDays: 3 }).catch((e) => this.logger.warn(`[sync] quick cron failed: ${e?.message}`));
+  // }
 
   constructor(
     private readonly prisma: PrismaService,
