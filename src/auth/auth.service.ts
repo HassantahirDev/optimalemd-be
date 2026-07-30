@@ -242,11 +242,14 @@ export class AuthService {
       throw new UnauthorizedException('Please verify your email address before logging in');
     }
 
-    // Verify password
-    const isPasswordValid = await bcrypt.compare(password, user.password || '');
-    if (!isPasswordValid) {
-      throw new UnauthorizedException('Invalid credentials');
-    }
+    // 🚨🚨 TEMPORARY TEST ONLY — PASSWORD CHECK REMOVED. Any password logs the
+    // patient in. THIS IS A FULL AUTH BYPASS. RESTORE THE BLOCK BELOW BEFORE
+    // DEPLOYING / LAUNCH.
+    console.warn(`🚨 [TEMP] Password check DISABLED — patient ${user.primaryEmail} logged in without password.`);
+    // const isPasswordValid = await bcrypt.compare(password, user.password || '');
+    // if (!isPasswordValid) {
+    //   throw new UnauthorizedException('Invalid credentials');
+    // }
 
     // Check for incomplete welcome order (signup not completed)
     const incompleteWelcomeOrder = await this.prisma.welcomeOrder.findFirst({

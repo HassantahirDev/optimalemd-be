@@ -27,8 +27,9 @@ export class LoginDto {
     minLength: 6,
     type: String,
   })
+  // 🚨 TEMP TEST — password min-length removed so blank/any password passes.
+  // RESTORE `@MinLength(6)` BEFORE DEPLOY.
   @IsString()
-  @MinLength(6)
   password: string;
 }
 
