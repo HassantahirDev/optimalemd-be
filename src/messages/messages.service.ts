@@ -307,7 +307,8 @@ export class MessagesService {
         select: {
           id: true,
           firstName: true,
-          lastName: true
+          lastName: true,
+          photoPath: true
         }
       });
     } else {
@@ -404,6 +405,10 @@ export class MessagesService {
           participantId: user.id,
           participantName: `${user.firstName} ${user.lastName}`,
           participantType: userType === 'doctor' ? 'patient' : 'doctor',
+          // Whether this participant has a profile photo (doctor→patient only).
+          // The frontend loads it via /uploads/admin/photo/:id (proxy-backed, so it
+          // resolves whether the image lives on the new OR old backend).
+          participantHasPhoto: !!(user as any).photoPath,
           lastMessage: lastMessageResponse,
           unreadCount
         };
