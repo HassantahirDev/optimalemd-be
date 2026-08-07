@@ -32,7 +32,7 @@ export class UploadsService {
    * from the lab-results email lands them straight on the booking page — logged in
    * if they weren't already. Falls back to a plain link if signing fails.
    */
-  private buildAutoLoginBookingLink(patient: { id: string; primaryEmail: string | null }): string {
+  private buildAutoLoginBookingLink(patient: { id: string; primaryEmail: string | null; firstName?: string | null }): string {
     // Patient emails always target production, matching the verification-email pattern.
     const base = (this.configService.get<string>('PUBLIC_APP_URL') || 'https://formamd.com').replace(/\/+$/, '');
     const next = '/dashboard/book-appointment';
@@ -40,7 +40,9 @@ export class UploadsService {
       const token = this.jwtService.sign(
         // userType is REQUIRED by JwtStrategy.validate — without it every guarded
         // call (e.g. /auth/me) returns 401 "Invalid token payload".
-        { sub: patient.id, email: patient.primaryEmail, userType: 'user' },
+        // name/email are carried so the auto-login page can populate localStorage
+        // identically to the regular email+password login flow.
+        { sub: patient.id, email: patient.primaryEmail, userType: 'user', name: patient.firstName || '' },
         { expiresIn: '3d' },
       );
       return `${base}/auto-login?token=${encodeURIComponent(token)}&next=${encodeURIComponent(next)}`;
