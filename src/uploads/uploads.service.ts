@@ -38,7 +38,9 @@ export class UploadsService {
     const next = '/dashboard/book-appointment';
     try {
       const token = this.jwtService.sign(
-        { sub: patient.id, email: patient.primaryEmail },
+        // userType is REQUIRED by JwtStrategy.validate — without it every guarded
+        // call (e.g. /auth/me) returns 401 "Invalid token payload".
+        { sub: patient.id, email: patient.primaryEmail, userType: 'user' },
         { expiresIn: '3d' },
       );
       return `${base}/auto-login?token=${encodeURIComponent(token)}&next=${encodeURIComponent(next)}`;
