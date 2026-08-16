@@ -672,6 +672,26 @@ export class DoctorsController {
     };
   }
 
+  @Get(':id/action-center')
+  @ApiOperation({
+    summary: 'Get Doctor Action Center',
+    description: 'Unified, server-aggregated task queue: visits to document, unassigned completed appointments, pending booking requests, unread messages, today\'s schedule, and in-queue patients.',
+  })
+  @ApiParam({ name: 'id', description: 'Doctor ID' })
+  async getActionCenter(
+    @Param('id') id: string,
+  ): Promise<BaseApiResponse<any>> {
+    const data = await this.doctorsService.getActionCenter(id);
+    return {
+      success: true,
+      statusCode: HttpStatus.OK,
+      message: 'Action center retrieved successfully',
+      data,
+      timestamp: new Date().toISOString(),
+      path: `/api/doctors/${id}/action-center`,
+    };
+  }
+
   @Get(':id/patients')
   @ApiOperation({
     summary: 'Get Doctor Patients',

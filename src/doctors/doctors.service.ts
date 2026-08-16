@@ -570,6 +570,122 @@ export class DoctorsService {
   }
 
   /**
+   * Unified "Action Center" for the doctor dashboard. Server-aggregated task
+   * queue — one call returns every actionable bucket with a count and a small
+   * preview list, so the dashboard renders a single prioritized to-do surface
+   * instead of stitching many endpoints together on the client.
+   */
+  async getActionCenter(doctorId: string): Promise<any> {
+    const now = new Date();
+    const startOfToday = new Date(now);
+    startOfToday.setHours(0, 0, 0, 0);
+    const endOfToday = new Date(startOfToday);
+    endOfToday.setDate(endOfToday.getDate() + 1);
+
+    const patientSelect = {
+      select: { id: true, firstName: true, lastName: true, photoPath: true },
+    };
+    const apptSelect = {
+      id: true,
+      appointmentDate: true,
+      appointmentTime: true,
+      status: true,
+      notesSignedAt: true,
+      googleMeetLink: true,
+      patient: patientSelect,
+      service: { select: { name: true } },
+    };
+
+    const [
+      visitsToDocument,
+      unassignedCompleted,
+      pendingBookings,
+      unreadMessages,
+      todaySchedule,
+      inQueue,
+    ] = await Promise.all([
+      // 1) My completed visits whose notes aren't signed yet (need documentation).
+      this.prisma.appointment.findMany({
+        where: {
+          doctorId,
+          status: 'COMPLETED',
+          notesSignedAt: null,
+        },
+        select: apptSelect,
+        orderBy: { appointmentDate: 'desc' },
+        take: 50,
+      }),
+      // 2) Completed appointments sitting UNASSIGNED (no doctor) — need pickup.
+      this.prisma.appointment.findMany({
+        where: {
+          doctorId: null,
+          status: 'COMPLETED',
+        },
+        select: apptSelect,
+        orderBy: { appointmentDate: 'desc' },
+        take: 50,
+      }),
+      // 3) Booking requests awaiting my response.
+      this.prisma.booking.findMany({
+        where: { doctorId, status: 'PENDING' as any },
+        select: {
+          id: true,
+          preferredDate: true,
+          preferredTime: true,
+          urgency: true,
+          requestedAt: true,
+          patient: patientSelect,
+          service: { select: { name: true } },
+        },
+        orderBy: { requestedAt: 'desc' },
+        take: 50,
+      }),
+      // 4) Unread messages addressed to me.
+      this.prisma.message.count({
+        where: { receiverId: doctorId, receiverType: 'doctor', isRead: false },
+      }),
+      // 5) Today's schedule.
+      this.prisma.appointment.findMany({
+        where: {
+          doctorId,
+          appointmentDate: { gte: startOfToday, lt: endOfToday },
+          status: { in: ['CONFIRMED', 'IN_PROGRESS', 'COMPLETED'] as any },
+        },
+        select: apptSelect,
+        orderBy: { appointmentTime: 'asc' },
+        take: 50,
+      }),
+      // 6) Patients currently checked-in / in progress.
+      this.prisma.appointment.findMany({
+        where: {
+          doctorId,
+          appointmentDate: { gte: startOfToday, lt: endOfToday },
+          status: 'IN_PROGRESS',
+        },
+        select: apptSelect,
+        orderBy: { appointmentTime: 'asc' },
+        take: 20,
+      }),
+    ]);
+
+    const bucket = (items: any[], limit = 8, count?: number) => ({
+      count: count ?? items.length,
+      items: items.slice(0, limit),
+    });
+
+    return {
+      // Notes-to-sign is the dashboard's primary surface — return a longer list.
+      visitsToDocument: bucket(visitsToDocument, 50),
+      unassignedCompleted: bucket(unassignedCompleted),
+      pendingBookings: bucket(pendingBookings as any[]),
+      unreadMessages: { count: unreadMessages, items: [] },
+      todaySchedule: bucket(todaySchedule, 50),
+      inQueue: bucket(inQueue),
+      generatedAt: now.toISOString(),
+    };
+  }
+
+  /**
    * Helper method to get DOB search conditions - same as admin
    */
   private getDobSearchConditions(searchTerm: string): any[] {

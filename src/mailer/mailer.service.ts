@@ -3854,6 +3854,7 @@ For your security, you will be asked to set a new password the first time you lo
     patientName: string,
     testNames: string,
     attachmentPath?: string,
+    bookingLink?: string,
   ): Promise<void> {
     const html = `
       <!DOCTYPE html>
@@ -3929,9 +3930,9 @@ For your security, you will be asked to set a new password the first time you lo
             <h1 class="logo">FormaMD</h1>
           </div>
           <div class="content">
-            <h2 class="title">Lab Results Available</h2>
+            <h2 class="title">Your Lab Results Are Ready</h2>
             <p>Dear ${patientName},</p>
-            <p>Your lab results are now available.</p>
+            <p>Good news — your lab results are now available for review.</p>
             
             <div class="info-box">
               <div class="info-item">
@@ -3939,13 +3940,18 @@ For your security, you will be asked to set a new password the first time you lo
               </div>
             </div>
 
-            <p>Your lab results have been attached to this email and are also available in your patient portal. Your healthcare provider will review these results and contact you if any follow-up is needed.</p>
-            
+            <p>Your lab results have been attached to this email and are also available in your patient portal. Your healthcare provider will review these results with you during a follow-up consultation.</p>
+
             <div class="info-box" style="margin-top: 30px; background-color: #e8f4f8; border-left-color: #3b82f6;">
-              <p style="margin: 0; font-weight: bold; color: #1e40af;">Next Steps:</p>
-              <p style="margin: 10px 0 0 0; color: #1e3a8a;">Your lab results are now available. You can now book an appointment to discuss your results with your healthcare provider.</p>
+              <p style="margin: 0; font-weight: bold; color: #1e40af;">Next step: schedule your follow-up</p>
+              <p style="margin: 10px 0 0 0; color: #1e3a8a;">To review your results and plan the next phase of your care, please book a follow-up appointment with your provider at your earliest convenience.</p>
             </div>
-            
+            ${bookingLink ? `
+            <div style="text-align: center; margin: 30px 0;">
+              <a href="${bookingLink}" target="_blank" style="display: inline-block; background-color: #dc2626; color: #ffffff; text-decoration: none; font-weight: bold; font-size: 16px; padding: 14px 32px; border-radius: 8px;">Book Your Follow-Up Appointment</a>
+              <p style="margin: 12px 0 0 0; font-size: 12px; color: #6b7280;">This secure link takes you straight to booking — no need to log in again.</p>
+            </div>` : ''}
+
             <p style="margin-top: 30px;">Best regards,<br><strong>The FormaMD Team</strong></p>
           </div>
           <div class="footer">
@@ -3961,7 +3967,7 @@ For your security, you will be asked to set a new password the first time you lo
       const mailOptions: any = {
         from: `"FormaMD" <${this.configService.get<string>('SMTP_FROM')}>`,
         to: patientEmail,
-        subject: 'Lab Results Available - FormaMD',
+        subject: 'Your Lab Results Are Ready — Book Your Follow-Up | FormaMD',
         html,
       };
 
