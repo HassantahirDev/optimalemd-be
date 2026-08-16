@@ -35,7 +35,9 @@ export class UploadsService {
   private buildAutoLoginBookingLink(patient: { id: string; primaryEmail: string | null; firstName?: string | null }): string {
     // Patient emails always target production, matching the verification-email pattern.
     const base = (this.configService.get<string>('PUBLIC_APP_URL') || 'https://formamd.com').replace(/\/+$/, '');
-    const next = '/dashboard/book-appointment';
+    // prefill=lab-followup tells the booking page to preselect Telehealth (primary)
+    // + Lab Testing (medical service) for the post-results follow-up.
+    const next = '/dashboard/book-appointment?prefill=lab-followup';
     try {
       const token = this.jwtService.sign(
         // userType is REQUIRED by JwtStrategy.validate — without it every guarded
