@@ -125,6 +125,20 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       const { password, ...paymentUserSafe } = account;
       return { ...paymentUserSafe, userType: 'payment', paymentUserId: account.id };
 
+    } else if (userType === 'partner') {
+      // Validate referral-partner. This role can ONLY reach the partner
+      // portal — it is never an admin/doctor/patient/payment user.
+      account = await this.prisma.referralPartner.findUnique({
+        where: { id },
+      });
+
+      if (!account || !account.isActive) {
+        throw new UnauthorizedException('Partner not found or inactive');
+      }
+
+      const { password, ...partnerSafe } = account;
+      return { ...partnerSafe, userType: 'partner', partnerId: account.id };
+
     } else {
       throw new UnauthorizedException('Invalid user type in token');
     }

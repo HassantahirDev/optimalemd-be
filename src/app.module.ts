@@ -30,6 +30,7 @@ import { BlogModule } from './blog/blog.module';
 import { NewsletterModule } from './newsletter/newsletter.module';
 import { AiModule } from './ai/ai.module';
 import { PaymentsModule } from './payments/payments.module';
+import { PartnersModule } from './partners/partners.module';
 
 @Module({
   imports: [
@@ -64,6 +65,7 @@ import { PaymentsModule } from './payments/payments.module';
     NewsletterModule,
     AiModule,
     PaymentsModule,
+    PartnersModule,
   ],
   controllers: [AppController],
   providers: [AppService],

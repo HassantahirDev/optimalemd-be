@@ -4,6 +4,7 @@ import { JwtService } from '@nestjs/jwt';
 import { MailerService } from '../mailer/mailer.service';
 import { ReferralService } from '../referral/referral.service';
 import { PaymentLedgerService } from '../payments/payment-ledger.service';
+import { PartnersService } from '../partners/partners.service';
 import * as bcrypt from 'bcrypt';
 import * as crypto from 'crypto';
 import { generateNextPatientId } from '../common/utils/patient-id.utils';
@@ -24,6 +25,7 @@ export class NewSignupService {
     private mailerService: MailerService,
     private referralService: ReferralService,
     private paymentLedger: PaymentLedgerService,
+    private partnersService: PartnersService,
   ) {}
 
   // Generate unique order number
@@ -531,6 +533,19 @@ export class NewSignupService {
       data: { userId: user.id },
     });
 
+    // Partner-program attribution: bind the visitor's last-touch partner click to
+    // this new account, then fire the qualifying event ("signup completed OR
+    // welcome order purchased" — this is the "signup completed" branch). Both are
+    // non-fatal — a referral hiccup must never block account creation.
+    try {
+      await this.partnersService.bindOnSignup(mergedUserData.visitorId || userData.visitorId, user.id, user.primaryEmail || undefined);
+      await this.partnersService.qualify(user.id, {
+        revenueCents: Math.round(Number(welcomeOrder.finalAmount || 0) * 100),
+      });
+    } catch (partnerErr) {
+      console.error('Partner attribution/qualification failed (non-fatal):', partnerErr);
+    }
+
     return {
       user,
       welcomeOrder: {
@@ -770,6 +785,15 @@ export class NewSignupService {
         } catch (refErr) {
           console.error('Referral creation failed (non-fatal):', refErr);
         }
+      }
+
+      // Partner-program attribution — separate from the patient referral hook above.
+      // Qualifying event here is "signup completed" (no welcome order in this flow).
+      try {
+        await this.partnersService.bindOnSignup(userData.visitorId, user.id, normalizedEmail);
+        await this.partnersService.qualify(user.id, {});
+      } catch (partnerErr) {
+        console.error('Partner attribution/qualification failed (non-fatal):', partnerErr);
       }
 
       // Generate JWT token (same format as login)

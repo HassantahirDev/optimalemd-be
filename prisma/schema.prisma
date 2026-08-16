@@ -1511,3 +1511,160 @@ model PatientDocument {
 
   @@index([labOrderId])
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Referral Partner (business affiliate) program — partners.formamd.com
+// Deliberately self-contained: no FK relations onto User/PaymentRecord, only
+// plain id-string links. Kept fully separate from the patient-to-patient
+// Referral/CreditEvent system above.
+// ─────────────────────────────────────────────────────────────────────────
+
+model ReferralPartner {
+  id                 String   @id @default(uuid())
+  name               String
+  email              String   @unique
+  password           String
+  phone              String?
+  companyName        String?
+  referralCode       String   @unique // e.g. PARTNER-A1B2C3, used in ?ref= links
+  isActive           Boolean  @default(true)
+  mustChangePassword Boolean  @default(true)
+
+  // Payout is manual for launch — no Stripe Connect yet.
+  payoutMethod String? // e.g. "Check", "ACH", "PayPal" — free text, admin-recorded
+  payoutNotes  String? // bank/PayPal details etc., admin-entered
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  referrals PartnerReferral[]
+  commissions Commission[]
+  payoutBatches PayoutBatch[]
+  commissionRules CommissionRule[]
+
+  @@map("referral_partners")
+}
+
+// One row per attributed visitor/signup. Attribution is LAST-TOUCH: the code
+// they actually signed up under is what's recorded, so a new track-visit for
+// the same visitorId simply overwrites landingUrl/utm/partner until signup
+// locks the row (status moves past PENDING).
+model PartnerReferral {
+  id        String @id @default(uuid())
+  partnerId String
+  partner   ReferralPartner @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+
+  visitorId String // anonymous id set by the tracking snippet (cookie/localStorage)
+  userId    String? // set once the visitor signs up — permanent from that point on
+
+  landingUrl String?
+  utmSource  String?
+  utmMedium  String?
+  utmCampaign String?
+
+  status PartnerReferralStatus @default(PENDING) // PENDING (clicked) -> SIGNED_UP -> QUALIFIED
+  firstClickAt DateTime @default(now())
+  signedUpAt   DateTime?
+  qualifiedAt  DateTime? // when it hit the qualifying event (signup complete OR welcome order)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  commissions Commission[]
+
+  // One open (pre-signup) attribution row per visitor+partner; signed-up rows are locked by userId uniqueness below.
+  @@unique([userId], map: "partner_referral_user_unique")
+  @@index([partnerId])
+  @@index([visitorId])
+  @@index([status])
+  @@map("partner_referrals")
+}
+
+enum PartnerReferralStatus {
+  PENDING
+  SIGNED_UP
+  QUALIFIED
+  VOIDED // refunded / fraud / duplicate — commission clawed back
+}
+
+// Admin-defined commission rule. Both flat-amount and percentage rules are
+// supported side by side; a partner can have several active rules (e.g. one
+// per service). The engine picks the best-matching active rule at qualify time.
+model CommissionRule {
+  id        String @id @default(uuid())
+  partnerId String? // null = applies to ALL partners (a global default rule)
+  partner   ReferralPartner? @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+
+  name String // admin label, e.g. "Standard flat $50" or "TRT 10%"
+  type CommissionType // FLAT | PERCENTAGE
+  flatAmountCents   Int? // used when type = FLAT
+  percentBasisPoints Int? // used when type = PERCENTAGE, e.g. 1000 = 10.00%
+  serviceKeyword    String? // optional filter — only applies to matching services
+
+  isActive  Boolean @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  commissions Commission[]
+
+  @@index([partnerId])
+  @@map("commission_rules")
+}
+
+enum CommissionType {
+  FLAT
+  PERCENTAGE
+}
+
+// An earned (or voided) commission amount, one row per qualifying event.
+model Commission {
+  id                String @id @default(uuid())
+  partnerId         String
+  partner           ReferralPartner @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  partnerReferralId String
+  partnerReferral   PartnerReferral @relation(fields: [partnerReferralId], references: [id], onDelete: Cascade)
+  ruleId            String?
+  rule              CommissionRule? @relation(fields: [ruleId], references: [id], onDelete: SetNull)
+
+  sourcePaymentRecordId String? // links to PaymentRecord.id when known (soft link, no FK)
+  amountCents           Int
+  status                CommissionStatus @default(OWED)
+
+  payoutBatchId String?
+  payoutBatch   PayoutBatch? @relation(fields: [payoutBatchId], references: [id], onDelete: SetNull)
+
+  eligibleAt DateTime @default(now())
+  paidAt     DateTime?
+  voidReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([partnerId])
+  @@index([status])
+  @@map("commissions")
+}
+
+enum CommissionStatus {
+  OWED
+  PAID
+  VOIDED
+}
+
+// A manual payout run — admin marks a batch of commissions as paid.
+model PayoutBatch {
+  id            String @id @default(uuid())
+  partnerId     String
+  partner       ReferralPartner @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  totalCents    Int
+  method        String? // "Check", "ACH", "PayPal" etc.
+  reference     String? // check #, transaction id, etc.
+  note          String?
+  paidAt        DateTime @default(now())
+  createdAt     DateTime @default(now())
+
+  commissions Commission[]
+
+  @@index([partnerId])
+  @@map("payout_batches")
+}

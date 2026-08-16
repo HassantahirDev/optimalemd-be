@@ -14,6 +14,7 @@ import { MailerModule } from '../mailer/mailer.module';
 import { StripeModule } from '../stripe/stripe.module';
 import { ReferralModule } from '../referral/referral.module';
 import { PaymentsModule } from '../payments/payments.module';
+import { PartnersModule } from '../partners/partners.module';
 
 @Module({
   imports: [
@@ -22,6 +23,7 @@ import { PaymentsModule } from '../payments/payments.module';
     StripeModule,
     ReferralModule,
     PaymentsModule,
+    PartnersModule,
     PassportModule,
     ConfigModule,
     JwtModule.registerAsync({
