@@ -138,6 +138,66 @@ export class MailerService implements OnModuleInit {
     }
   }
 
+  /** The mail accounts configured in env, for the /email-checker tool's account switcher. */
+  getEmailAccountsInfo(): Array<{ key: 'default' | 'appointment'; label: string; fromAddress: string | null; configured: boolean }> {
+    return [
+      {
+        key: 'default',
+        label: 'Default (SMTP_*)',
+        fromAddress: this.configService.get<string>('SMTP_FROM') || null,
+        configured: !this.isNoopTransport,
+      },
+      {
+        key: 'appointment',
+        label: 'Appointment (APPOINTMENT_SMTP_*)',
+        fromAddress:
+          this.configService.get<string>('APPOINTMENT_SMTP_FROM') ||
+          this.configService.get<string>('SMTP_FROM') ||
+          null,
+        configured: !this.isAppointmentNoopTransport,
+      },
+    ];
+  }
+
+  /**
+   * Sends a fixed diagnostic email via whichever configured account is chosen, for the
+   * standalone /email-checker tool. Returns whether the transport is actually live
+   * (vs. silently running in no-op mode because SMTP creds are missing/invalid) so the
+   * caller can tell "sent" apart from "pretended to send".
+   */
+  async sendTestEmail(
+    to: string,
+    account: 'default' | 'appointment' = 'default',
+  ): Promise<{ noop: boolean; fromAddress: string }> {
+    const useAppointment = account === 'appointment';
+    const transporter = useAppointment ? this.appointmentTransporter : this.transporter;
+    const isNoop = useAppointment ? this.isAppointmentNoopTransport : this.isNoopTransport;
+    const fromAddress =
+      (useAppointment
+        ? this.configService.get<string>('APPOINTMENT_SMTP_FROM')
+        : this.configService.get<string>('SMTP_FROM')) ||
+      this.configService.get<string>('SMTP_FROM') ||
+      '';
+
+    const sentAt = new Date().toLocaleString();
+    await transporter.sendMail({
+      from: `"FormaMD Email Checker" <${fromAddress}>`,
+      to,
+      subject: 'FormaMD Email Checker — Test Email',
+      text: `This is a test email from the FormaMD email checker tool, sent via the "${account}" mail account. If you received this, email delivery is working.\n\nSent at: ${sentAt}`,
+      html: `
+        <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:28px;color:#111;border:1px solid #eee;border-radius:12px;">
+          <h2 style="margin:0 0 12px;color:#dc2626;">✅ Email Checker — Test Successful</h2>
+          <p style="margin:0 0 8px;">This is a test email from the FormaMD email checker tool, sent via the <strong>${account}</strong> mail account.</p>
+          <p style="margin:16px 0 0;color:#888;font-size:12px;">Sent at ${sentAt}</p>
+        </div>
+      `,
+    });
+
+    console.log(`[email-checker] Test email sent to ${to} via "${account}" account ${isNoop ? '(no-op transport — not actually delivered)' : ''}`);
+    return { noop: isNoop, fromAddress };
+  }
+
   async sendEmailVerificationEmail(to: string, name: string, verificationLink: string): Promise<void> {
     const html = `
       <!DOCTYPE html>
