@@ -20,6 +20,11 @@ import { dateStringToUTC, isDateTimeInPast, getUTCMidnight, getUTCEndOfDay } fro
 export class AppointmentsService {
   private stripe: Stripe;
 
+  // 🚨🚨 TEMPORARY — ALL appointment-related emails (booking confirmation,
+  // cancellation, reschedule; patient AND doctor copies) are disabled. Nothing
+  // is sent, only logged. Flip back to `false` to restore emails.
+  private readonly APPOINTMENT_EMAILS_DISABLED = true;
+
   constructor(
     private prisma: PrismaService,
     private mailerService: MailerService,
@@ -1154,7 +1159,9 @@ export class AppointmentsService {
     });
 
     // Send email notifications
-    try {
+    if (this.APPOINTMENT_EMAILS_DISABLED) {
+      console.warn('🚨 [TEMP] Appointment emails disabled — cancellation emails NOT sent.');
+    } else try {
       const patientName = `${appointment.patient.firstName} ${appointment.patient.lastName}`;
       const doctorName = appointment.doctor ? `Dr. ${appointment.doctor.firstName} ${appointment.doctor.lastName}` : 'To be assigned';
       const appointmentDate = appointment.appointmentDate.toISOString().split('T')[0];
@@ -1390,7 +1397,9 @@ export class AppointmentsService {
     });
 
     // Send email notifications
-    try {
+    if (this.APPOINTMENT_EMAILS_DISABLED) {
+      console.warn('🚨 [TEMP] Appointment emails disabled — reschedule emails NOT sent.');
+    } else try {
       const patientName = `${appointment.patient.firstName} ${appointment.patient.lastName}`;
       const doctorName = appointment.doctor ? `Dr. ${appointment.doctor.firstName} ${appointment.doctor.lastName}` : 'To be assigned';
 
@@ -2104,6 +2113,9 @@ export class AppointmentsService {
         // Send emails (best-effort)
         const dateStr = created.appointmentDate.toISOString().split('T')[0];
         const amountStr = typeof (created as any).amount === 'string' ? (created as any).amount : '0.00';
+        if (this.APPOINTMENT_EMAILS_DISABLED) {
+          console.warn('🚨 [TEMP] Appointment emails disabled — booking confirmation emails NOT sent.');
+        } else {
         try {
           if (created.patient?.primaryEmail) {
             const additionalServices = (created as any).additionalServices as Array<{ id: string; name: string; duration: number }> | null;
@@ -2143,6 +2155,7 @@ export class AppointmentsService {
         } catch (err) {
           console.error('Failed to send doctor notification email:', err);
         }
+        } // end APPOINTMENT_EMAILS_DISABLED else
       }
     } catch (err) {
       console.error('Failed to generate Google Meet link or send emails:', err);
