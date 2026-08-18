@@ -1412,6 +1412,10 @@ export class StripeService {
     // We find the authoritative premium subscription and adopt it, so a cancellation made
     // directly in Stripe (or a missed webhook) is always reflected here.
     if (user.stripeCustomerId) {
+      // Captured BEFORE the lookup below can overwrite user.stripeSubscriptionId — this is
+      // what tells us whether the DB was ever pointing at a real Stripe subscription.
+      const hadStripeSubscriptionId = !!user.stripeSubscriptionId;
+
       const livePremium = await this.findPremiumSubscriptionFromStripe(
         user.stripeCustomerId,
       );
@@ -1423,8 +1427,9 @@ export class StripeService {
             data: { stripeSubscriptionId: livePremium.id },
           });
         }
-      } else {
-        // No premium subscription exists in Stripe at all — ensure DB reflects unsubscribed.
+      } else if (hadStripeSubscriptionId) {
+        // A real Stripe subscription this user WAS linked to has since disappeared/canceled —
+        // genuine cleanup case. Ensure DB reflects unsubscribed.
         if (user.isSubscribed || user.stripeSubscriptionId) {
           await this.prisma.user.update({
             where: { id: userId },
@@ -1439,6 +1444,10 @@ export class StripeService {
         user.subscriptionStatus = 'canceled';
         user.stripeSubscriptionId = null;
       }
+      // else: no Stripe subscription was ever linked (stripeSubscriptionId was already
+      // null) and Stripe has none either — nothing to reconcile. In particular this
+      // leaves an admin-granted premium (isSubscribed=true, no stripeSubscriptionId)
+      // untouched instead of silently reverting it to unsubscribed.
     }
 
     let stripeSubscription: any = null;
