@@ -156,16 +156,29 @@ export class StripeService {
       throw new BadRequestException('Failed to generate payment client secret');
     }
 
-    // Create payment record
+    // Create (or replace) the payment record for this appointment. appointmentId is
+    // @unique on Payment, so a retried/re-opened payment (e.g. clicking "Complete Payment"
+    // again on an unpaid-reservation banner) hits an existing row from the first attempt —
+    // upsert so it's updated with the fresh payment intent instead of crashing on the
+    // unique constraint.
     if (appointmentId) {
-      await this.prisma.payment.create({
-        data: {
+      await this.prisma.payment.upsert({
+        where: { appointmentId },
+        create: {
           appointmentId,
           stripePaymentId: paymentIntent.id,
           amount,
           currency,
           status: 'PENDING',
           paymentIntent: paymentIntent.id,
+        },
+        update: {
+          stripePaymentId: paymentIntent.id,
+          amount,
+          currency,
+          status: 'PENDING',
+          paymentIntent: paymentIntent.id,
+          paidAt: null,
         },
       });
     }
