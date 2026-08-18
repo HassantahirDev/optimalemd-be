@@ -32,7 +32,9 @@ export class EmailCheckerController {
         success: true,
         message: result.noop
           ? 'Send call completed, but this account has NO real SMTP credentials configured — nothing was actually delivered.'
-          : `Test email sent to ${body.to}.`,
+          : result.usedFallback
+            ? `Sent to ${body.to} — but the "appointment" account's login is failing on THIS environment, so it fell back to the default account (${result.fromAddress}) instead. Check APPOINTMENT_SMTP_USER/APPOINTMENT_SMTP_PASS here.`
+            : `Test email sent to ${body.to} from ${result.fromAddress}.`,
         data: result,
       };
     } catch (error: any) {

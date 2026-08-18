@@ -10,6 +10,10 @@ export class MailerService implements OnModuleInit {
   private appointmentTransporter: nodemailer.Transporter;
   private isNoopTransport = false;
   private isAppointmentNoopTransport = false;
+  // True whenever the dedicated appointment account isn't actually being used — either no
+  // APPOINTMENT_SMTP_* creds were set, or they failed to authenticate — and everything
+  // "sent via appointment" is silently going out through the default account instead.
+  private appointmentUsingFallback = false;
 
   constructor(private configService: ConfigService) {}
 
@@ -72,6 +76,7 @@ export class MailerService implements OnModuleInit {
       console.log('Appointment email config not found, using default transporter');
       this.appointmentTransporter = this.transporter;
       this.isAppointmentNoopTransport = this.isNoopTransport;
+      this.appointmentUsingFallback = true;
       return;
     }
 
@@ -91,6 +96,7 @@ export class MailerService implements OnModuleInit {
       console.error('Failed to initialize appointment SMTP transport, falling back to default:', error);
       this.appointmentTransporter = this.transporter;
       this.isAppointmentNoopTransport = this.isNoopTransport;
+      this.appointmentUsingFallback = true;
     }
   }
 
@@ -139,7 +145,13 @@ export class MailerService implements OnModuleInit {
   }
 
   /** The mail accounts configured in env, for the /email-checker tool's account switcher. */
-  getEmailAccountsInfo(): Array<{ key: 'default' | 'appointment'; label: string; fromAddress: string | null; configured: boolean }> {
+  getEmailAccountsInfo(): Array<{
+    key: 'default' | 'appointment';
+    label: string;
+    fromAddress: string | null;
+    configured: boolean;
+    note?: string;
+  }> {
     return [
       {
         key: 'default',
@@ -150,11 +162,16 @@ export class MailerService implements OnModuleInit {
       {
         key: 'appointment',
         label: 'Appointment (APPOINTMENT_SMTP_*)',
-        fromAddress:
-          this.configService.get<string>('APPOINTMENT_SMTP_FROM') ||
-          this.configService.get<string>('SMTP_FROM') ||
-          null,
-        configured: !this.isAppointmentNoopTransport,
+        // While falling back, emails sent as "appointment" actually go out via the
+        // default account's from-address — show that, not the unused APPOINTMENT_SMTP_FROM,
+        // so this matches what the recipient will really see.
+        fromAddress: this.appointmentUsingFallback
+          ? this.configService.get<string>('SMTP_FROM') || null
+          : this.configService.get<string>('APPOINTMENT_SMTP_FROM') || null,
+        configured: !this.isAppointmentNoopTransport && !this.appointmentUsingFallback,
+        note: this.appointmentUsingFallback
+          ? 'APPOINTMENT_SMTP_* login failed or is unset — silently falling back to the default account.'
+          : undefined,
       },
     ];
   }
@@ -162,22 +179,27 @@ export class MailerService implements OnModuleInit {
   /**
    * Sends a fixed diagnostic email via whichever configured account is chosen, for the
    * standalone /email-checker tool. Returns whether the transport is actually live
-   * (vs. silently running in no-op mode because SMTP creds are missing/invalid) so the
-   * caller can tell "sent" apart from "pretended to send".
+   * (vs. silently running in no-op mode because SMTP creds are missing/invalid), and
+   * whether the requested account silently fell back to the default one — so the caller
+   * can tell "sent, exactly as requested" apart from "sent, but not through the account
+   * you picked".
    */
   async sendTestEmail(
     to: string,
     account: 'default' | 'appointment' = 'default',
-  ): Promise<{ noop: boolean; fromAddress: string }> {
+  ): Promise<{ noop: boolean; fromAddress: string; usedFallback: boolean }> {
     const useAppointment = account === 'appointment';
+    const usedFallback = useAppointment && this.appointmentUsingFallback;
     const transporter = useAppointment ? this.appointmentTransporter : this.transporter;
     const isNoop = useAppointment ? this.isAppointmentNoopTransport : this.isNoopTransport;
+    // If the appointment account is falling back, the real from-address that will go out
+    // (and that the authenticated Gmail login will actually accept) is the default one —
+    // sending with the appointment address here would just get silently rewritten by
+    // Gmail, which is exactly the confusing behavior this is meant to catch.
     const fromAddress =
-      (useAppointment
-        ? this.configService.get<string>('APPOINTMENT_SMTP_FROM')
-        : this.configService.get<string>('SMTP_FROM')) ||
-      this.configService.get<string>('SMTP_FROM') ||
-      '';
+      useAppointment && !usedFallback
+        ? this.configService.get<string>('APPOINTMENT_SMTP_FROM') || ''
+        : this.configService.get<string>('SMTP_FROM') || '';
 
     const sentAt = new Date().toLocaleString();
     await transporter.sendMail({
@@ -194,8 +216,8 @@ export class MailerService implements OnModuleInit {
       `,
     });
 
-    console.log(`[email-checker] Test email sent to ${to} via "${account}" account ${isNoop ? '(no-op transport — not actually delivered)' : ''}`);
-    return { noop: isNoop, fromAddress };
+    console.log(`[email-checker] Test email sent to ${to} via "${account}" account ${isNoop ? '(no-op transport — not actually delivered)' : ''}${usedFallback ? ' (fell back to default account)' : ''}`);
+    return { noop: isNoop, fromAddress, usedFallback };
   }
 
   async sendEmailVerificationEmail(to: string, name: string, verificationLink: string): Promise<void> {
