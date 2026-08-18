@@ -674,7 +674,13 @@ export class AdminService {
       throw new NotFoundException('Patient not found');
     }
 
-    // Update subscription status
+    // Update subscription status. stripeSubscriptionId is ALWAYS cleared here (even when
+    // granting) — an admin grant is a manual override, never Stripe-backed. Leaving a stale
+    // subscription id in place (e.g. from a past real subscription that has since lapsed)
+    // makes getSubscriptionStatus() treat this as "a real subscription that needs
+    // reconciling", and it silently reverts the grant back to unsubscribed the next time the
+    // patient's dashboard checks status. stripeCustomerId is kept — harmless, and needed if
+    // the patient later subscribes for real.
     const updatedPatient = await this.prisma.user.update({
       where: { id: patientId },
       data: {
@@ -683,8 +689,7 @@ export class AdminService {
         subscriptionStartDate: isPremium ? new Date() : null,
         subscriptionEndDate: null,
         subscriptionCanceledAt: null,
-        // Clear Stripe subscription ID when removing premium to avoid conflicts with Stripe data
-        stripeSubscriptionId: isPremium ? existingPatient.stripeSubscriptionId : null,
+        stripeSubscriptionId: null,
         stripeCustomerId: isPremium ? existingPatient.stripeCustomerId : null,
       },
     });
