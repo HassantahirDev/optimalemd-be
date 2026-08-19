@@ -240,6 +240,86 @@ export class PartnersService {
     return { items, total, page, limit };
   }
 
+  /**
+   * Partner sets/updates their US bank details (ACH) — what admin needs to actually wire
+   * a manual payout. Light validation only (routing number is always 9 digits in the US);
+   * this is a manual-transfer workflow, not a real ACH integration, so we don't verify the
+   * account with a bank.
+   */
+  async updateBankDetails(
+    partnerId: string,
+    data: {
+      bankAccountHolderName: string;
+      bankName: string;
+      bankAccountType: 'checking' | 'savings';
+      bankRoutingNumber: string;
+      bankAccountNumber: string;
+    },
+  ) {
+    const routing = data.bankRoutingNumber.replace(/\s/g, '');
+    if (!/^\d{9}$/.test(routing)) {
+      throw new BadRequestException('Routing number must be exactly 9 digits (US ABA routing number).');
+    }
+    const accountNumber = data.bankAccountNumber.replace(/\s/g, '');
+    if (!/^\d{4,17}$/.test(accountNumber)) {
+      throw new BadRequestException('Account number looks invalid.');
+    }
+    if (!['checking', 'savings'].includes(data.bankAccountType)) {
+      throw new BadRequestException('Account type must be "checking" or "savings".');
+    }
+
+    const updated = await this.prisma.referralPartner.update({
+      where: { id: partnerId },
+      data: {
+        bankAccountHolderName: data.bankAccountHolderName,
+        bankName: data.bankName,
+        bankAccountType: data.bankAccountType,
+        bankRoutingNumber: routing,
+        bankAccountNumber: accountNumber,
+        bankDetailsUpdatedAt: new Date(),
+      },
+    });
+    const { password, ...safe } = updated;
+    return safe;
+  }
+
+  /** Request a payout of whatever is currently OWED. One pending request at a time. */
+  async requestPayout(partnerId: string, note?: string) {
+    const partner = await this.prisma.referralPartner.findUnique({ where: { id: partnerId } });
+    if (!partner) throw new NotFoundException('Partner not found');
+    if (!partner.bankAccountNumber || !partner.bankRoutingNumber) {
+      throw new BadRequestException('Add your bank details before requesting a payout.');
+    }
+
+    const existingPending = await this.prisma.payoutRequest.findFirst({
+      where: { partnerId, status: 'PENDING' },
+    });
+    if (existingPending) {
+      throw new BadRequestException('You already have a pending payout request.');
+    }
+
+    const owedAgg = await this.prisma.commission.aggregate({
+      where: { partnerId, status: CommissionStatus.OWED },
+      _sum: { amountCents: true },
+    });
+    const amountCents = owedAgg._sum.amountCents ?? 0;
+    if (amountCents <= 0) {
+      throw new BadRequestException('Nothing owed right now.');
+    }
+
+    return this.prisma.payoutRequest.create({
+      data: { partnerId, amountCents, note },
+    });
+  }
+
+  async getPayoutRequests(partnerId: string) {
+    return this.prisma.payoutRequest.findMany({
+      where: { partnerId },
+      orderBy: { requestedAt: 'desc' },
+      include: { payoutBatch: true },
+    });
+  }
+
   async changeOwnPassword(partnerId: string, currentPassword: string, newPassword: string) {
     const partner = await this.prisma.referralPartner.findUnique({ where: { id: partnerId } });
     if (!partner) throw new NotFoundException('Partner not found');
@@ -377,6 +457,83 @@ export class PartnersService {
       where: partnerId ? { partnerId } : {},
       orderBy: { paidAt: 'desc' },
       include: { partner: { select: { name: true, email: true } }, commissions: true },
+    });
+  }
+
+  /** List payout requests, with the partner's bank details attached (admin needs these to wire the transfer). */
+  async adminListPayoutRequests(status?: 'PENDING' | 'COMPLETED' | 'REJECTED') {
+    return this.prisma.payoutRequest.findMany({
+      where: status ? { status } : {},
+      orderBy: { requestedAt: 'desc' },
+      include: {
+        partner: {
+          select: {
+            name: true,
+            email: true,
+            bankAccountHolderName: true,
+            bankName: true,
+            bankAccountType: true,
+            bankRoutingNumber: true,
+            bankAccountNumber: true,
+          },
+        },
+        payoutBatch: true,
+      },
+    });
+  }
+
+  /**
+   * Admin fulfills a payout request: pays out every commission currently OWED for that
+   * partner (not just what was owed at request time — if more accrued since, a manual
+   * transfer would naturally cover it in one go), creates the PayoutBatch, and links it
+   * back to the request so the partner sees "Completed" the next time they check.
+   */
+  async adminFulfillPayoutRequest(requestId: string, data: { method?: string; reference?: string; note?: string }) {
+    const request = await this.prisma.payoutRequest.findUnique({ where: { id: requestId } });
+    if (!request) throw new NotFoundException('Payout request not found');
+    if (request.status !== 'PENDING') {
+      throw new BadRequestException(`This request is already ${request.status.toLowerCase()}.`);
+    }
+
+    const owedCommissions = await this.prisma.commission.findMany({
+      where: { partnerId: request.partnerId, status: CommissionStatus.OWED },
+    });
+    if (owedCommissions.length === 0) {
+      throw new BadRequestException('No OWED commissions found for this partner — nothing to pay out.');
+    }
+    const totalCents = owedCommissions.reduce((sum, c) => sum + c.amountCents, 0);
+
+    const batch = await this.prisma.payoutBatch.create({
+      data: {
+        partnerId: request.partnerId,
+        totalCents,
+        method: data.method,
+        reference: data.reference,
+        note: data.note,
+      },
+    });
+
+    await this.prisma.commission.updateMany({
+      where: { id: { in: owedCommissions.map((c) => c.id) } },
+      data: { status: CommissionStatus.PAID, paidAt: new Date(), payoutBatchId: batch.id },
+    });
+
+    return this.prisma.payoutRequest.update({
+      where: { id: requestId },
+      data: { status: 'COMPLETED', completedAt: new Date(), payoutBatchId: batch.id },
+      include: { payoutBatch: true },
+    });
+  }
+
+  async adminRejectPayoutRequest(requestId: string, note?: string) {
+    const request = await this.prisma.payoutRequest.findUnique({ where: { id: requestId } });
+    if (!request) throw new NotFoundException('Payout request not found');
+    if (request.status !== 'PENDING') {
+      throw new BadRequestException(`This request is already ${request.status.toLowerCase()}.`);
+    }
+    return this.prisma.payoutRequest.update({
+      where: { id: requestId },
+      data: { status: 'REJECTED', completedAt: new Date(), note: note ?? request.note },
     });
   }
 }

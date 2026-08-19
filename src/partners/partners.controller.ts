@@ -2,6 +2,7 @@ import {
   Controller,
   Get,
   Post,
+  Put,
   Body,
   Query,
   Req,
@@ -77,6 +78,44 @@ export class PartnersController {
   async getCommissions(@Req() req: any, @Query('page') page?: string, @Query('limit') limit?: string) {
     const data = await this.partnersService.getCommissions(req.user.id, Number(page) || 1, Number(limit) || 20);
     return { success: true, ...data };
+  }
+
+  @Put('me/bank-details')
+  @UseGuards(JwtAuthGuard, PartnerGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Set/update the partner\'s US bank details (for manual ACH payout)' })
+  async updateBankDetails(
+    @Req() req: any,
+    @Body()
+    body: {
+      bankAccountHolderName: string;
+      bankName: string;
+      bankAccountType: 'checking' | 'savings';
+      bankRoutingNumber: string;
+      bankAccountNumber: string;
+    },
+  ) {
+    const data = await this.partnersService.updateBankDetails(req.user.id, body);
+    return { success: true, data };
+  }
+
+  @Post('me/payout-requests')
+  @UseGuards(JwtAuthGuard, PartnerGuard)
+  @ApiBearerAuth()
+  @HttpCode(HttpStatus.CREATED)
+  @ApiOperation({ summary: 'Request a payout of whatever is currently owed' })
+  async requestPayout(@Req() req: any, @Body() body: { note?: string }) {
+    const data = await this.partnersService.requestPayout(req.user.id, body?.note);
+    return { success: true, data };
+  }
+
+  @Get('me/payout-requests')
+  @UseGuards(JwtAuthGuard, PartnerGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Partner\'s own payout request history' })
+  async getPayoutRequests(@Req() req: any) {
+    const data = await this.partnersService.getPayoutRequests(req.user.id);
+    return { success: true, data };
   }
 
   @Post('me/change-password')

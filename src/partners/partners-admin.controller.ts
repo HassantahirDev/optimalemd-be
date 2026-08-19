@@ -125,4 +125,30 @@ export class PartnersAdminController {
     const data = await this.partnersService.adminListPayoutBatches(partnerId);
     return { success: true, data };
   }
+
+  // ─── Payout requests (partner-initiated) ────────────────────────────────
+
+  @Get('payout-requests')
+  @ApiOperation({ summary: 'List payout requests, with the partner\'s bank details attached' })
+  async listPayoutRequests(@Query('status') status?: 'PENDING' | 'COMPLETED' | 'REJECTED') {
+    const data = await this.partnersService.adminListPayoutRequests(status);
+    return { success: true, data };
+  }
+
+  @Post('payout-requests/:id/fulfill')
+  @ApiOperation({ summary: 'Mark a payout request as transferred — pays out everything currently owed for that partner' })
+  async fulfillPayoutRequest(
+    @Param('id') id: string,
+    @Body() body: { method?: string; reference?: string; note?: string },
+  ) {
+    const data = await this.partnersService.adminFulfillPayoutRequest(id, body || {});
+    return { success: true, data };
+  }
+
+  @Post('payout-requests/:id/reject')
+  @ApiOperation({ summary: 'Reject a payout request' })
+  async rejectPayoutRequest(@Param('id') id: string, @Body() body: { note?: string }) {
+    const data = await this.partnersService.adminRejectPayoutRequest(id, body?.note);
+    return { success: true, data };
+  }
 }

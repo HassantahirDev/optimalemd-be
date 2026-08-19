@@ -1532,7 +1532,19 @@ model ReferralPartner {
 
   // Payout is manual for launch — no Stripe Connect yet.
   payoutMethod String? // e.g. "Check", "ACH", "PayPal" — free text, admin-recorded
-  payoutNotes  String? // bank/PayPal details etc., admin-entered
+  payoutNotes  String? // free-text admin notes (separate from the structured bank fields below)
+
+  // US bank details (ACH), entered by the partner themselves so admin has what's needed
+  // to wire a manual payout. Not encrypted at the field level — matches this project's
+  // existing pattern of no field-level encryption for stored PII, but flagged as a known
+  // hardening item (consider column-level encryption or moving to a vault before scaling
+  // partner volume beyond a manually-managed handful).
+  bankAccountHolderName String?
+  bankName              String?
+  bankAccountType       String? // "checking" | "savings"
+  bankRoutingNumber     String? // 9-digit ABA routing number
+  bankAccountNumber     String?
+  bankDetailsUpdatedAt  DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -1541,6 +1553,7 @@ model ReferralPartner {
   commissions Commission[]
   payoutBatches PayoutBatch[]
   commissionRules CommissionRule[]
+  payoutRequests PayoutRequest[]
 
   @@map("referral_partners")
 }
@@ -1664,7 +1677,40 @@ model PayoutBatch {
   createdAt     DateTime @default(now())
 
   commissions Commission[]
+  payoutRequest PayoutRequest?
 
   @@index([partnerId])
   @@map("payout_batches")
+}
+
+// A partner's ask to be paid out. Created by the partner (snapshotting what's owed at
+// that moment); fulfilled by admin, which creates the actual PayoutBatch against their
+// then-current OWED commissions and links it back here. Keeps "partner asked to be paid"
+// visibly separate from "admin recorded a payout" (which can still happen without a
+// request, e.g. a scheduled monthly run).
+model PayoutRequest {
+  id        String @id @default(uuid())
+  partnerId String
+  partner   ReferralPartner @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+
+  amountCents Int // snapshot of totalOwedCents at request time (informational — the actual
+                  // payout amount is whatever is OWED when admin fulfills it)
+  status      PayoutRequestStatus @default(PENDING)
+  note        String? // optional note from the partner when requesting
+
+  payoutBatchId String?      @unique
+  payoutBatch   PayoutBatch? @relation(fields: [payoutBatchId], references: [id], onDelete: SetNull)
+
+  requestedAt DateTime  @default(now())
+  completedAt DateTime?
+
+  @@index([partnerId])
+  @@index([status])
+  @@map("payout_requests")
+}
+
+enum PayoutRequestStatus {
+  PENDING
+  COMPLETED
+  REJECTED
 }
