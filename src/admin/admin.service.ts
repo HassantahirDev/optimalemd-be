@@ -698,6 +698,27 @@ export class AdminService {
   }
 
   /**
+   * Toggle the one-time "admin booking override" for a patient. While enabled, that
+   * patient's own booking page gets the exact same booking powers as admin's Create
+   * Appointment flow (any doctor, custom out-of-slot time, no payment required) — it
+   * auto-disables itself the moment they successfully book one appointment under it
+   * (see AppointmentsService.createWithAdminOverride).
+   */
+  async toggleAdminBookingOverride(patientId: string, enabled: boolean): Promise<PatientWithMedicalFormResponseDto> {
+    const existingPatient = await this.prisma.user.findUnique({ where: { id: patientId } });
+    if (!existingPatient) {
+      throw new NotFoundException('Patient not found');
+    }
+
+    const updatedPatient = await this.prisma.user.update({
+      where: { id: patientId },
+      data: { adminBookingOverrideEnabled: enabled },
+    });
+
+    return this.mapToResponseDto(updatedPatient);
+  }
+
+  /**
    * Delete patient (hard delete - permanently removes from database)
    */
   async deletePatient(patientId: string): Promise<void> {
@@ -853,6 +874,7 @@ export class AdminService {
       isSubscribed: user.isSubscribed,
       subscriptionStatus: user.subscriptionStatus,
       subscriptionStartDate: user.subscriptionStartDate,
+      adminBookingOverrideEnabled: user.adminBookingOverrideEnabled,
       drivingLicensePath: user.drivingLicensePath,
       photoPath: user.photoPath,
       welcomeOrderPaymentIntentId: (user as any).welcomeOrderPaymentIntentId || null,
