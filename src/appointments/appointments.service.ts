@@ -84,7 +84,6 @@ export class AppointmentsService {
     const uniqueAdditionalServiceIds = Array.from(new Set((additionalServiceIds || []).filter(id => id && id !== serviceId)));
 
     let additionalServicesData: Array<{ id: string; name: string; duration: number }> = [];
-    let additionalServicesDuration = 0;
 
     if (uniqueAdditionalServiceIds.length > 0) {
       const additionalServices = await this.prisma.service.findMany({
@@ -100,7 +99,11 @@ export class AppointmentsService {
         if (!additional.isActive) {
           throw new BadRequestException(`Service "${additional.name}" is not active`);
         }
-        additionalServicesDuration += additional.duration;
+        // Each service's own duration is kept here purely for display (the
+        // additionalServices JSON blob below) — it is never summed into the
+        // booked appointment duration. One slot = one appointment, no matter
+        // how many services are attached to it; selecting extra services must
+        // never require a longer slot.
         additionalServicesData.push({
           id: additional.id,
           name: additional.name,
@@ -109,10 +112,7 @@ export class AppointmentsService {
       }
     }
 
-    const computedDuration = service.duration + additionalServicesDuration;
-    const appointmentDuration = additionalServicesData.length > 0
-      ? computedDuration
-      : (typeof duration === 'number' ? duration : service.duration);
+    let appointmentDuration = typeof duration === 'number' ? duration : service.duration;
 
     // Check if slot exists and is available (only if slotId is provided)
     let slot: any = null;
@@ -128,13 +128,11 @@ export class AppointmentsService {
         throw new BadRequestException('Slot is not available');
       }
 
-      // Check if slot duration is sufficient for service
+      // The appointment's duration IS the slot's own span — the one slot the
+      // patient picked, regardless of how many services are attached to it.
       const slotStart = new Date(`2000-01-01T${slot.startTime}`);
       const slotEnd = new Date(`2000-01-01T${slot.endTime}`);
-      const slotDuration = (slotEnd.getTime() - slotStart.getTime()) / (1000 * 60);
-      if (slotDuration < appointmentDuration) {
-        throw new BadRequestException('Slot duration is insufficient for the selected services');
-      }
+      appointmentDuration = (slotEnd.getTime() - slotStart.getTime()) / (1000 * 60);
     }
 
     // Check if appointment date is not in the past
