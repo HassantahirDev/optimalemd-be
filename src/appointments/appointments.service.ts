@@ -1,9 +1,11 @@
 import { Injectable, NotFoundException, BadRequestException, ConflictException, ForbiddenException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { JwtService } from '@nestjs/jwt';
 import Stripe from 'stripe';
 import { PrismaService } from '../prisma/prisma.service';
 import { MailerService } from '../mailer/mailer.service';
 import { GoogleCalendarService } from '../google-calendar/google-calendar.service';
+import { buildAutoLoginLink } from '../common/utils/auto-login-link.util';
 import {
   CreateAppointmentDto,
   UpdateAppointmentDto,
@@ -25,6 +27,7 @@ export class AppointmentsService {
     private mailerService: MailerService,
     private googleCalendarService: GoogleCalendarService,
     private configService: ConfigService,
+    private jwtService: JwtService,
   ) {
     const stripeKey = this.configService.get<string>('STRIPE_SECRET_KEY');
     if (stripeKey) {
@@ -790,8 +793,18 @@ export class AppointmentsService {
     visitStatusNote: string | undefined,
     setByUserId: string,
   ): Promise<AppointmentResponseDto> {
-    const appointment = await this.prisma.appointment.findUnique({ where: { id: appointmentId } });
+    const appointment = await this.prisma.appointment.findUnique({
+      where: { id: appointmentId },
+      include: {
+        patient: { select: { id: true, firstName: true, lastName: true, primaryEmail: true } },
+        doctor: { select: { firstName: true, lastName: true } },
+      },
+    });
     if (!appointment) throw new NotFoundException('Appointment not found');
+
+    // Only email on the actual transition INTO no-show, not on re-saves / note edits
+    // of an already-recorded no-show.
+    const isNewNoShow = visitStatus === 'NO_SHOW' && appointment.visitStatus !== 'NO_SHOW';
 
     // Mirror booking status from the recorded clinical outcome.
     const now = new Date();
@@ -828,6 +841,34 @@ export class AppointmentsService {
         ...bookingMirror,
       },
     });
+
+    // Fire the "sorry we missed you" email — non-fatal, must never block the status
+    // update itself just because the mail server hiccups.
+    if (isNewNoShow && appointment.patient?.primaryEmail) {
+      try {
+        const patientName = `${appointment.patient.firstName || ''} ${appointment.patient.lastName || ''}`.trim() || 'there';
+        const doctorName = appointment.doctor
+          ? `Dr. ${appointment.doctor.firstName} ${appointment.doctor.lastName}`
+          : 'your provider';
+        const bookingLink = buildAutoLoginLink(
+          this.jwtService,
+          this.configService,
+          appointment.patient,
+          '/dashboard/book-appointment',
+        );
+        await this.mailerService.sendNoShowEmail(
+          appointment.patient.primaryEmail,
+          patientName,
+          doctorName,
+          appointment.appointmentDate.toISOString().split('T')[0],
+          appointment.appointmentTime,
+          bookingLink,
+        );
+      } catch (err) {
+        console.error('Failed to send no-show email:', err);
+      }
+    }
+
     return updated as any;
   }
 
