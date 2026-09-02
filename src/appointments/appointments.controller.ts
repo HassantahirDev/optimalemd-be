@@ -44,6 +44,7 @@ import {
   AppointmentResponseDto,
   AppointmentWithRelationsResponseDto,
   AdminCreateAppointmentDto,
+  PatientOverrideBookingDto,
 } from './dto';
 import {
   CreateBookingDto,
@@ -358,6 +359,41 @@ export class AppointmentsController {
       data,
       timestamp: new Date().toISOString(),
       path: '/api/appointments/my-pending-unpaid',
+    };
+  }
+
+  // NOTE: these two routes MUST stay declared before 'patient/:patientId' below —
+  // Nest/Express match routes in declaration order, so a param route like
+  // 'patient/:patientId' greedily captures literal segments (e.g. 'override-status')
+  // registered after it, and this handler would never be reached.
+  @Get('patient/override-status')
+  @ApiOperation({ summary: 'Patient: check whether admin booking override is currently enabled for me' })
+  async getOverrideStatus(@CurrentUser() user: any) {
+    return { success: true, data: { enabled: !!user?.adminBookingOverrideEnabled } };
+  }
+
+  @Post('patient/create-with-override')
+  @ApiOperation({
+    summary: 'Patient: book using an admin-granted one-time override',
+    description:
+      'Same underlying flow as admin/create-confirmed (any doctor, custom out-of-slot time, no payment) — only usable when an admin has enabled adminBookingOverrideEnabled for this patient. Consumed automatically after one successful booking.',
+  })
+  @ApiOkResponse({ description: 'Appointment created', type: BaseApiResponse<AppointmentResponseDto> })
+  async createWithAdminOverride(
+    @CurrentUser() user: any,
+    @Body() dto: PatientOverrideBookingDto,
+  ): Promise<BaseApiResponse<AppointmentResponseDto>> {
+    if (user?.userType !== 'user') {
+      throw new ForbiddenException('Only patients can use this endpoint.');
+    }
+    const data = await this.appointmentsService.createWithAdminOverride(user.id, dto);
+    return {
+      success: true,
+      statusCode: 201,
+      message: 'Appointment created successfully',
+      data,
+      timestamp: new Date().toISOString(),
+      path: '/api/appointments/patient/create-with-override',
     };
   }
 

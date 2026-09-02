@@ -104,6 +104,13 @@ model User {
   drivingLicensePath String? // Path to uploaded driving license
   photoPath String? // Path to uploaded photo
 
+  // Admin-granted one-time override: while true, this patient's OWN booking page gets the
+  // exact same booking powers as admin's "Create Appointment" flow — pick any doctor, a
+  // custom out-of-slot time, and skip payment entirely (appointment is created CONFIRMED,
+  // isPaid=false). Auto-flips back to false the moment that appointment is created, so it's
+  // a one-time grant, not a standing permission.
+  adminBookingOverrideEnabled Boolean @default(false)
+
   // Patient documents (multiple paperwork/files)
   patientDocuments   PatientDocument[]
 
