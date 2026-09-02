@@ -181,11 +181,34 @@ export class AdminController {
     };
   }
 
+  @Patch(':id/booking-override')
+  @ApiOperation({
+    summary: 'Toggle admin booking override',
+    description: 'While enabled, this patient\'s own booking page gets admin-equivalent booking powers (any doctor, custom time, no payment) for their next appointment — auto-disables after that one booking.',
+  })
+  @ApiParam({ name: 'id', description: 'Patient ID' })
+  @ApiResponse({ status: 200, description: 'Booking override updated successfully' })
+  @ApiResponse({ status: 404, description: 'Patient not found' })
+  async toggleAdminBookingOverride(
+    @Param('id') patientId: string,
+    @Body() body: { enabled: boolean },
+  ): Promise<{ success: boolean; message: string; data: PatientWithMedicalFormResponseDto }> {
+    const patient = await this.adminService.toggleAdminBookingOverride(patientId, body.enabled);
+
+    return {
+      success: true,
+      message: body.enabled
+        ? 'Admin booking override enabled — patient can now book one appointment with admin controls'
+        : 'Admin booking override disabled',
+      data: patient,
+    };
+  }
+
   @Delete(':id')
   @HttpCode(HttpStatus.NO_CONTENT)
-  @ApiOperation({ 
-    summary: 'Delete Patient (Admin)', 
-    description: 'Soft delete patient by deactivating account' 
+  @ApiOperation({
+    summary: 'Delete Patient (Admin)',
+    description: 'Soft delete patient by deactivating account'
   })
   @ApiParam({ name: 'id', description: 'Patient ID' })
   @ApiResponse({ status: 204, description: 'Patient deleted successfully' })
