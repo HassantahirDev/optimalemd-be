@@ -299,18 +299,29 @@ export class MessagesService {
   }> {
     const { userId, userType } = getConversationsDto;
 
-    // TEMPORARY: Get all users instead of just conversation participants
     let allUsers;
     if (userType === 'doctor') {
-      // Get all patients for doctors
-      allUsers = await this.prisma.user.findMany({
-        select: {
-          id: true,
-          firstName: true,
-          lastName: true,
-          photoPath: true
-        }
+      // Only patients this doctor has at least one appointment with — not every
+      // patient in the system. `distinct: ['patientId']` collapses multiple
+      // appointments with the same patient down to one row before we fetch the users.
+      const appointments = await this.prisma.appointment.findMany({
+        where: { doctorId: userId },
+        select: { patientId: true },
+        distinct: ['patientId'],
       });
+      const patientIds = appointments.map((a) => a.patientId);
+
+      allUsers = patientIds.length
+        ? await this.prisma.user.findMany({
+            where: { id: { in: patientIds } },
+            select: {
+              id: true,
+              firstName: true,
+              lastName: true,
+              photoPath: true
+            }
+          })
+        : [];
     } else {
       // Get all doctors for patients
       allUsers = await this.prisma.doctor.findMany({
