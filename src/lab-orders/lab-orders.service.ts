@@ -605,5 +605,46 @@ export class LabOrdersService {
       updatedAt: order.updatedAt,
     };
   }
+
+  /**
+   * Admin: permanently remove a lab order — the order itself, its selected test items,
+   * every uploaded result file, and its per-order paperwork documents. Nothing else is
+   * touched: LabOrder has no other required relations anywhere in the schema (checked
+   * against prisma/schema.prisma), so this can't cascade into appointments, medical
+   * forms, payments, etc. — it only ever removes what belonged to this one lab order.
+   */
+  async adminDeleteLabOrder(orderId: string): Promise<{ id: string }> {
+    const order = await this.prisma.labOrder.findUnique({
+      where: { id: orderId },
+      include: { resultFiles: true, documents: true },
+    });
+
+    if (!order) {
+      throw new NotFoundException('Lab order not found');
+    }
+
+    const fs = require('fs');
+    const filePaths = [
+      order.receiptPath,
+      order.resultsPath,
+      ...order.resultFiles.map((f) => f.filePath),
+      ...order.documents.map((d) => d.filePath),
+    ].filter((p): p is string => !!p);
+
+    // DB row (and its LabOrderItem / LabResultFile / PatientDocument children, all
+    // onDelete: Cascade) is the source of truth — delete it first, then best-effort
+    // clean up the files on disk so a file-system hiccup never leaves an orphaned order.
+    await this.prisma.labOrder.delete({ where: { id: orderId } });
+
+    for (const filePath of filePaths) {
+      try {
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      } catch {
+        // Non-fatal — the DB record is already gone, which is what matters.
+      }
+    }
+
+    return { id: orderId };
+  }
 }
 
