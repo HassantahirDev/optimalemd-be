@@ -30,6 +30,7 @@ import { BlogModule } from './blog/blog.module';
 import { NewsletterModule } from './newsletter/newsletter.module';
 import { AiModule } from './ai/ai.module';
 import { PaymentsModule } from './payments/payments.module';
+import { EmailCheckerModule } from './email-checker/email-checker.module';
 import { PartnersModule } from './partners/partners.module';
 
 @Module({
@@ -64,6 +65,7 @@ import { PartnersModule } from './partners/partners.module';
     BlogModule,
     NewsletterModule,
     AiModule,
+    EmailCheckerModule,
     PaymentsModule,
     PartnersModule,
   ],

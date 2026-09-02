@@ -246,10 +246,20 @@ export class AdminCreateAppointmentDto {
   @IsNotEmpty()
   doctorId: string;
 
-  @ApiProperty({ description: 'Service ID' })
+  @ApiProperty({ description: 'Primary/first selected medical service ID' })
   @IsString()
   @IsNotEmpty()
   serviceId: string;
+
+  @ApiProperty({
+    description: 'Additional medical service IDs beyond serviceId (multi-select). Never changes the booked duration — one slot is one slot no matter how many services are attached to it.',
+    required: false,
+    type: [String],
+  })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  additionalServiceIds?: string[];
 
   @ApiProperty({ description: 'Primary Service ID (billing/main)' })
   @IsString()
@@ -281,10 +291,74 @@ export class AdminCreateAppointmentDto {
   @MaxLength(1000)
   patientNotes?: string;
 
-  @ApiProperty({ 
-    description: 'Patient timezone (IANA format, e.g., "America/New_York")', 
+  @ApiProperty({
+    description: 'Patient timezone (IANA format, e.g., "America/New_York")',
     required: false,
     example: 'America/New_York'
+  })
+  @IsOptional()
+  @IsString()
+  patientTimezone?: string;
+}
+
+// Same shape as AdminCreateAppointmentDto minus patientId — the patient booking with their
+// own admin-granted override can only ever book for themselves; patientId is always taken
+// from the authenticated session, never from the request body.
+export class PatientOverrideBookingDto {
+  @ApiProperty({ description: 'Doctor ID' })
+  @IsString()
+  @IsNotEmpty()
+  doctorId: string;
+
+  @ApiProperty({ description: 'Primary/first selected medical service ID' })
+  @IsString()
+  @IsNotEmpty()
+  serviceId: string;
+
+  @ApiProperty({
+    description: 'Additional medical service IDs beyond serviceId (multi-select). Never changes the booked duration — one slot is one slot no matter how many services are attached to it.',
+    required: false,
+    type: [String],
+  })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  additionalServiceIds?: string[];
+
+  @ApiProperty({ description: 'Primary Service ID (billing/main)' })
+  @IsString()
+  @IsNotEmpty()
+  primaryServiceId: string;
+
+  @ApiProperty({ description: 'Slot ID', required: false })
+  @IsOptional()
+  @IsString()
+  slotId?: string;
+
+  @ApiProperty({ description: 'Appointment date (YYYY-MM-DD)' })
+  @IsDateString()
+  appointmentDate: string;
+
+  @ApiProperty({ description: 'Appointment time (HH:MM)' })
+  @IsString()
+  @IsNotEmpty()
+  appointmentTime: string;
+
+  @ApiProperty({ description: 'Duration in minutes', example: 30 })
+  @Type(() => Number)
+  @IsNumber()
+  duration: number;
+
+  @ApiProperty({ description: 'Patient notes', required: false })
+  @IsOptional()
+  @IsString()
+  @MaxLength(1000)
+  patientNotes?: string;
+
+  @ApiProperty({
+    description: 'Patient timezone (IANA format, e.g., "America/New_York")',
+    required: false,
+    example: 'America/New_York',
   })
   @IsOptional()
   @IsString()
