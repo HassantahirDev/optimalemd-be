@@ -1,9 +1,11 @@
 import { Injectable, NotFoundException, BadRequestException, ConflictException, ForbiddenException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { JwtService } from '@nestjs/jwt';
 import Stripe from 'stripe';
 import { PrismaService } from '../prisma/prisma.service';
 import { MailerService } from '../mailer/mailer.service';
 import { GoogleCalendarService } from '../google-calendar/google-calendar.service';
+import { buildAutoLoginLink } from '../common/utils/auto-login-link.util';
 import {
   CreateAppointmentDto,
   UpdateAppointmentDto,
@@ -25,6 +27,7 @@ export class AppointmentsService {
     private mailerService: MailerService,
     private googleCalendarService: GoogleCalendarService,
     private configService: ConfigService,
+    private jwtService: JwtService,
   ) {
     const stripeKey = this.configService.get<string>('STRIPE_SECRET_KEY');
     if (stripeKey) {
@@ -84,7 +87,6 @@ export class AppointmentsService {
     const uniqueAdditionalServiceIds = Array.from(new Set((additionalServiceIds || []).filter(id => id && id !== serviceId)));
 
     let additionalServicesData: Array<{ id: string; name: string; duration: number }> = [];
-    let additionalServicesDuration = 0;
 
     if (uniqueAdditionalServiceIds.length > 0) {
       const additionalServices = await this.prisma.service.findMany({
@@ -100,7 +102,11 @@ export class AppointmentsService {
         if (!additional.isActive) {
           throw new BadRequestException(`Service "${additional.name}" is not active`);
         }
-        additionalServicesDuration += additional.duration;
+        // Each service's own duration is kept here purely for display (the
+        // additionalServices JSON blob below) — it is never summed into the
+        // booked appointment duration. One slot = one appointment, no matter
+        // how many services are attached to it; selecting extra services must
+        // never require a longer slot.
         additionalServicesData.push({
           id: additional.id,
           name: additional.name,
@@ -109,10 +115,7 @@ export class AppointmentsService {
       }
     }
 
-    const computedDuration = service.duration + additionalServicesDuration;
-    const appointmentDuration = additionalServicesData.length > 0
-      ? computedDuration
-      : (typeof duration === 'number' ? duration : service.duration);
+    let appointmentDuration = typeof duration === 'number' ? duration : service.duration;
 
     // Check if slot exists and is available (only if slotId is provided)
     let slot: any = null;
@@ -128,13 +131,11 @@ export class AppointmentsService {
         throw new BadRequestException('Slot is not available');
       }
 
-      // Check if slot duration is sufficient for service
+      // The appointment's duration IS the slot's own span — the one slot the
+      // patient picked, regardless of how many services are attached to it.
       const slotStart = new Date(`2000-01-01T${slot.startTime}`);
       const slotEnd = new Date(`2000-01-01T${slot.endTime}`);
-      const slotDuration = (slotEnd.getTime() - slotStart.getTime()) / (1000 * 60);
-      if (slotDuration < appointmentDuration) {
-        throw new BadRequestException('Slot duration is insufficient for the selected services');
-      }
+      appointmentDuration = (slotEnd.getTime() - slotStart.getTime()) / (1000 * 60);
     }
 
     // Check if appointment date is not in the past
@@ -792,8 +793,18 @@ export class AppointmentsService {
     visitStatusNote: string | undefined,
     setByUserId: string,
   ): Promise<AppointmentResponseDto> {
-    const appointment = await this.prisma.appointment.findUnique({ where: { id: appointmentId } });
+    const appointment = await this.prisma.appointment.findUnique({
+      where: { id: appointmentId },
+      include: {
+        patient: { select: { id: true, firstName: true, lastName: true, primaryEmail: true } },
+        doctor: { select: { firstName: true, lastName: true } },
+      },
+    });
     if (!appointment) throw new NotFoundException('Appointment not found');
+
+    // Only email on the actual transition INTO no-show, not on re-saves / note edits
+    // of an already-recorded no-show.
+    const isNewNoShow = visitStatus === 'NO_SHOW' && appointment.visitStatus !== 'NO_SHOW';
 
     // Mirror booking status from the recorded clinical outcome.
     const now = new Date();
@@ -830,6 +841,34 @@ export class AppointmentsService {
         ...bookingMirror,
       },
     });
+
+    // Fire the "sorry we missed you" email — non-fatal, must never block the status
+    // update itself just because the mail server hiccups.
+    if (isNewNoShow && appointment.patient?.primaryEmail) {
+      try {
+        const patientName = `${appointment.patient.firstName || ''} ${appointment.patient.lastName || ''}`.trim() || 'there';
+        const doctorName = appointment.doctor
+          ? `Dr. ${appointment.doctor.firstName} ${appointment.doctor.lastName}`
+          : 'your provider';
+        const bookingLink = buildAutoLoginLink(
+          this.jwtService,
+          this.configService,
+          appointment.patient,
+          '/dashboard/book-appointment',
+        );
+        await this.mailerService.sendNoShowEmail(
+          appointment.patient.primaryEmail,
+          patientName,
+          doctorName,
+          appointment.appointmentDate.toISOString().split('T')[0],
+          appointment.appointmentTime,
+          bookingLink,
+        );
+      } catch (err) {
+        console.error('Failed to send no-show email:', err);
+      }
+    }
+
     return updated as any;
   }
 
@@ -1950,7 +1989,7 @@ export class AppointmentsService {
   }
 
   async adminCreateConfirmed(dto: any): Promise<any> {
-    const { patientId, doctorId, serviceId, primaryServiceId, slotId, appointmentDate, appointmentTime, duration, patientNotes, patientTimezone } = dto;
+    const { patientId, doctorId, serviceId, additionalServiceIds, primaryServiceId, slotId, appointmentDate, appointmentTime, duration, patientNotes, patientTimezone } = dto;
 
     // Basic validations
     const patient = await this.prisma.user.findUnique({ where: { id: patientId }, select: { id: true, isActive: true } });
@@ -1966,6 +2005,31 @@ export class AppointmentsService {
     const service = await this.prisma.service.findUnique({ where: { id: serviceId }, select: { id: true, isActive: true } });
     if (!service || !service.isActive) {
       throw new BadRequestException('Invalid or inactive service');
+    }
+
+    // Multi-select medical services. Each service's own duration is kept only for
+    // display (the additionalServices JSON blob below) — it is NEVER summed into the
+    // booked duration. One slot = one appointment, no matter how many services are
+    // attached to it; the `duration` param above (the slot's own span, or the admin's
+    // custom-time duration) is what's actually booked, unchanged by this selection.
+    let additionalServicesData: Array<{ id: string; name: string; duration: number }> = [];
+    const uniqueAdditionalServiceIds = Array.from(
+      new Set((additionalServiceIds || []).filter((id: string) => id && id !== serviceId)),
+    ) as string[];
+    if (uniqueAdditionalServiceIds.length > 0) {
+      const additionalServices = await this.prisma.service.findMany({
+        where: { id: { in: uniqueAdditionalServiceIds } },
+        select: { id: true, name: true, duration: true, isActive: true },
+      });
+      if (additionalServices.length !== uniqueAdditionalServiceIds.length) {
+        throw new BadRequestException('One or more additional services are invalid');
+      }
+      for (const additional of additionalServices) {
+        if (!additional.isActive) {
+          throw new BadRequestException(`Service "${additional.name}" is not active`);
+        }
+        additionalServicesData.push({ id: additional.id, name: additional.name, duration: additional.duration });
+      }
     }
 
     // Validate primary service
@@ -1997,9 +2061,14 @@ export class AppointmentsService {
       });
       const clash = daySlots.find((s) => toMin(s.startTime) < endMin && startMin < toMin(s.endTime));
       if (clash) {
-        throw new BadRequestException(
-          `A slot already exists in the schedule for ${clash.startTime}–${clash.endTime} on this date. Please book that slot instead of creating a custom time.`,
-        );
+        // Send the raw UTC times as their own fields (same as every slot object already
+        // does) instead of baking them into the sentence — the frontend formats these
+        // with the exact same formatTime() it already uses for the slot dropdown.
+        throw new BadRequestException({
+          message: `A slot already exists in the schedule for ${clash.startTime}–${clash.endTime} on this date. Please book that slot instead of creating a custom time.`,
+          clashStartTime: clash.startTime,
+          clashEndTime: clash.endTime,
+        });
       }
     }
 
@@ -2019,6 +2088,7 @@ export class AppointmentsService {
         appointmentDate: dateStringToUTC(appointmentDate),
         appointmentTime,
         duration,
+        additionalServices: additionalServicesData.length > 0 ? additionalServicesData : undefined,
         status: 'CONFIRMED',
         patientNotes: patientNotes ?? null,
         carePlan: defaultCarePlan,
@@ -2149,6 +2219,37 @@ export class AppointmentsService {
     }
 
     return created as any;
+  }
+
+  /**
+   * Patient books using an admin-granted one-time override: exact same underlying flow as
+   * adminCreateConfirmed (any doctor, custom out-of-slot time, no payment) — just entered
+   * from the patient's own booking page instead of the admin panel. patientId always comes
+   * from the authenticated session (never the request body), so a patient can only ever
+   * book for themselves this way. The override is consumed (flipped back off) the moment
+   * the appointment is successfully created, so it's a one-time grant.
+   */
+  async createWithAdminOverride(userId: string, dto: any): Promise<any> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, isActive: true, adminBookingOverrideEnabled: true },
+    });
+    if (!user || !user.isActive) {
+      throw new BadRequestException('Invalid or inactive patient');
+    }
+    if (!user.adminBookingOverrideEnabled) {
+      throw new ForbiddenException('Admin booking override is not enabled for your account.');
+    }
+
+    const created = await this.adminCreateConfirmed({ ...dto, patientId: userId });
+
+    // Consume the one-time grant — only after the appointment was actually created.
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { adminBookingOverrideEnabled: false },
+    });
+
+    return created;
   }
 
   async getUnassignedAppointments(params: { page?: number; limit?: number; status?: string }): Promise<any[]> {

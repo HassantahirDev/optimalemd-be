@@ -30,6 +30,7 @@ import { BlogModule } from './blog/blog.module';
 import { NewsletterModule } from './newsletter/newsletter.module';
 import { AiModule } from './ai/ai.module';
 import { PaymentsModule } from './payments/payments.module';
+import { EmailCheckerModule } from './email-checker/email-checker.module';
 
 @Module({
   imports: [
@@ -63,6 +64,7 @@ import { PaymentsModule } from './payments/payments.module';
     BlogModule,
     NewsletterModule,
     AiModule,
+    EmailCheckerModule,
     PaymentsModule,
   ],
   controllers: [AppController],

@@ -54,7 +54,7 @@ async function bootstrap() {
         'http://localhost:8080'
       ],
       methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-      allowedHeaders: ['Content-Type', 'Authorization'],
+      allowedHeaders: ['Content-Type', 'Authorization', 'x-checker-key'],
       credentials: true,
     },
   );

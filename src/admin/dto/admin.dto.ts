@@ -758,6 +758,9 @@ export class PatientWithMedicalFormResponseDto {
   @ApiProperty({ description: 'Subscription start date', required: false })
   subscriptionStartDate?: Date | null;
 
+  @ApiProperty({ description: 'One-time admin booking override — grants admin-equivalent booking powers on the patient\'s own booking page for their next appointment', required: false })
+  adminBookingOverrideEnabled?: boolean;
+
   @ApiProperty({ description: 'Driving license file path', required: false })
   drivingLicensePath?: string | null;
 

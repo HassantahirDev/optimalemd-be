@@ -25,21 +25,30 @@ export class HttpExceptionFilter implements ExceptionFilter {
     let message: string;
     let details: string[] | undefined;
     let error: string;
-    
+    // Any extra fields the thrower attached beyond the standard message/error/statusCode
+    // (e.g. `throw new BadRequestException({ message, clashStartTime, clashEndTime })`) —
+    // forwarded as-is so callers can use them instead of parsing the message string.
+    let extraFields: Record<string, unknown> | undefined;
+
     if (typeof exceptionResponse === 'string') {
       message = exceptionResponse;
       error = this.getErrorType(status);
     } else if (typeof exceptionResponse === 'object') {
       const responseObj = exceptionResponse as any;
       message = responseObj.message || responseObj.error || 'An error occurred';
-      
+
       // Handle validation errors
       if (Array.isArray(responseObj.message)) {
         details = responseObj.message;
         message = 'Validation failed';
       }
-      
+
       error = responseObj.error || this.getErrorType(status);
+
+      const { message: _m, error: _e, statusCode: _s, ...rest } = responseObj;
+      if (Object.keys(rest).length > 0) {
+        extraFields = rest;
+      }
     } else {
       message = 'An error occurred';
       error = this.getErrorType(status);
@@ -55,6 +64,7 @@ export class HttpExceptionFilter implements ExceptionFilter {
       timestamp: new Date().toISOString(),
       path: request.url,
       requestId,
+      ...extraFields,
     };
 
     // Log error for debugging
