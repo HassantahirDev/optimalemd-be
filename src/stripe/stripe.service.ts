@@ -158,16 +158,29 @@ export class StripeService {
       throw new BadRequestException('Failed to generate payment client secret');
     }
 
-    // Create payment record
+    // Create (or replace) the payment record for this appointment. appointmentId is
+    // @unique on Payment, so a retried/re-opened payment (e.g. clicking "Complete Payment"
+    // again on an unpaid-reservation banner) hits an existing row from the first attempt —
+    // upsert so it's updated with the fresh payment intent instead of crashing on the
+    // unique constraint.
     if (appointmentId) {
-      await this.prisma.payment.create({
-        data: {
+      await this.prisma.payment.upsert({
+        where: { appointmentId },
+        create: {
           appointmentId,
           stripePaymentId: paymentIntent.id,
           amount,
           currency,
           status: 'PENDING',
           paymentIntent: paymentIntent.id,
+        },
+        update: {
+          stripePaymentId: paymentIntent.id,
+          amount,
+          currency,
+          status: 'PENDING',
+          paymentIntent: paymentIntent.id,
+          paidAt: null,
         },
       });
     }
@@ -1482,6 +1495,10 @@ export class StripeService {
     // We find the authoritative premium subscription and adopt it, so a cancellation made
     // directly in Stripe (or a missed webhook) is always reflected here.
     if (user.stripeCustomerId) {
+      // Captured BEFORE the lookup below can overwrite user.stripeSubscriptionId — this is
+      // what tells us whether the DB was ever pointing at a real Stripe subscription.
+      const hadStripeSubscriptionId = !!user.stripeSubscriptionId;
+
       const livePremium = await this.findPremiumSubscriptionFromStripe(
         user.stripeCustomerId,
       );
@@ -1493,8 +1510,9 @@ export class StripeService {
             data: { stripeSubscriptionId: livePremium.id },
           });
         }
-      } else {
-        // No premium subscription exists in Stripe at all — ensure DB reflects unsubscribed.
+      } else if (hadStripeSubscriptionId) {
+        // A real Stripe subscription this user WAS linked to has since disappeared/canceled —
+        // genuine cleanup case. Ensure DB reflects unsubscribed.
         if (user.isSubscribed || user.stripeSubscriptionId) {
           await this.prisma.user.update({
             where: { id: userId },
@@ -1509,6 +1527,10 @@ export class StripeService {
         user.subscriptionStatus = 'canceled';
         user.stripeSubscriptionId = null;
       }
+      // else: no Stripe subscription was ever linked (stripeSubscriptionId was already
+      // null) and Stripe has none either — nothing to reconcile. In particular this
+      // leaves an admin-granted premium (isSubscribed=true, no stripeSubscriptionId)
+      // untouched instead of silently reverting it to unsubscribed.
     }
 
     let stripeSubscription: any = null;
