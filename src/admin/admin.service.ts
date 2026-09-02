@@ -674,7 +674,13 @@ export class AdminService {
       throw new NotFoundException('Patient not found');
     }
 
-    // Update subscription status
+    // Update subscription status. stripeSubscriptionId is ALWAYS cleared here (even when
+    // granting) — an admin grant is a manual override, never Stripe-backed. Leaving a stale
+    // subscription id in place (e.g. from a past real subscription that has since lapsed)
+    // makes getSubscriptionStatus() treat this as "a real subscription that needs
+    // reconciling", and it silently reverts the grant back to unsubscribed the next time the
+    // patient's dashboard checks status. stripeCustomerId is kept — harmless, and needed if
+    // the patient later subscribes for real.
     const updatedPatient = await this.prisma.user.update({
       where: { id: patientId },
       data: {
@@ -683,10 +689,30 @@ export class AdminService {
         subscriptionStartDate: isPremium ? new Date() : null,
         subscriptionEndDate: null,
         subscriptionCanceledAt: null,
-        // Clear Stripe subscription ID when removing premium to avoid conflicts with Stripe data
-        stripeSubscriptionId: isPremium ? existingPatient.stripeSubscriptionId : null,
+        stripeSubscriptionId: null,
         stripeCustomerId: isPremium ? existingPatient.stripeCustomerId : null,
       },
+    });
+
+    return this.mapToResponseDto(updatedPatient);
+  }
+
+  /**
+   * Toggle the one-time "admin booking override" for a patient. While enabled, that
+   * patient's own booking page gets the exact same booking powers as admin's Create
+   * Appointment flow (any doctor, custom out-of-slot time, no payment required) — it
+   * auto-disables itself the moment they successfully book one appointment under it
+   * (see AppointmentsService.createWithAdminOverride).
+   */
+  async toggleAdminBookingOverride(patientId: string, enabled: boolean): Promise<PatientWithMedicalFormResponseDto> {
+    const existingPatient = await this.prisma.user.findUnique({ where: { id: patientId } });
+    if (!existingPatient) {
+      throw new NotFoundException('Patient not found');
+    }
+
+    const updatedPatient = await this.prisma.user.update({
+      where: { id: patientId },
+      data: { adminBookingOverrideEnabled: enabled },
     });
 
     return this.mapToResponseDto(updatedPatient);
@@ -848,6 +874,7 @@ export class AdminService {
       isSubscribed: user.isSubscribed,
       subscriptionStatus: user.subscriptionStatus,
       subscriptionStartDate: user.subscriptionStartDate,
+      adminBookingOverrideEnabled: user.adminBookingOverrideEnabled,
       drivingLicensePath: user.drivingLicensePath,
       photoPath: user.photoPath,
       welcomeOrderPaymentIntentId: (user as any).welcomeOrderPaymentIntentId || null,
