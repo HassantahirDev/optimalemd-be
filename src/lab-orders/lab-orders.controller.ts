@@ -309,5 +309,34 @@ export class LabOrdersController {
       path: `/api/lab-orders/admin/patient/${patientId}`,
     };
   }
+
+  @Delete('admin/:orderId')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Permanently delete a lab order (Admin)',
+    description:
+      'Hard-deletes a lab order along with its test items, uploaded result files, and per-order documents. Does not affect the appointment, medical form, or anything else tied to the patient.',
+  })
+  @ApiParam({
+    name: 'orderId',
+    description: 'Lab order ID',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Lab order permanently deleted',
+  })
+  async adminDeleteLabOrder(
+    @Param('orderId') orderId: string,
+  ): Promise<BaseApiResponse<{ id: string }>> {
+    const result = await this.labOrdersService.adminDeleteLabOrder(orderId);
+    return {
+      success: true,
+      statusCode: HttpStatus.OK,
+      message: 'Lab order permanently deleted',
+      data: result,
+      timestamp: new Date().toISOString(),
+      path: `/api/lab-orders/admin/${orderId}`,
+    };
+  }
 }
 
