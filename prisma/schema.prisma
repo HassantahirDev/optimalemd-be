@@ -540,10 +540,17 @@ model Payment {
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
   paidAt            DateTime?
-  
+
+  // Partner platform-credit applied to this payment — same pattern as WelcomeOrder's
+  // equivalent fields. partnerCreditDeducted guards against double-deducting the
+  // partner's balance on a retried/re-confirmed payment.
+  partnerCreditPartnerId    String?
+  partnerCreditAppliedCents Int?     @default(0)
+  partnerCreditDeducted     Boolean  @default(false)
+
   // Relations
   appointment       Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
-  
+
   @@map("payments")
 }
 
@@ -561,11 +568,17 @@ model MedicationPayment {
   subscriptionStatus String? // active, canceling, canceled, etc.
   subscriptionCanceledAt DateTime? // When cancellation was requested
   subscriptionEndDate DateTime? // When subscription will end (current_period_end)
-  
+
+  // Partner platform-credit applied to this medication order's FIRST invoice only
+  // (never recurring months) — same pattern as Payment/WelcomeOrder.
+  partnerCreditPartnerId    String?
+  partnerCreditAppliedCents Int?     @default(0)
+  partnerCreditDeducted     Boolean  @default(false)
+
   // Timestamps
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
-  
+
   // Relations
   appointment       Appointment @relation("MedicationPayments", fields: [appointmentId], references: [id], onDelete: Restrict)
 
@@ -1247,7 +1260,14 @@ model WelcomeOrder {
   paymentIntentId   String?
   paymentStatus     PaymentStatus @default(PENDING)
   paidAt            DateTime?
-  
+
+  // Partner platform-credit applied to this order (soft link — no FK, same pattern as
+  // PaymentRecord's other soft links). partnerCreditDeducted guards against double-
+  // deducting the partner's balance on a retried/re-confirmed payment.
+  partnerCreditPartnerId    String?
+  partnerCreditAppliedCents Int?     @default(0)
+  partnerCreditDeducted     Boolean  @default(false)
+
   // Progress tracking
   currentStep       Int      @default(0) // 0-4 (Gender, Basic Info, Checkout, Password, Details)
   currentSubStep    Int      @default(0) // For internal navigation within steps
@@ -1553,6 +1573,19 @@ model ReferralPartner {
   bankAccountNumber     String?
   bankDetailsUpdatedAt  DateTime?
 
+  // Platform credit — every commission converts to spendable credit automatically
+  // (see Commission.status CREDITED) instead of sitting as a manual-payout-only OWED
+  // balance. 1 cent of credit = 1 cent off at signup (welcome order) and, if any is
+  // left over, off the first premium-subscription invoice. Manual payout (PayoutBatch/
+  // PayoutRequest) still exists for whatever was OWED before this shipped.
+  creditBalanceCents Int @default(0)
+
+  // The ONE email allowed to redeem creditBalanceCents at signup — defaults to `email`
+  // (this partner's own account email) until they verify a different one via
+  // PartnerCreditEmailVerification. Only ever one active email at a time: setting a new
+  // one replaces this value outright, so the old email stops working immediately.
+  creditActiveEmail String?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -1561,8 +1594,26 @@ model ReferralPartner {
   payoutBatches PayoutBatch[]
   commissionRules CommissionRule[]
   payoutRequests PayoutRequest[]
+  creditEmailVerifications PartnerCreditEmailVerification[]
 
   @@map("referral_partners")
+}
+
+// A pending "I want to redeem my credit under a different email" request. The new
+// email only becomes ReferralPartner.creditActiveEmail once verified — never before —
+// so credit can't be redirected to an email the partner doesn't actually control.
+model PartnerCreditEmailVerification {
+  id         String          @id @default(uuid())
+  partnerId  String
+  partner    ReferralPartner @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  newEmail   String
+  code       String // 6-digit
+  expiresAt  DateTime
+  verifiedAt DateTime?
+  createdAt  DateTime        @default(now())
+
+  @@index([partnerId])
+  @@map("partner_credit_email_verifications")
 }
 
 // One row per attributed visitor/signup. Attribution is LAST-TOUCH: the code
@@ -1666,7 +1717,8 @@ model Commission {
 }
 
 enum CommissionStatus {
-  OWED
+  OWED // legacy: earned before platform-credit auto-conversion shipped; still payable manually
+  CREDITED // converted automatically to ReferralPartner.creditBalanceCents at creation time
   PAID
   VOIDED
 }

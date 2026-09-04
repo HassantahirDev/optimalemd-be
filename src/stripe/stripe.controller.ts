@@ -85,6 +85,13 @@ export class StripeController {
     );
   }
 
+  @Get('subscription/price-preview')
+  @ApiOperation({ summary: 'Preview the premium subscription price, including any partner credit, before committing' })
+  async previewSubscriptionPrice(@Request() req) {
+    const data = await this.stripeService.previewSubscriptionPrice(req.user.id);
+    return { success: true, data };
+  }
+
   @Post('subscription/create')
   @ApiOperation({ summary: 'Create a subscription for the authenticated user' })
   @ApiResponse({ status: 201, description: 'Subscription created successfully' })

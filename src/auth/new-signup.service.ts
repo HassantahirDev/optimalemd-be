@@ -150,18 +150,36 @@ export class NewSignupService {
   // Create a new welcome order
   async createWelcomeOrder(createDto: CreateWelcomeOrderDto) {
     const orderNumber = this.generateOrderNumber();
-    
+
+    // Partner platform credit, applied server-side (never trust a client-sent discount
+    // for this) — 1 cent of credit = 1 cent off. Reserved here, not yet spent from the
+    // partner's balance; that happens in updatePaymentStatus once payment truly succeeds,
+    // so a never-completed signup never burns real credit.
+    const credit = await this.partnersService.findAvailableCreditByEmail(createDto.email);
+    const clientFinalCents = Math.round(createDto.finalAmount * 100);
+    const creditAppliedCents = credit ? Math.min(credit.availableCents, clientFinalCents) : 0;
+    const finalAmount = creditAppliedCents > 0
+      ? Math.round((createDto.finalAmount - creditAppliedCents / 100) * 100) / 100
+      : createDto.finalAmount;
+    const discountAmount = creditAppliedCents > 0
+      ? Math.round((createDto.discountAmount + creditAppliedCents / 100) * 100) / 100
+      : createDto.discountAmount;
+
     const welcomeOrder = await this.prisma.welcomeOrder.create({
       data: {
         email: createDto.email,
         orderNumber,
         totalAmount: createDto.totalAmount,
-        discountAmount: createDto.discountAmount,
-        finalAmount: createDto.finalAmount,
+        discountAmount,
+        finalAmount,
         status: WelcomeOrderStatus.PENDING,
         currentStep: 0,
         currentSubStep: 0,
         ...(createDto.userId && { userId: createDto.userId }),
+        ...(creditAppliedCents > 0 && {
+          partnerCreditPartnerId: credit!.partnerId,
+          partnerCreditAppliedCents: creditAppliedCents,
+        }),
       },
       include: {
         signupSteps: true,
@@ -536,14 +554,20 @@ export class NewSignupService {
     });
 
     // Partner-program attribution: bind the visitor's last-touch partner click to
-    // this new account, then fire the qualifying event ("signup completed OR
-    // welcome order purchased" — this is the "signup completed" branch). Both are
-    // non-fatal — a referral hiccup must never block account creation.
+    // this new account. QUALIFYING (the event that earns the partner a commission)
+    // requires this welcome order to have actually been paid — reaching this step
+    // doesn't guarantee that server-side, so it's checked explicitly rather than
+    // assumed from step order. Both are non-fatal — a referral hiccup must never
+    // block account creation.
     try {
       await this.partnersService.bindOnSignup(mergedUserData.visitorId || userData.visitorId, user.id, user.primaryEmail || undefined);
-      await this.partnersService.qualify(user.id, {
-        revenueCents: Math.round(Number(welcomeOrder.finalAmount || 0) * 100),
-      });
+      if (welcomeOrder.paymentStatus === PaymentStatus.SUCCEEDED) {
+        await this.partnersService.qualify(user.id, {
+          revenueCents: Math.round(Number(welcomeOrder.finalAmount || 0) * 100),
+        });
+      } else {
+        console.log(`Skipping partner qualification for welcome order ${welcomeOrder.id} — payment not succeeded (${welcomeOrder.paymentStatus})`);
+      }
     } catch (partnerErr) {
       console.error('Partner attribution/qualification failed (non-fatal):', partnerErr);
     }
@@ -580,6 +604,22 @@ export class NewSignupService {
     }
 
     return welcomeOrder;
+  }
+
+  // A welcome order fully covered by partner credit (finalAmount rounds to $0) never
+  // gets a real Stripe PaymentIntent — createPaymentIntent refuses amounts <= 0. This
+  // reuses all of updatePaymentStatus's logic (ledger write, credit deduction, email)
+  // with a synthetic non-Stripe id, same pattern as the existing free-appointment flow.
+  async confirmFreeWelcomeOrder(welcomeOrderId: string) {
+    const order = await this.prisma.welcomeOrder.findUnique({ where: { id: welcomeOrderId } });
+    if (!order) throw new NotFoundException('Welcome order not found');
+    if (Number(order.finalAmount) !== 0) {
+      throw new BadRequestException('This order is not fully covered by credit');
+    }
+    if (order.paymentStatus === PaymentStatus.SUCCEEDED) {
+      return this.getWelcomeOrder(welcomeOrderId); // already confirmed, idempotent no-op
+    }
+    return this.updatePaymentStatus(welcomeOrderId, `free-${welcomeOrderId}`, PaymentStatus.SUCCEEDED);
   }
 
   // Update payment status
@@ -637,6 +677,22 @@ export class NewSignupService {
         receiptUrl,
         note: `Signup order ${welcomeOrder.orderNumber}`,
       });
+
+      // Actually spend the reserved partner credit now that payment truly succeeded —
+      // never at order-creation time, so an abandoned/failed checkout never burns real
+      // credit. partnerCreditDeducted guards against double-spending on a retried
+      // confirm-payment call for the same order.
+      if (
+        welcomeOrder.partnerCreditPartnerId &&
+        (welcomeOrder.partnerCreditAppliedCents ?? 0) > 0 &&
+        !welcomeOrder.partnerCreditDeducted
+      ) {
+        await this.partnersService.spendCredit(welcomeOrder.partnerCreditPartnerId, welcomeOrder.partnerCreditAppliedCents!);
+        await this.prisma.welcomeOrder.update({
+          where: { id: welcomeOrder.id },
+          data: { partnerCreditDeducted: true },
+        });
+      }
     }
 
     // Send payment confirmation email if payment succeeded
@@ -799,10 +855,25 @@ export class NewSignupService {
       }
 
       // Partner-program attribution — separate from the patient referral hook above.
-      // Qualifying event here is "signup completed" (no welcome order in this flow).
+      // Binding (visitorId -> this new userId) happens regardless, so the click is
+      // never lost even if payment comes later or never completes. QUALIFYING —
+      // the event that actually earns the partner a commission — requires an actual
+      // SUCCEEDED welcome order for this email; a created-but-unpaid account (or one
+      // created through a path with no welcome order at all) must never qualify.
       try {
         await this.partnersService.bindOnSignup(userData.visitorId, user.id, normalizedEmail);
-        await this.partnersService.qualify(user.id, {});
+
+        const paidWelcomeOrder = await this.prisma.welcomeOrder.findFirst({
+          where: { email: normalizedEmail, paymentStatus: PaymentStatus.SUCCEEDED },
+          orderBy: { paidAt: 'desc' },
+        });
+        if (paidWelcomeOrder) {
+          await this.partnersService.qualify(user.id, {
+            revenueCents: Math.round(Number(paidWelcomeOrder.finalAmount) * 100),
+          });
+        } else {
+          console.log(`Skipping partner qualification for ${normalizedEmail} — no paid welcome order yet`);
+        }
       } catch (partnerErr) {
         console.error('Partner attribution/qualification failed (non-fatal):', partnerErr);
       }

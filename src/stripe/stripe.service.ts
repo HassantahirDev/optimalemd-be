@@ -7,6 +7,7 @@ import { MailerService } from '../mailer/mailer.service';
 import { GoogleCalendarService } from '../google-calendar/google-calendar.service';
 import { ReferralService } from '../referral/referral.service';
 import { PaymentLedgerService } from '../payments/payment-ledger.service';
+import { PartnersService } from '../partners/partners.service';
 import { CreatePaymentIntentDto, ConfirmPaymentDto } from './dto';
 
 @Injectable()
@@ -21,6 +22,7 @@ export class StripeService {
     private googleCalendarService: GoogleCalendarService,
     private referralService: ReferralService,
     private paymentLedger: PaymentLedgerService,
+    private partnersService: PartnersService,
   ) {
     const stripeKey = this.configService.get('STRIPE_SECRET_KEY');
     if (!stripeKey) {
@@ -49,12 +51,14 @@ export class StripeService {
    * Create a payment intent for an appointment or welcome order
    */
   async createPaymentIntent(createPaymentIntentDto: CreatePaymentIntentDto) {
-    const { appointmentId, welcomeOrderId, amount, currency = 'usd' } = createPaymentIntentDto;
+    const { appointmentId, welcomeOrderId, currency = 'usd' } = createPaymentIntentDto;
+    let amount = createPaymentIntentDto.amount;
 
     let metadata: any = {};
     let description = '';
 
     let stripeCustomerId: string | undefined;
+    let appointmentCreditApplied: { partnerId: string; appliedCents: number } | null = null;
 
     if (appointmentId) {
       const appointment = await this.prisma.appointment.findUnique({
@@ -68,6 +72,27 @@ export class StripeService {
 
       if (!appointment) throw new NotFoundException('Appointment not found');
       if (appointment.isPaid) throw new BadRequestException('Appointment is already paid');
+
+      // Partner platform credit — same mechanism as the welcome-order signup fee.
+      // Applied authoritatively here (never trust a client-sent discount), reserved
+      // on the Payment row, and only actually spent from the partner's balance once
+      // this payment truly succeeds (see confirmPayment).
+      const appointmentCredit = await this.partnersService.findAvailableCreditByEmail(
+        appointment.patient.primaryEmail || '',
+      );
+      if (appointmentCredit && appointmentCredit.availableCents > 0 && amount) {
+        const amountCents = Math.round(amount * 100);
+        // Stripe requires a minimum charge (50 cents) — cap the applied credit so the
+        // appointment never lands in an unchargeable $0.01–$0.49 gap. A fully-covered
+        // ($0) appointment isn't built yet (unlike the welcome order's confirm-free
+        // path) — this leaves a minimum charge instead of erroring out.
+        const maxApplyCents = Math.max(0, amountCents - 50);
+        const applyCents = Math.min(appointmentCredit.availableCents, maxApplyCents);
+        if (applyCents > 0) {
+          amount = (amountCents - applyCents) / 100;
+          appointmentCreditApplied = { partnerId: appointmentCredit.partnerId, appliedCents: applyCents };
+        }
+      }
 
       const patientName = `${appointment.patient.firstName} ${appointment.patient.lastName}`;
       const doctorName = appointment.doctor ? `Dr. ${appointment.doctor.firstName} ${appointment.doctor.lastName}` : 'Doctor TBD';
@@ -104,6 +129,10 @@ export class StripeService {
 
       if (!welcomeOrder) throw new NotFoundException('Welcome order not found');
       if (welcomeOrder.paymentStatus === 'SUCCEEDED') throw new BadRequestException('Welcome order is already paid');
+
+      // Authoritative — never trust a client-sent amount here. finalAmount already
+      // reflects any partner platform credit applied at order-creation time.
+      amount = Number(welcomeOrder.finalAmount);
 
       const patientName = welcomeOrder.user
         ? `${welcomeOrder.user.firstName} ${welcomeOrder.user.lastName}`
@@ -187,6 +216,10 @@ export class StripeService {
           currency,
           status: 'PENDING',
           paymentIntent: paymentIntent.id,
+          ...(appointmentCreditApplied && {
+            partnerCreditPartnerId: appointmentCreditApplied.partnerId,
+            partnerCreditAppliedCents: appointmentCreditApplied.appliedCents,
+          }),
         },
         update: {
           stripePaymentId: paymentIntent.id,
@@ -195,6 +228,11 @@ export class StripeService {
           status: 'PENDING',
           paymentIntent: paymentIntent.id,
           paidAt: null,
+          ...(appointmentCreditApplied && {
+            partnerCreditPartnerId: appointmentCreditApplied.partnerId,
+            partnerCreditAppliedCents: appointmentCreditApplied.appliedCents,
+            partnerCreditDeducted: false,
+          }),
         },
       });
     }
@@ -241,8 +279,29 @@ export class StripeService {
         status: 'SUCCEEDED',
         paidAt: new Date(),
       },
-      select: { amount: true, appointmentId: true },
+      select: {
+        amount: true,
+        appointmentId: true,
+        partnerCreditPartnerId: true,
+        partnerCreditAppliedCents: true,
+        partnerCreditDeducted: true,
+      },
     });
+
+    // Actually spend the reserved partner credit now that payment truly succeeded —
+    // never at payment-intent-creation time (see createPaymentIntent). Guarded by
+    // partnerCreditDeducted so a retried confirm-payment call never double-spends.
+    if (
+      updatedPayment.partnerCreditPartnerId &&
+      (updatedPayment.partnerCreditAppliedCents ?? 0) > 0 &&
+      !updatedPayment.partnerCreditDeducted
+    ) {
+      await this.partnersService.spendCredit(updatedPayment.partnerCreditPartnerId, updatedPayment.partnerCreditAppliedCents!);
+      await this.prisma.payment.update({
+        where: { paymentIntent: paymentIntentId },
+        data: { partnerCreditDeducted: true },
+      });
+    }
 
     // --- Dual-write consult payment into the unified ledger (additive; Part A) ---
     // Existing Payment logic above is untouched.
@@ -550,6 +609,34 @@ export class StripeService {
     }
   }
 
+  /**
+   * Preview the premium subscription price BEFORE the patient commits — lets the
+   * Subscribe modal show "Partner credit applied: -$X" and the true price up front,
+   * instead of only finding out what was charged after confirming. Read-only; applies
+   * nothing, spends nothing.
+   */
+  async previewSubscriptionPrice(userId: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { primaryEmail: true, email: true },
+    });
+    const priceId = this.configService.get('STRIPE_SUBSCRIPTION_PRICE_ID');
+    if (!priceId) throw new Error('STRIPE_SUBSCRIPTION_PRICE_ID is not configured');
+
+    const price = await this.stripe.prices.retrieve(priceId);
+    const priceCents = price.unit_amount ?? 0;
+
+    const email = user?.primaryEmail || user?.email || '';
+    const credit = email ? await this.partnersService.findAvailableCreditByEmail(email) : null;
+    const creditAppliedCents = credit ? Math.min(credit.availableCents, priceCents) : 0;
+
+    return {
+      priceCents,
+      creditAppliedCents,
+      finalCents: priceCents - creditAppliedCents,
+    };
+  }
+
   async createSubscription(userId: string) {
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
@@ -625,6 +712,41 @@ export class StripeService {
       throw new Error('STRIPE_SUBSCRIPTION_PRICE_ID is not configured');
     }
 
+    // Any partner platform credit left over after the welcome order (or a partner
+    // subscribing directly without ever having one) applies here as a one-time
+    // discount on this subscription's very first invoice — capped at one month's
+    // price so it never goes negative or rolls into a second free month by itself.
+    // A pending Stripe invoice item attaches automatically to the next invoice
+    // generated for this customer, which is exactly the one subscriptions.create is
+    // about to generate below.
+    let partnerCreditForSub: { partnerId: string; appliedCents: number } | null = null;
+    const credit = await this.partnersService.findAvailableCreditByEmail(email);
+    if (credit && credit.availableCents > 0) {
+      try {
+        const price = await this.stripe.prices.retrieve(priceId);
+        const priceCents = price.unit_amount ?? 0;
+        const applyCents = Math.min(credit.availableCents, priceCents);
+        if (applyCents > 0) {
+          await this.stripe.invoiceItems.create(
+            {
+              customer: customerId,
+              amount: -applyCents,
+              currency: 'usd',
+              description: 'Partner platform credit',
+            },
+            // Same 5-minute bucket as the subscription's own idempotency key below —
+            // a retried request reuses this exact invoice item instead of stacking a
+            // second discount onto whatever invoice comes next for this customer.
+            { idempotencyKey: `credit-item-${userId}-${Math.floor(Date.now() / 300_000)}` },
+          );
+          partnerCreditForSub = { partnerId: credit.partnerId, appliedCents: applyCents };
+        }
+      } catch (err: any) {
+        console.error(`Failed to apply partner credit to subscription: ${err.message}`);
+        // Non-fatal — subscription still proceeds at full price.
+      }
+    }
+
     // Create subscription with payment intent. The "already subscribed" checks above
     // only close the door on a SECOND request made after the first one already landed
     // in Stripe — two near-simultaneous requests (double-click, retry) can both pass
@@ -664,6 +786,10 @@ export class StripeService {
       throw new BadRequestException(
         stripeError.message || 'Failed to create subscription with Stripe'
       );
+    }
+
+    if (partnerCreditForSub) {
+      await this.partnersService.spendCredit(partnerCreditForSub.partnerId, partnerCreditForSub.appliedCents);
     }
 
     // The invoice's OWN payment. The clover API exposes it as
@@ -2617,6 +2743,32 @@ export class StripeService {
       `✅ Prepared ${subscriptionItems.length} itemized medication line(s) for appointment ${appointmentId} (total $${invoice.total})`,
     );
 
+    // Partner platform credit — applies to this medication order's FIRST invoice only
+    // (never a recurring month), same mechanism as the premium subscription. Capped at
+    // this invoice's total so it never goes negative.
+    let medCreditApplied: { partnerId: string; appliedCents: number } | null = null;
+    const medCredit = await this.partnersService.findAvailableCreditByEmail(email);
+    if (medCredit && medCredit.availableCents > 0) {
+      const invoiceCents = Math.round(invoice.total * 100);
+      const applyCents = Math.min(medCredit.availableCents, invoiceCents);
+      if (applyCents > 0) {
+        try {
+          await this.stripe.invoiceItems.create(
+            {
+              customer: customerId,
+              amount: -applyCents,
+              currency: invoice.currency,
+              description: 'Partner platform credit',
+            },
+            { idempotencyKey: `${idemBase}-credit-item` },
+          );
+          medCreditApplied = { partnerId: medCredit.partnerId, appliedCents: applyCents };
+        } catch (err: any) {
+          console.error(`Failed to apply partner credit to medication order: ${err.message}`);
+        }
+      }
+    }
+
     // Create subscription with payment intent
     let subscription: Stripe.Subscription;
     try {
@@ -2768,6 +2920,11 @@ export class StripeService {
           currency: invoice.currency,
           status: 'PENDING',
           paymentIntent: paymentIntent.id,
+          ...(medCreditApplied && {
+            partnerCreditPartnerId: medCreditApplied.partnerId,
+            partnerCreditAppliedCents: medCreditApplied.appliedCents,
+            partnerCreditDeducted: false,
+          }),
         },
       });
     } else {
@@ -2781,6 +2938,10 @@ export class StripeService {
           currency: invoice.currency,
           status: 'PENDING',
           paymentIntent: paymentIntent.id,
+          ...(medCreditApplied && {
+            partnerCreditPartnerId: medCreditApplied.partnerId,
+            partnerCreditAppliedCents: medCreditApplied.appliedCents,
+          }),
         },
       });
     }
@@ -2943,6 +3104,20 @@ export class StripeService {
         subscriptionCanceledAt: null as any, // Clear any previous cancellation
       },
     });
+
+    // Actually spend the reserved partner credit now that payment truly succeeded —
+    // guarded so a retried confirm-payment call never double-spends.
+    if (
+      payment.partnerCreditPartnerId &&
+      (payment.partnerCreditAppliedCents ?? 0) > 0 &&
+      !payment.partnerCreditDeducted
+    ) {
+      await this.partnersService.spendCredit(payment.partnerCreditPartnerId, payment.partnerCreditAppliedCents!);
+      await this.prisma.medicationPayment.update({
+        where: { id: payment.id },
+        data: { partnerCreditDeducted: true },
+      });
+    }
 
     // Calculate invoice to get item details for email
     const invoice = await this.calculateMedicationInvoice(payment.appointmentId, userId);

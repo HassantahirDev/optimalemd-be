@@ -99,6 +99,22 @@ export class PartnersController {
     return { success: true, data };
   }
 
+  @Post('me/credit/request-email-change')
+  @UseGuards(JwtAuthGuard, PartnerGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Send a verification code to a new email, to redeem platform credit there instead' })
+  async requestCreditEmailChange(@Req() req: any, @Body() body: { newEmail: string }) {
+    return this.partnersService.requestCreditEmailChange(req.user.id, body.newEmail);
+  }
+
+  @Post('me/credit/verify-email-change')
+  @UseGuards(JwtAuthGuard, PartnerGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Verify the code and switch the credit-redemption email' })
+  async verifyCreditEmailChange(@Req() req: any, @Body() body: { code: string }) {
+    return this.partnersService.verifyCreditEmailChange(req.user.id, body.code);
+  }
+
   @Post('me/payout-requests')
   @UseGuards(JwtAuthGuard, PartnerGuard)
   @ApiBearerAuth()

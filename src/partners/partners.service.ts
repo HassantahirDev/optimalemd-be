@@ -5,6 +5,7 @@ import {
   ConflictException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { MailerService } from '../mailer/mailer.service';
 import * as bcrypt from 'bcrypt';
 import { CommissionType, PartnerReferralStatus, CommissionStatus } from '@prisma/client';
 
@@ -20,7 +21,10 @@ import { CommissionType, PartnerReferralStatus, CommissionStatus } from '@prisma
  */
 @Injectable()
 export class PartnersService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private mailerService: MailerService,
+  ) {}
 
   // ─── Codes / passwords ──────────────────────────────────────────────────
 
@@ -134,6 +138,10 @@ export class PartnersService {
     const rule = await this.pickRule(referral.partnerId);
     const amountCents = rule ? this.computeAmount(rule, opts?.revenueCents ?? 0) : 0;
 
+    // Every commission converts straight to spendable platform credit — no manual
+    // payout request step. It's created CREDITED (not OWED) so it can never also be
+    // picked up by the manual payout batch/request flow (which only ever looks at
+    // OWED rows) — that would double-pay the same dollar as both cash and credit.
     const [, commission] = await this.prisma.$transaction([
       this.prisma.partnerReferral.update({
         where: { id: referral.id },
@@ -146,10 +154,17 @@ export class PartnersService {
           ruleId: rule?.id,
           sourcePaymentRecordId: opts?.sourcePaymentRecordId,
           amountCents,
-          status: CommissionStatus.OWED,
+          status: CommissionStatus.CREDITED,
         },
       }),
     ]);
+
+    if (amountCents > 0) {
+      await this.prisma.referralPartner.update({
+        where: { id: referral.partnerId },
+        data: { creditBalanceCents: { increment: amountCents } },
+      });
+    }
 
     return commission;
   }
@@ -174,14 +189,44 @@ export class PartnersService {
     return Math.round((revenueCents * bps) / 10000);
   }
 
-  /** Void a commission (refund/fraud/duplicate) — used from the payment refund path. */
+  /**
+   * Void a commission (refund/fraud/duplicate) — used from the payment refund path.
+   * Covers CREDITED rows too, with a clawback: since that amount already landed in
+   * creditBalanceCents (not sitting in a payable OWED bucket), voiding it must also
+   * pull it back out of the balance — clamped at 0 in case some/all of it was already
+   * spent on a signup/subscription discount by the time the void happens.
+   */
   async voidCommissionForUser(userId: string, reason: string) {
     const referral = await this.prisma.partnerReferral.findUnique({ where: { userId } });
     if (!referral) return;
+
+    const toVoid = await this.prisma.commission.findMany({
+      where: { partnerReferralId: referral.id, status: { in: [CommissionStatus.OWED, CommissionStatus.CREDITED] } },
+      select: { id: true, partnerId: true, amountCents: true, status: true },
+    });
+    if (toVoid.length === 0) return;
+
     await this.prisma.commission.updateMany({
-      where: { partnerReferralId: referral.id, status: CommissionStatus.OWED },
+      where: { id: { in: toVoid.map((c) => c.id) } },
       data: { status: CommissionStatus.VOIDED, voidReason: reason },
     });
+
+    const creditedTotal = toVoid
+      .filter((c) => c.status === CommissionStatus.CREDITED)
+      .reduce((sum, c) => sum + c.amountCents, 0);
+    if (creditedTotal > 0) {
+      const partner = await this.prisma.referralPartner.findUnique({
+        where: { id: toVoid[0].partnerId },
+        select: { creditBalanceCents: true },
+      });
+      const clawback = Math.min(creditedTotal, partner?.creditBalanceCents ?? 0);
+      if (clawback > 0) {
+        await this.prisma.referralPartner.update({
+          where: { id: toVoid[0].partnerId },
+          data: { creditBalanceCents: { decrement: clawback } },
+        });
+      }
+    }
   }
 
   // ─── Partner-facing (partners.formamd.com) ──────────────────────────────
@@ -194,20 +239,25 @@ export class PartnersService {
   }
 
   async getStats(partnerId: string) {
-    const [clicks, signedUp, qualified, owedAgg, paidAgg] = await Promise.all([
+    const [clicks, signedUp, qualified, owedAgg, paidAgg, creditedAgg, partner] = await Promise.all([
       this.prisma.partnerReferral.count({ where: { partnerId } }),
       this.prisma.partnerReferral.count({ where: { partnerId, status: { in: [PartnerReferralStatus.SIGNED_UP, PartnerReferralStatus.QUALIFIED] } } }),
       this.prisma.partnerReferral.count({ where: { partnerId, status: PartnerReferralStatus.QUALIFIED } }),
       this.prisma.commission.aggregate({ where: { partnerId, status: CommissionStatus.OWED }, _sum: { amountCents: true } }),
       this.prisma.commission.aggregate({ where: { partnerId, status: CommissionStatus.PAID }, _sum: { amountCents: true } }),
+      this.prisma.commission.aggregate({ where: { partnerId, status: CommissionStatus.CREDITED }, _sum: { amountCents: true } }),
+      this.prisma.referralPartner.findUnique({ where: { id: partnerId }, select: { creditBalanceCents: true, creditActiveEmail: true, email: true } }),
     ]);
 
     return {
       totalClicks: clicks,
       totalSignups: signedUp,
       totalQualified: qualified,
-      totalOwedCents: owedAgg._sum.amountCents ?? 0,
+      totalOwedCents: owedAgg._sum.amountCents ?? 0, // legacy, pre-credit-conversion only
       totalPaidCents: paidAgg._sum.amountCents ?? 0,
+      totalCreditedCents: creditedAgg._sum.amountCents ?? 0, // lifetime earned as credit (spent or not)
+      creditBalanceCents: partner?.creditBalanceCents ?? 0, // spendable right now
+      creditActiveEmail: partner?.creditActiveEmail || partner?.email || null,
     };
   }
 
@@ -332,6 +382,104 @@ export class PartnersService {
       data: { password: hashed, mustChangePassword: false },
     });
     return { success: true };
+  }
+
+  // ─── Platform credit (redeeming commission earnings as a signup/subscription discount) ──
+
+  /**
+   * Look up spendable partner credit for a given email — the ONE thing the signup
+   * and subscription flows need. Pure email match, no partner login required at
+   * redemption time. Matches creditActiveEmail if set, else the partner's own
+   * account email (that's the default until they verify a different one).
+   */
+  async findAvailableCreditByEmail(email: string): Promise<{ partnerId: string; availableCents: number } | null> {
+    const normalized = email.toLowerCase().trim();
+    if (!normalized) return null;
+
+    const partner = await this.prisma.referralPartner.findFirst({
+      where: {
+        isActive: true,
+        creditBalanceCents: { gt: 0 },
+        OR: [
+          { creditActiveEmail: normalized },
+          { AND: [{ creditActiveEmail: null }, { email: normalized }] },
+        ],
+      },
+      select: { id: true, creditBalanceCents: true },
+    });
+    if (!partner) return null;
+    return { partnerId: partner.id, availableCents: partner.creditBalanceCents };
+  }
+
+  /** Spend up to `cents` of a partner's credit. Returns how much was actually deducted. */
+  async spendCredit(partnerId: string, cents: number): Promise<number> {
+    if (cents <= 0) return 0;
+    const partner = await this.prisma.referralPartner.findUnique({
+      where: { id: partnerId },
+      select: { creditBalanceCents: true },
+    });
+    const spend = Math.min(cents, partner?.creditBalanceCents ?? 0);
+    if (spend <= 0) return 0;
+    await this.prisma.referralPartner.update({
+      where: { id: partnerId },
+      data: { creditBalanceCents: { decrement: spend } },
+    });
+    return spend;
+  }
+
+  /**
+   * Request switching creditActiveEmail to a new address. Does NOT change anything
+   * yet — only sends a 6-digit code to the new email. The old email keeps working
+   * until verifyEmailChange succeeds, so credit is never left unredeemable mid-switch.
+   */
+  async requestCreditEmailChange(partnerId: string, newEmail: string) {
+    const normalized = newEmail.toLowerCase().trim();
+    if (!normalized || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized)) {
+      throw new BadRequestException('Enter a valid email address');
+    }
+    const partner = await this.prisma.referralPartner.findUnique({ where: { id: partnerId } });
+    if (!partner) throw new NotFoundException('Partner not found');
+
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    await this.prisma.partnerCreditEmailVerification.create({
+      data: {
+        partnerId,
+        newEmail: normalized,
+        code,
+        expiresAt: new Date(Date.now() + 15 * 60 * 1000), // 15 minutes
+      },
+    });
+
+    await this.mailerService.sendEmail(
+      normalized,
+      'Verify your email for FormaMD platform credit',
+      `Your verification code is ${code}. It expires in 15 minutes.\n\nEnter this code in the Partners Portal to start using your platform credit with this email address.`,
+      `<p>Your verification code is <strong style="font-size:20px;letter-spacing:2px;">${code}</strong>.</p><p>It expires in 15 minutes.</p><p>Enter this code in the Partners Portal to start using your platform credit with this email address.</p>`,
+    );
+
+    return { success: true, message: `Verification code sent to ${normalized}` };
+  }
+
+  /** Verify the code and, on success, switch creditActiveEmail to the new address. */
+  async verifyCreditEmailChange(partnerId: string, code: string) {
+    const pending = await this.prisma.partnerCreditEmailVerification.findFirst({
+      where: { partnerId, code, verifiedAt: null, expiresAt: { gt: new Date() } },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (!pending) throw new BadRequestException('Invalid or expired code');
+
+    await this.prisma.$transaction([
+      this.prisma.partnerCreditEmailVerification.update({
+        where: { id: pending.id },
+        data: { verifiedAt: new Date() },
+      }),
+      this.prisma.referralPartner.update({
+        where: { id: partnerId },
+        data: { creditActiveEmail: pending.newEmail },
+      }),
+    ]);
+
+    return { success: true, creditActiveEmail: pending.newEmail };
   }
 
   // ─── Admin-facing ────────────────────────────────────────────────────────

@@ -170,6 +170,15 @@ export class NewSignupController {
     );
   }
 
+  // Confirm a welcome order that's fully covered by partner credit ($0 due) — no
+  // Stripe payment intent exists for these, so it can't go through the normal
+  // payment-status endpoint above.
+  @Post('welcome-order/:welcomeOrderId/confirm-free')
+  @HttpCode(HttpStatus.OK)
+  async confirmFreeWelcomeOrder(@Param('welcomeOrderId') welcomeOrderId: string) {
+    return this.newSignupService.confirmFreeWelcomeOrder(welcomeOrderId);
+  }
+
   // Get welcome order status by user ID
   @Get('welcome-orders/status')
   @UseGuards(JwtAuthGuard)
