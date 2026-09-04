@@ -1988,6 +1988,72 @@ export class AppointmentsService {
       }));
   }
 
+  /**
+   * Doctor self-service: block or unblock ONE slot. Blocking just flips
+   * `Slot.isAvailable` to false — the same field/derivation `getDoctorSlots` already
+   * uses to report a slot as 'blocked' (no appointment + !isAvailable). A booked slot
+   * can never be blocked — that would be indistinguishable from cancelling it — and
+   * un-blocking never touches a booked slot either, since it's not this doctor's to
+   * silently reopen while a patient holds it.
+   */
+  async setSlotAvailability(doctorId: string, slotId: string, isAvailable: boolean): Promise<{ id: string; isAvailable: boolean }> {
+    const slot = await this.prisma.slot.findUnique({
+      where: { id: slotId },
+      include: { schedule: true, appointment: { select: { id: true, status: true } } },
+    });
+
+    if (!slot) {
+      throw new NotFoundException('Slot not found');
+    }
+    if (slot.schedule.doctorId !== doctorId) {
+      throw new BadRequestException('This slot does not belong to you');
+    }
+
+    const hasActiveAppointment = slot.appointment.some((a) => a.status !== 'CANCELLED');
+    if (hasActiveAppointment) {
+      throw new BadRequestException('This slot has a booked appointment and cannot be blocked or unblocked directly');
+    }
+
+    const updated = await this.prisma.slot.update({
+      where: { id: slotId },
+      data: { isAvailable },
+      select: { id: true, isAvailable: true },
+    });
+
+    return updated;
+  }
+
+  /**
+   * Doctor self-service: block or unblock every slot for a whole day at once. Only
+   * touches slots with no active appointment — booked slots are always left exactly
+   * as they are, whichever direction this is called with.
+   */
+  async setDayAvailability(doctorId: string, date: string, isAvailable: boolean): Promise<{ updated: number; skippedBooked: number }> {
+    const targetDate = dateStringToUTC(date);
+    const startOfDay = getUTCMidnight(targetDate);
+    const endOfDay = getUTCEndOfDay(targetDate);
+
+    const schedules = await this.prisma.schedule.findMany({
+      where: { doctorId, date: { gte: startOfDay, lte: endOfDay } },
+      include: {
+        slots: { include: { appointment: { select: { id: true, status: true } } } },
+      },
+    });
+
+    const allSlots = schedules.flatMap((s) => s.slots);
+    const blockable = allSlots.filter((s) => !s.appointment.some((a) => a.status !== 'CANCELLED'));
+    const skippedBooked = allSlots.length - blockable.length;
+
+    if (blockable.length > 0) {
+      await this.prisma.slot.updateMany({
+        where: { id: { in: blockable.map((s) => s.id) } },
+        data: { isAvailable },
+      });
+    }
+
+    return { updated: blockable.length, skippedBooked };
+  }
+
   async adminCreateConfirmed(dto: any): Promise<any> {
     const { patientId, doctorId, serviceId, additionalServiceIds, primaryServiceId, slotId, appointmentDate, appointmentTime, duration, patientNotes, patientTimezone } = dto;
 

@@ -1595,7 +1595,57 @@ export class AppointmentsController {
     }
   }
 
- 
+  @Patch('doctor/:doctorId/slots/:slotId/availability')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Doctor: block or unblock a single slot' })
+  @ApiParam({ name: 'doctorId', description: 'Doctor ID' })
+  @ApiParam({ name: 'slotId', description: 'Slot ID' })
+  @ApiOkResponse({ description: 'Slot availability updated' })
+  async setSlotAvailability(
+    @Param('doctorId') doctorId: string,
+    @Param('slotId') slotId: string,
+    @Body('isAvailable') isAvailable: boolean,
+  ): Promise<BaseApiResponse<{ id: string; isAvailable: boolean }>> {
+    const data = await this.appointmentsService.setSlotAvailability(doctorId, slotId, isAvailable);
+    return {
+      success: true,
+      statusCode: 200,
+      message: isAvailable ? 'Slot unblocked' : 'Slot blocked',
+      data,
+      timestamp: new Date().toISOString(),
+      path: `/api/appointments/doctor/${doctorId}/slots/${slotId}/availability`,
+    };
+  }
+
+  @Patch('doctor/:doctorId/day/:date/availability')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: "Doctor: block or unblock every open slot on a given day (booked slots are left untouched)" })
+  @ApiParam({ name: 'doctorId', description: 'Doctor ID' })
+  @ApiParam({ name: 'date', description: 'Date in YYYY-MM-DD format' })
+  @ApiOkResponse({ description: 'Day availability updated' })
+  async setDayAvailability(
+    @Param('doctorId') doctorId: string,
+    @Param('date') date: string,
+    @Body('isAvailable') isAvailable: boolean,
+  ): Promise<BaseApiResponse<{ updated: number; skippedBooked: number }>> {
+    const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+    if (!dateRegex.test(date)) {
+      throw new BadRequestException('Invalid date format. Use YYYY-MM-DD');
+    }
+    const data = await this.appointmentsService.setDayAvailability(doctorId, date, isAvailable);
+    return {
+      success: true,
+      statusCode: 200,
+      message: isAvailable
+        ? `Unblocked ${data.updated} slot(s)`
+        : `Blocked ${data.updated} slot(s)${data.skippedBooked > 0 ? ` (${data.skippedBooked} booked slot(s) left untouched)` : ''}`,
+      data,
+      timestamp: new Date().toISOString(),
+      path: `/api/appointments/doctor/${doctorId}/day/${date}/availability`,
+    };
+  }
 
   @Post('admin/create-confirmed')
   @ApiOperation({ summary: 'Admin: Create confirmed appointment' })
