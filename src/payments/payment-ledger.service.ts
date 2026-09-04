@@ -67,6 +67,7 @@ export class PaymentLedgerService {
 
         cardBrand: input.cardBrand ?? null,
         cardLast4: input.cardLast4 ?? null,
+        billingEmail: input.billingEmail ? input.billingEmail.toLowerCase() : null,
 
         createdByType: input.createdByType ?? 'system',
         createdById: input.createdById ?? null,

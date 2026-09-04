@@ -135,17 +135,31 @@ export class StripeService {
 
     if (!amount || amount <= 0) throw new BadRequestException('Amount must be greater than 0');
 
+    // Idempotency key scoped to the one appointment/welcome-order + amount being paid.
+    // A retried or double-submitted request (double-click before the button disables, a
+    // dropped-response retry, the checkout page reloaded mid-flow) reuses THIS SAME
+    // PaymentIntent instead of Stripe creating a second, separate one — the same class of
+    // fix already applied to the medication-subscription flow below (idemBase/-sub keys)
+    // to prevent double charges; this is the appointment/welcome-order counterpart, which
+    // never had the same protection.
+    const idempotencyKey = appointmentId
+      ? `pi-appt-${appointmentId}-${Math.round(amount * 100)}`
+      : `pi-welcome-${welcomeOrderId}-${Math.round(amount * 100)}`;
+
     // Create payment intent
     let paymentIntent;
     try {
-      paymentIntent = await this.stripe.paymentIntents.create({
-        amount: Math.round(amount * 100),
-        currency,
-        metadata,
-        description,
-        ...(stripeCustomerId && { customer: stripeCustomerId }),
-        receipt_email: metadata.patientEmail,
-      });
+      paymentIntent = await this.stripe.paymentIntents.create(
+        {
+          amount: Math.round(amount * 100),
+          currency,
+          metadata,
+          description,
+          ...(stripeCustomerId && { customer: stripeCustomerId }),
+          receipt_email: metadata.patientEmail,
+        },
+        { idempotencyKey },
+      );
     } catch (stripeError: any) {
       console.error('Stripe API Error:', stripeError);
       throw new BadRequestException(
@@ -236,6 +250,10 @@ export class StripeService {
       where: { id: updatedPayment.appointmentId },
       select: { patientId: true },
     });
+    // No line items for a flat consult fee — the receipt link is what "expand" shows
+    // for this row instead. Best-effort; never blocks the write if Stripe can't be
+    // reached for it right now.
+    const receiptUrl = await this.getReceiptUrl(paymentIntentId);
     await this.paymentLedger.upsertFromStripe({
       stripePaymentIntentId: paymentIntentId,
       userId: paidAppt?.patientId ?? null,
@@ -247,6 +265,7 @@ export class StripeService {
       currency: 'usd',
       status: 'SUCCEEDED',
       paidAt: new Date(),
+      receiptUrl,
       note: 'Consultation / appointment payment',
     });
     }
@@ -606,26 +625,40 @@ export class StripeService {
       throw new Error('STRIPE_SUBSCRIPTION_PRICE_ID is not configured');
     }
 
-    // Create subscription with payment intent
+    // Create subscription with payment intent. The "already subscribed" checks above
+    // only close the door on a SECOND request made after the first one already landed
+    // in Stripe — two near-simultaneous requests (double-click, retry) can both pass
+    // that check before either commits. The idempotency key closes that race at the
+    // Stripe API level: a retried/duplicate request within the SAME 5-minute window
+    // reuses this SAME subscription instead of creating a second one, so the customer
+    // can't be signed up (and charged) for two premium subscriptions from one click.
+    // Bucketed by time (not just userId) so a genuine resubscribe later — after a
+    // cancellation, say — isn't blocked by Stripe replaying a stale idempotency key
+    // from the earlier, now-canceled subscription (idempotency keys live 24h on Stripe's
+    // side; a bare per-user key would incorrectly collide with that).
+    const idempotencyKey = `sub-premium-${userId}-${Math.floor(Date.now() / 300_000)}`;
     let subscription: Stripe.Subscription;
     try {
-      subscription = await this.stripe.subscriptions.create({
-        customer: customerId,
-        items: [{ price: priceId }],
-        payment_behavior: 'default_incomplete',
-        payment_settings: {
-          save_default_payment_method: 'on_subscription',
-          payment_method_types: ['card'],
+      subscription = await this.stripe.subscriptions.create(
+        {
+          customer: customerId,
+          items: [{ price: priceId }],
+          payment_behavior: 'default_incomplete',
+          payment_settings: {
+            save_default_payment_method: 'on_subscription',
+            payment_method_types: ['card'],
+          },
+          expand: ['latest_invoice.confirmation_secret'],
+          description: `Premium Subscription – ${`${user.firstName || ''} ${user.lastName || ''}`.trim()}`,
+          metadata: {
+            userId: user.id,
+            patientName: `${user.firstName || ''} ${user.lastName || ''}`.trim(),
+            patientEmail: user.primaryEmail || user.email || '',
+            type: 'premium_subscription',
+          },
         },
-        expand: ['latest_invoice.confirmation_secret'],
-        description: `Premium Subscription – ${`${user.firstName || ''} ${user.lastName || ''}`.trim()}`,
-        metadata: {
-          userId: user.id,
-          patientName: `${user.firstName || ''} ${user.lastName || ''}`.trim(),
-          patientEmail: user.primaryEmail || user.email || '',
-          type: 'premium_subscription',
-        },
-      });
+        { idempotencyKey },
+      );
     } catch (stripeError: any) {
       console.error('Stripe subscription creation error:', stripeError);
       throw new BadRequestException(
@@ -3471,6 +3504,27 @@ export class StripeService {
     } catch (error: any) {
       console.error(`❌ Error reactivating medication subscription: ${error.message}`);
       throw new BadRequestException(`Failed to reactivate medication subscription: ${error.message}`);
+    }
+  }
+
+  /**
+   * Stripe's own hosted receipt URL for a succeeded PaymentIntent's charge — lets a
+   * ledger row that has no line items (signup, appointment) still offer something
+   * concrete to view on expand instead of nothing. Best-effort: never throws, just
+   * returns null if the charge/receipt isn't available for any reason.
+   */
+  async getReceiptUrl(paymentIntentId: string): Promise<string | null> {
+    try {
+      const pi = await this.stripe.paymentIntents.retrieve(paymentIntentId, {
+        expand: ['latest_charge'],
+      });
+      const charge = pi.latest_charge;
+      if (charge && typeof charge !== 'string') {
+        return (charge as Stripe.Charge).receipt_url ?? null;
+      }
+      return null;
+    } catch {
+      return null;
     }
   }
 }

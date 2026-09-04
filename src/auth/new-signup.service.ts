@@ -4,6 +4,7 @@ import { JwtService } from '@nestjs/jwt';
 import { MailerService } from '../mailer/mailer.service';
 import { ReferralService } from '../referral/referral.service';
 import { PaymentLedgerService } from '../payments/payment-ledger.service';
+import { StripeService } from '../stripe/stripe.service';
 import * as bcrypt from 'bcrypt';
 import * as crypto from 'crypto';
 import { generateNextPatientId } from '../common/utils/patient-id.utils';
@@ -24,6 +25,7 @@ export class NewSignupService {
     private mailerService: MailerService,
     private referralService: ReferralService,
     private paymentLedger: PaymentLedgerService,
+    private stripeService: StripeService,
   ) {}
 
   // Generate unique order number
@@ -598,10 +600,18 @@ export class NewSignupService {
     // --- Dual-write signup payment into the unified ledger (additive; Part A) ---
     // welcomeOrder logic above is untouched. Runs only on success.
     if (status === PaymentStatus.SUCCEEDED) {
+      // No line items for a flat signup fee — the receipt link is what "expand" shows
+      // for this row instead. Best-effort; never blocks the write if unavailable.
+      const receiptUrl = await this.stripeService.getReceiptUrl(paymentIntentId);
       await this.paymentLedger.upsertFromStripe({
         stripePaymentIntentId: paymentIntentId,
         userId: welcomeOrder.userId ?? null,
         welcomeOrderId: welcomeOrder.id,
+        // Payment happens at Checkout (step 2), before the User account exists
+        // (created a step later, at Password). userId is null at write-time for
+        // nearly every signup — billingEmail is what makes this record findable
+        // in the patient's own billing history once they do have an account.
+        billingEmail: welcomeOrder.email,
         channel: 'PLATFORM',
         category: 'SIGNUP',
         billing: 'ONE_TIME',
@@ -609,6 +619,7 @@ export class NewSignupService {
         currency: 'usd',
         status: 'SUCCEEDED',
         paidAt: welcomeOrder.paidAt ?? new Date(),
+        receiptUrl,
         note: `Signup order ${welcomeOrder.orderNumber}`,
       });
     }

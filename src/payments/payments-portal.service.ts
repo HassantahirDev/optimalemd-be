@@ -586,6 +586,18 @@ export class PaymentsPortalService implements OnModuleInit {
         .filter((r) => r.stripeInvoiceId)
         .map((r) => [r.stripeInvoiceId as string, r]),
     );
+    // Any invoice already represented as its own row in `payments` above (every synced
+    // ledger record, `records`, gets one there) must NOT also render as a standalone
+    // invoice row below — that produced the exact "charged twice" look reported: a
+    // subscription/medication charge billed via an Invoice showed once under `payments`
+    // (id = the PaymentIntent) and again under `invoices` (id = the Invoice), because
+    // those are two different Stripe ID types for the same charge and never matched in
+    // the frontend's `payments.id === invoice.id` dedupe. Filtering here, against every
+    // stripeInvoiceId already present in `records`, is the correct place to dedupe —
+    // upstream of both the frontend and any other future consumer of this endpoint.
+    const ledgerInvoiceIds = new Set(
+      records.map((r) => r.stripeInvoiceId).filter((id): id is string => !!id),
+    );
     const enrichInvoice = (iv: any) => {
       const led = ledgerByInvoice.get(iv.id);
       if (!led) return iv; // subscription/external invoice — keep the live Stripe data
@@ -602,7 +614,7 @@ export class PaymentsPortalService implements OnModuleInit {
       };
     };
     const invoicesOut = invoicesLive.length
-      ? invoicesLive.map(enrichInvoice)
+      ? invoicesLive.map(enrichInvoice).filter((iv) => !ledgerInvoiceIds.has(iv.id))
       : invoiceRecords.map((r) => {
           const lineCats = Array.from(
             new Set((r.lineItems || []).map((li: any) => li.category).filter((c: any) => c && c !== 'OTHER')),

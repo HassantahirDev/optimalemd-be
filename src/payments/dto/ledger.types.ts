@@ -65,6 +65,15 @@ export interface UpsertPaymentInput {
   hostedInvoiceUrl?: string | null;
   cardBrand?: string | null;
   cardLast4?: string | null;
+  /**
+   * Payer email at the time of payment. This is the ONLY way `getPatientHistory`
+   * can find a record when `userId` isn't set yet — e.g. a signup payment made
+   * before the User account exists (payment happens at Checkout, the account is
+   * created a step later at Password). Always pass this for guest/pre-account
+   * charges, not just true guest checkouts, or the record becomes permanently
+   * invisible to the patient's billing history.
+   */
+  billingEmail?: string | null;
 
   // --- Audit ---
   createdByType?: 'patient' | 'admin' | 'payment_user' | 'system' | null;
