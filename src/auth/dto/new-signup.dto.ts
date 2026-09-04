@@ -276,6 +276,12 @@ export class CreateUserStepByStepDto {
   @IsString()
   referralCode?: string;
 
+  // Partner-program attribution id set by the tracking snippet (cookie/localStorage).
+  // Separate from referralCode (patient-to-patient program) — see ReferralPartner.
+  @IsOptional()
+  @IsString()
+  visitorId?: string;
+
   @IsOptional()
   @IsBoolean()
   isActive?: boolean;

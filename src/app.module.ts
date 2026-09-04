@@ -31,6 +31,7 @@ import { NewsletterModule } from './newsletter/newsletter.module';
 import { AiModule } from './ai/ai.module';
 import { PaymentsModule } from './payments/payments.module';
 import { EmailCheckerModule } from './email-checker/email-checker.module';
+import { PartnersModule } from './partners/partners.module';
 
 @Module({
   imports: [
@@ -66,6 +67,7 @@ import { EmailCheckerModule } from './email-checker/email-checker.module';
     AiModule,
     EmailCheckerModule,
     PaymentsModule,
+    PartnersModule,
   ],
   controllers: [AppController],
   providers: [AppService],

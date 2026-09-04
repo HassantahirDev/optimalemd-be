@@ -10,8 +10,8 @@ export class LoginDto {
     enum: ['user', 'doctor', 'admin'],
   })
   @IsString()
-  @IsIn(['user', 'doctor', 'admin', 'assistant', 'payment'])
-  userType: 'user' | 'doctor' | 'admin' | 'assistant' | 'payment';
+  @IsIn(['user', 'doctor', 'admin', 'assistant', 'payment', 'partner'])
+  userType: 'user' | 'doctor' | 'admin' | 'assistant' | 'payment' | 'partner';
 
   @ApiProperty({
     description: 'Email address (primary email for users, email for doctors)',

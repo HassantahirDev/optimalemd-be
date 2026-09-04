@@ -127,10 +127,54 @@ export class AuthService {
     } else if (userType === 'payment') {
       // Handle payment-portal staff login (payments.formamd.com)
       return this.loginPaymentUser(normalizedEmail, password);
+    } else if (userType === 'partner') {
+      // Handle referral-partner login (partners.formamd.com)
+      return this.loginPartner(normalizedEmail, password);
     } else {
-      throw new BadRequestException('Invalid user type. Must be "user", "doctor", "admin", "assistant", or "payment"');
+      throw new BadRequestException('Invalid user type. Must be "user", "doctor", "admin", "assistant", "payment", or "partner"');
     }
   }
+
+  /**
+   * Login referral-partner (partners.formamd.com). Separate role entirely —
+   * these accounts can ONLY access the partner portal; they are not admins,
+   * doctors, patients, or payment staff.
+   */
+  private async loginPartner(email: string, password: string): Promise<any> {
+    const partner = await this.prisma.referralPartner.findUnique({
+      where: { email },
+    });
+
+    if (!partner) {
+      throw new UnauthorizedException('Invalid credentials');
+    }
+    if (!partner.isActive) {
+      throw new UnauthorizedException('Account is deactivated');
+    }
+
+    const isPasswordValid = await bcrypt.compare(password, partner.password);
+    if (!isPasswordValid) {
+      throw new UnauthorizedException('Invalid credentials');
+    }
+
+    const payload = {
+      sub: partner.id,
+      email: partner.email,
+      userType: 'partner',
+    };
+    const accessToken = this.jwtService.sign(payload);
+
+    const { password: _, ...safe } = partner;
+    return {
+      accessToken,
+      partner: safe,
+      mustChangePassword: partner.mustChangePassword,
+      userType: 'partner' as any,
+    };
+  }
+
+  // Partner password changes are handled by PartnersService (self-contained
+  // partner module) via POST /partners/me/change-password.
 
   /**
    * Login payment-portal user (payments.formamd.com). Separate role entirely —
