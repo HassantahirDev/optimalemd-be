@@ -194,18 +194,32 @@ export class StripePosService {
     const {
       customerId,
       setupIntentId,
-      oneTimeItems = [],
-      subscriptionItems = [],
+      oneTimeItems: rawOneTimeItems = [],
+      subscriptionItems: rawSubscriptionItems = [],
       userId = null,
     } = body;
 
-    if (oneTimeItems.length === 0 && subscriptionItems.length === 0) {
+    if (rawOneTimeItems.length === 0 && rawSubscriptionItems.length === 0) {
       return {
         ok: false,
         error: 'No cart items were provided.',
         statusCode: 400,
       };
     }
+
+    // Reclassify every item against its ACTUAL Stripe Price type — never trust which
+    // cart section (one-time vs. subscription) the frontend happened to add it to. A
+    // recurring-priced item put in the wrong bucket used to get charged as a flat
+    // one-time fee with no subscription created at all, instead of billing monthly —
+    // this is the guarantee that a subscription item always bills monthly and a
+    // one-time item only ever bills once, no matter which section it was added from.
+    // Only items backed by a real saved priceId can be checked this way; a pure
+    // custom-priced item (price_data, no priceId) has no Stripe object to check
+    // against, so its cart-section placement is trusted as the only signal of intent.
+    const { oneTimeItems, subscriptionItems } = await this.reclassifyCartItems(
+      rawOneTimeItems,
+      rawSubscriptionItems,
+    );
 
     const setupIntent = await this.stripe.setupIntents.retrieve(setupIntentId, {
       expand: ['latest_attempt'],
@@ -394,18 +408,30 @@ export class StripePosService {
     paymentMethodId: string,
     oneTimeInvoiceItems: Stripe.SubscriptionCreateParams.AddInvoiceItem[],
   ) {
+    let itemsCreated = 0;
     for (const line of oneTimeInvoiceItems) {
       if (line.price) {
         await this.stripe.invoiceItems.create({
           customer: customerId,
           pricing: { price: line.price },
         });
+        itemsCreated++;
       } else if (line.price_data) {
         await this.stripe.invoiceItems.create({
           customer: customerId,
           price_data: line.price_data as Stripe.InvoiceItemCreateParams.PriceData,
         });
+        itemsCreated++;
       }
+    }
+
+    // Guard against the exact failure this is fixing: every cart line SHOULD have
+    // resolved to a real price above (see buildOneTimeInvoiceItems) — if none did,
+    // stop here with a clear error instead of creating and auto-finalizing a $0
+    // invoice, which Stripe marks "paid" with nothing actually charged. That used to
+    // look identical to a real successful sale.
+    if (itemsCreated === 0) {
+      throw new Error('No priced items to charge — cart items are missing a valid price.');
     }
 
     const invoice = await this.stripe.invoices.create({
@@ -413,6 +439,13 @@ export class StripePosService {
       default_payment_method: paymentMethodId,
       auto_advance: true,
       collection_method: 'charge_automatically',
+      // THE actual root cause of every $0 POS invoice: this API version does not
+      // auto-attach a customer's pending invoice items to a new invoice by default —
+      // confirmed directly (an item created with a real $25 price, invoice created
+      // right after, came back with total: 0 / zero line items until this was added).
+      // Every one-time POS charge was affected regardless of which price-selection
+      // branch ran above; this was never actually a pricing-logic bug.
+      pending_invoice_items_behavior: 'include',
     });
 
     if (!invoice.id) {
@@ -421,6 +454,16 @@ export class StripePosService {
 
     const finalized = await this.stripe.invoices.finalizeInvoice(invoice.id);
     const invoiceId = finalized.id ?? invoice.id;
+
+    // Same guard, at the Stripe-authoritative level: if the finalized invoice's total
+    // came out $0 despite priced items being sent, something upstream (a $0 price, a
+    // missing catalog price) produced a free invoice Stripe auto-marks "paid" without
+    // charging anything — surface that as an error rather than a false success.
+    if ((finalized.total ?? 0) === 0) {
+      throw new Error(
+        `Invoice ${invoiceId} finalized with a $0 total — nothing was actually charged. Check the cart items' prices.`,
+      );
+    }
 
     const paid =
       finalized.status === 'paid'
@@ -431,6 +474,53 @@ export class StripePosService {
       invoiceId: paid.id ?? invoiceId,
       status: paid.status,
     };
+  }
+
+  /**
+   * Ground-truth reclassification: for every item with a real priceId, look up its
+   * actual Stripe Price `type` and move it into the correct bucket if the frontend
+   * put it in the wrong one — a saved recurring price must always end up billed as a
+   * subscription, a saved one-time price must always end up billed once, regardless
+   * of which cart section (one-time vs. subscription) it was added through. Items
+   * with no priceId (pure custom price_data) have nothing to check against, so their
+   * cart-section placement is trusted as-is.
+   */
+  private async reclassifyCartItems(
+    rawOneTimeItems: PosCartItem[],
+    rawSubscriptionItems: PosCartItem[],
+  ): Promise<{ oneTimeItems: PosCartItem[]; subscriptionItems: PosCartItem[] }> {
+    const allItems = [...rawOneTimeItems, ...rawSubscriptionItems];
+    const priceIds = Array.from(
+      new Set(allItems.map((i) => i.priceId).filter((id): id is string => !!id)),
+    );
+
+    const priceTypeById = new Map<string, Stripe.Price.Type>();
+    await Promise.all(
+      priceIds.map(async (id) => {
+        try {
+          const price = await this.stripe.prices.retrieve(id);
+          priceTypeById.set(id, price.type);
+        } catch {
+          // Unretrievable price (deleted/invalid) — leave unclassified, item keeps
+          // its original bucket and any downstream error (missing/invalid price)
+          // still surfaces normally from the existing build/charge logic.
+        }
+      }),
+    );
+
+    const oneTimeItems: PosCartItem[] = [];
+    const subscriptionItems: PosCartItem[] = [];
+
+    for (const item of rawOneTimeItems) {
+      const type = item.priceId ? priceTypeById.get(item.priceId) : undefined;
+      (type === 'recurring' ? subscriptionItems : oneTimeItems).push(item);
+    }
+    for (const item of rawSubscriptionItems) {
+      const type = item.priceId ? priceTypeById.get(item.priceId) : undefined;
+      (type === 'one_time' ? oneTimeItems : subscriptionItems).push(item);
+    }
+
+    return { oneTimeItems, subscriptionItems };
   }
 
   private buildSubscriptionLineItems(subscriptionItems: PosCartItem[]) {
@@ -445,27 +535,34 @@ export class StripePosService {
         );
       }
 
-      if (amount !== defaultAmount) {
-        if (!item.productId) {
-          throw new Error(
-            `Subscription item "${label}" is missing productId for custom pricing.`,
-          );
-        }
-
-        const interval = (item.interval || 'month') as Stripe.Price.Recurring.Interval;
-
-        return {
-          price_data: {
-            currency: item.currency || 'usd',
-            product: item.productId,
-            recurring: { interval },
-            unit_amount: amount,
-          },
-        };
+      // The cashier typed a different amount than this item's catalog default — that's
+      // a deliberate override, and MUST use price_data with the real typed amount, not
+      // the catalog's own price (charging the wrong amount is worse than the original
+      // bug this replaced: silently using priceId here previously ignored every custom
+      // override and charged the catalog default instead — for this test that default
+      // happened to be $0, which is what produced the "$0 total" error).
+      const isOverridden = Number.isFinite(defaultAmount) && amount !== defaultAmount;
+      if (!isOverridden && item.priceId) {
+        return { price: item.priceId };
       }
 
+      if (!item.productId) {
+        throw new Error(
+          isOverridden
+            ? `Subscription item "${label}" needs productId to charge its custom amount.`
+            : `Subscription item "${label}" is missing productId for custom pricing.`,
+        );
+      }
+
+      const interval = (item.interval || 'month') as Stripe.Price.Recurring.Interval;
+
       return {
-        price: item.priceId!,
+        price_data: {
+          currency: item.currency || 'usd',
+          product: item.productId,
+          recurring: { interval },
+          unit_amount: amount,
+        },
       };
     }) as Stripe.SubscriptionCreateParams.Item[];
   }
@@ -482,24 +579,29 @@ export class StripePosService {
         );
       }
 
-      if (amount !== defaultAmount) {
-        if (!item.productId) {
-          throw new Error(
-            `One-time item "${label}" is missing productId for custom pricing.`,
-          );
-        }
+      // See the identical logic (and its comment) in buildSubscriptionLineItems above —
+      // a custom-typed amount (differs from the catalog default) must use price_data
+      // with the real typed amount, never the catalog's own priceId, or the item gets
+      // charged at the wrong (catalog default) price instead of what the cashier entered.
+      const isOverridden = Number.isFinite(defaultAmount) && amount !== defaultAmount;
+      if (!isOverridden && item.priceId) {
+        return { price: item.priceId };
+      }
 
-        return {
-          price_data: {
-            currency: item.currency || 'usd',
-            product: item.productId,
-            unit_amount: amount,
-          },
-        };
+      if (!item.productId) {
+        throw new Error(
+          isOverridden
+            ? `One-time item "${label}" needs productId to charge its custom amount.`
+            : `One-time item "${label}" is missing productId for custom pricing.`,
+        );
       }
 
       return {
-        price: item.priceId!,
+        price_data: {
+          currency: item.currency || 'usd',
+          product: item.productId,
+          unit_amount: amount,
+        },
       };
     }) as Stripe.SubscriptionCreateParams.AddInvoiceItem[];
   }

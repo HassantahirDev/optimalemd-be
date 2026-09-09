@@ -3148,8 +3148,14 @@ export class StripeService {
     // Existing medicationPayment logic above is untouched. Medication line items
     // feed the set-based MedicationOrder lifecycle inside the ledger service.
     const isMedSubscription = !!payment.stripeSubscriptionId;
+    // Without this, the live Stripe invoice for this same charge never gets matched
+    // against this ledger row (getPatientHistory dedupes by stripeInvoiceId) and shows
+    // up a second time in Billing History as its own "1 × ... (at $X/month)" row —
+    // same invoiceId this PI was tagged with at createMedicationPaymentIntent time.
+    const medInvoiceId = (paymentIntent.metadata?.invoiceId as string) || null;
     await this.paymentLedger.upsertFromStripe({
       stripePaymentIntentId: paymentIntentId,
+      stripeInvoiceId: medInvoiceId,
       stripeSubscriptionId: payment.stripeSubscriptionId,
       stripeCustomerId: payment.stripeCustomerId,
       userId,
