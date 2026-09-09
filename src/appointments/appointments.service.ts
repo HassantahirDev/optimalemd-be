@@ -1533,7 +1533,13 @@ export class AppointmentsService {
               }
             }
           },
-          medicalForm: true, // Include medical form data
+          // The patient-portal appointments list doesn't render medical form
+          // content at all (CarePlanDetails fetches its own single-appointment
+          // record separately, with its own medicalForm data, when a patient
+          // drills into one). MedicalForm has 100+ columns of intake-questionnaire
+          // text — pulling the full row for every appointment in the list was
+          // multiplying the response payload for no reason. Existence only.
+          medicalForm: { select: { id: true } },
           rescheduleLogs: { orderBy: { createdAt: 'asc' } } // Reschedule audit history
         },
         skip,
