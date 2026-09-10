@@ -140,6 +140,22 @@ export class NewSignupController {
     return this.newSignupService.resumeSignupByEmail(email);
   }
 
+  // Resuming a PAID but abandoned signup, without charging again. Public like
+  // the rest of this controller, so ownership is proven by clicking a signed
+  // link emailed to that address — the email lookup only decides whether to
+  // send one.
+  @Post('resume/request-link')
+  async requestResumeLink(@Body() body: { email: string }) {
+    const data = await this.newSignupService.requestResumeLink(body.email);
+    return { success: true, data };
+  }
+
+  @Post('resume/verify-token')
+  async verifyResumeToken(@Body() body: { token: string }) {
+    const data = await this.newSignupService.verifyResumeToken(body.token);
+    return { success: true, data };
+  }
+
   // Complete signup and create user
   @Post('welcome-order/:welcomeOrderId/complete')
   @HttpCode(HttpStatus.CREATED)

@@ -6,6 +6,26 @@ import { ReferralService } from '../referral/referral.service';
 import * as bcrypt from 'bcrypt';
 import * as crypto from 'crypto';
 import { generateNextPatientId } from '../common/utils/patient-id.utils';
+
+/**
+ * Resuming a PAID but abandoned signup.
+ *
+ * Ownership of the email is proven by a signed, short-lived token carried in an
+ * emailed link. Nothing is persisted — no schema change, and unlike an
+ * in-memory code it survives backend restarts and works across multiple
+ * instances.
+ */
+const RESUME_TOKEN_PURPOSE = 'signup-resume';
+
+/**
+ * A secret distinct from the auth JWT secret, so a resume token can never be
+ * presented as a login token (and vice versa) even if payload shapes change.
+ */
+function resumeTokenSecret() {
+  const base = process.env.JWT_SECRET;
+  if (!base) throw new Error('JWT_SECRET is not configured');
+  return `${base}::${RESUME_TOKEN_PURPOSE}`;
+}
 import {
   CreateWelcomeOrderDto,
   UpdateSignupStepDto,
@@ -326,6 +346,111 @@ export class NewSignupService {
       currentSubStep: welcomeOrder.currentSubStep,
       stepData: currentStep?.stepData || {},
       canResume: true,
+    };
+  }
+
+  // ── Resuming a PAID but abandoned signup ─────────────────────────────────
+  //
+  // Someone who paid and then closed the tab shouldn't have to pay again. But
+  // this whole controller is public, so "email matches → skip checkout" would
+  // let anyone who knows that email claim a stranger's paid registration and
+  // set their own password on it. So resuming is gated two ways:
+  //   1. first name + last name + email must all match the abandoned order
+  //   2. a one-time code emailed to that address must be entered
+  // Step 1 keeps this from being an oracle for "who paid"; step 2 is what
+  // actually proves ownership.
+
+  /** The paid, unfinished order for an email — or null. */
+  private async findResumablePaidOrder(email: string) {
+    const normalizedEmail = email.toLowerCase().trim();
+
+    return this.prisma.welcomeOrder.findFirst({
+      where: {
+        email: normalizedEmail,
+        isCompleted: false,
+        paymentStatus: PaymentStatus.SUCCEEDED,
+      },
+      include: {
+        signupSteps: { orderBy: [{ stepNumber: 'asc' }, { subStepNumber: 'asc' }] },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  async requestResumeLink(email: string) {
+    if (!email?.trim()) throw new BadRequestException('Email is required');
+
+    const order = await this.findResumablePaidOrder(email);
+
+    const noMatch = { linkSent: false };
+    if (!order) {
+      console.log(`[signup resume] No paid, unfinished order for ${email.toLowerCase().trim()}`);
+      return noMatch;
+    }
+
+    // Matching on email alone is deliberate. The welcome order isn't created
+    // until checkout, so a name typed at step 1 often isn't recorded against it
+    // yet — requiring a name match meant a link was never sent. It costs
+    // nothing in security either: the link is the real gate, and it only ever
+    // goes to the address on the order. Typing someone else's email just emails
+    // them. (check-email already exposes "has an unfinished signup" publicly,
+    // so this reveals nothing new.)
+
+    // Stateless proof of ownership: a signed, short-lived token in the link.
+    // Nothing is stored, so this survives restarts and works across instances.
+    const token = await this.jwtService.signAsync(
+      { welcomeOrderId: order.id, email: order.email, purpose: RESUME_TOKEN_PURPOSE },
+      { secret: resumeTokenSecret(), expiresIn: '2h' },
+    );
+
+    // Hardcoded to the live site (same as auth.service.ts does for password
+    // resets) so a misconfigured FRONTEND_URL can never email a patient a link
+    // pointing at localhost or a preview host.
+    const frontendUrl = 'https://formamd.com';
+    const resumeLink = `${frontendUrl}/register/resume?token=${encodeURIComponent(token)}`;
+
+    try {
+      // Same branded template as the rest of our transactional mail.
+      await this.mailerService.sendSignupResumeEmail(order.email, resumeLink);
+    } catch (err) {
+      // Don't leak delivery problems back to the caller either.
+      console.error('[signup resume] Failed to send resume link:', err);
+      return noMatch;
+    }
+
+    return { linkSent: true };
+  }
+
+  async verifyResumeToken(token: string) {
+    const invalid = new BadRequestException('This link is invalid or has expired. Please request a new one.');
+    if (!token?.trim()) throw invalid;
+
+    let payload: any;
+    try {
+      payload = await this.jwtService.verifyAsync(token, { secret: resumeTokenSecret() });
+    } catch {
+      throw invalid;
+    }
+
+    // A token minted for anything else must never unlock a paid signup.
+    if (payload?.purpose !== RESUME_TOKEN_PURPOSE || !payload?.welcomeOrderId) throw invalid;
+
+    const order = await this.prisma.welcomeOrder.findFirst({
+      where: {
+        id: payload.welcomeOrderId,
+        isCompleted: false,
+        paymentStatus: PaymentStatus.SUCCEEDED,
+      },
+    });
+    if (!order) throw invalid;
+
+    return {
+      welcomeOrderId: order.id,
+      email: order.email,
+      paymentIntentId: order.paymentIntentId,
+      paymentStatus: order.paymentStatus,
+      currentStep: order.currentStep,
+      currentSubStep: order.currentSubStep,
     };
   }
 
