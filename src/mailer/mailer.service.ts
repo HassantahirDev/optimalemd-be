@@ -542,6 +542,174 @@ export class MailerService implements OnModuleInit {
     }
   }
 
+  async sendSignupResumeEmail(to: string, resumeLink: string): Promise<void> {
+    const html = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+          body {
+            font-family: Arial, sans-serif;
+            line-height: 1.6;
+            margin: 0;
+            padding: 20px;
+            background-color: #f4f4f4;
+            color: #333333;
+          }
+          .container {
+            max-width: 600px;
+            margin: 0 auto;
+            background-color: #ffffff;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            overflow: hidden;
+          }
+          .header {
+            background-color: #000000;
+            padding: 25px;
+            text-align: center;
+          }
+          .logo-container {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 15px;
+            margin: 0 auto;
+            width: fit-content;
+          }
+          .logo-img {
+            width: 40px;
+            height: 40px;
+            object-fit: contain;
+          }
+          .logo {
+            color: #ffffff;
+            font-size: 24px;
+            font-weight: bold;
+            text-transform: uppercase;
+            margin: 0;
+          }
+          .content {
+            padding: 30px;
+            text-align: center;
+          }
+          .title {
+            color: #333333;
+            font-size: 24px;
+            font-weight: bold;
+            margin-bottom: 20px;
+          }
+          .description {
+            color: #666666;
+            font-size: 16px;
+            margin-bottom: 25px;
+            line-height: 1.6;
+          }
+          .resume-button {
+            display: inline-block;
+            background-color: #000000;
+            color: #ffffff !important;
+            padding: 15px 30px;
+            text-decoration: none;
+            border-radius: 5px;
+            font-weight: bold;
+            font-size: 16px;
+            margin: 20px 0;
+          }
+          .info-box {
+            background-color: #f8f9fa;
+            padding: 20px;
+            border-radius: 5px;
+            margin: 20px 0;
+            border-left: 4px solid #000000;
+          }
+          .warning-box {
+            background-color: #fff3cd;
+            padding: 20px;
+            border-radius: 5px;
+            margin: 20px 0;
+            border-left: 4px solid #ffc107;
+            color: #856404;
+            font-size: 14px;
+          }
+          .footer {
+            background-color: #f8f9fa;
+            text-align: center;
+            padding: 20px;
+            color: #666666;
+            font-size: 14px;
+            border-top: 1px solid #e9ecef;
+          }
+          .link-fallback {
+            background-color: #f8f9fa;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 20px 0;
+            border: 1px solid #e9ecef;
+            color: #666666;
+            font-size: 14px;
+          }
+          .link-fallback a {
+            color: #000000;
+            word-break: break-all;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">
+            <div class="logo-container">
+              <img src="https://formamd.com/logo.png" alt="FormaMD Logo" class="logo-img" />
+              <div class="logo">FormaMD</div>
+            </div>
+          </div>
+          <div class="content">
+            <h2 class="title">Finish Setting Up Your Account</h2>
+            <p class="description">Hi,</p>
+            <p class="description">You already paid for your consultation — there's nothing more to pay. Click below to pick up right where you left off.</p>
+            
+            <a href="${resumeLink}" class="resume-button">Continue Setting Up My Account</a>
+            
+            <div class="info-box">
+              <p style="margin: 0; color: #000000; font-weight: bold;">⏰ This link expires in 2 hours</p>
+            </div>
+            
+            <div class="warning-box">
+              <p style="margin: 0;"><strong>⚠️ Security Notice:</strong></p>
+              <p style="margin: 5px 0 0 0;">If you didn't request this, please ignore this email. This link is the only way to resume your paid signup, so don't forward it.</p>
+            </div>
+            
+            <div class="link-fallback">
+              <p style="margin: 0 0 10px 0;"><strong>Manual Link:</strong></p>
+              <p style="margin: 0;">If the button doesn't work, copy this link:</p>
+              <a href="${resumeLink}">${resumeLink}</a>
+            </div>
+          </div>
+          <div class="footer">
+            <p>This is an automated email, please do not reply.</p>
+            <p>&copy; ${new Date().getFullYear()} FormaMD</p>
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+
+    try {
+      await this.transporter.sendMail({
+        from: `"FormaMD" <${this.configService.get<string>('SMTP_FROM')}>`,
+        to,
+        subject: 'Finish Setting Up Your FormaMD Account',
+        html,
+      });
+      console.log(`Signup resume email sent successfully to ${to}`);
+    } catch (error) {
+      console.error('Failed to send signup resume email:', error);
+      throw error;
+    }
+  }
+
   async sendWelcomeEmail(to: string, name: string): Promise<void> {
     const html = `
       <!DOCTYPE html>
