@@ -642,6 +642,42 @@ Required JSON shape:
     return trends;
   }
 
+  /**
+   * Analysis is otherwise clinician-triggered only (analyzeLabTrendsForAppointment
+   * is gated to non-patient users at the controller). A patient whose results are
+   * uploaded but whose doctor hasn't run the analysis yet would otherwise see an
+   * indefinite "preparing" state with nothing actually running to finish it. This
+   * runs the same pipeline on the patient's own behalf, once, best-effort — still
+   * Gemini-backed, still cached by content hash so repeat loads don't re-analyze.
+   * Never throws: a failure here should never break the patient's dashboard load.
+   */
+  async ensureLabTrendsAnalyzedForPatient(patientId: string, authorization?: string, force = false) {
+    try {
+      const hasUploadedResults = await this.prisma.labOrder.findFirst({
+        where: {
+          patientId,
+          OR: [{ resultsPath: { not: null } }, { resultFiles: { some: {} } }],
+        },
+        select: { id: true },
+      });
+      if (!hasUploadedResults) return null;
+
+      // Any appointment belonging to this patient works as the anchor — the
+      // analysis result is written across all of the patient's appointments.
+      const anchorAppointment = await this.prisma.appointment.findFirst({
+        where: { patientId },
+        orderBy: { appointmentDate: 'desc' },
+        select: { id: true },
+      });
+      if (!anchorAppointment) return null;
+
+      return await this.analyzeLabTrendsForAppointment(patientId, anchorAppointment.id, authorization, force);
+    } catch (err) {
+      console.error('[AI lab trends] Patient auto-trigger failed:', err);
+      return null;
+    }
+  }
+
   private tryParseLabTrendAnalysis(rawText: string): LabTrendAnalysisResult | null {
     try {
       return this.parseLabTrendAnalysis(rawText);
@@ -699,13 +735,28 @@ Required JSON shape:
       date: file.scheduledDate.toISOString().split('T')[0],
     }));
 
+    // The lab order's scheduledDate is the authoritative ordering for a
+    // patient's labs, so it's preferred over whatever date the model read out
+    // of the file. When the model's sourceFile can't be matched back to a
+    // known file, fall back in this order:
+    //   1. the model's own date, if it's a usable ISO date
+    //   2. the only source file's date, when there IS just one file — then
+    //      every point provably came from it, so it can't be ambiguous
+    // Only when neither applies does a point stay undated.
+    const soleFileDate = fileDates.length === 1 ? fileDates[0].date : null;
+    const isIsoDate = (value: unknown) => /^\d{4}-\d{2}-\d{2}/.test(String(value ?? '').trim());
+
     return this.normalizeLabTrendAnalysis({
       ...trendData,
       categories: trendData.categories.map((category) => ({
         ...category,
         points: category.points.map((point) => ({
           ...point,
-          date: this.getCanonicalLabDate(point.sourceFile, fileDates) || point.date,
+          date:
+            this.getCanonicalLabDate(point.sourceFile, fileDates) ||
+            (isIsoDate(point.date) ? point.date : null) ||
+            soleFileDate ||
+            point.date,
         })),
       })),
     });
@@ -872,15 +923,23 @@ Required JSON shape:
       return buffer.toString('base64');
     }
 
-    if (!file.remotePath || this.remoteApiBaseUrls.length === 0) {
+    if (!file.remotePath) {
       throw new Error(`Lab result file is missing locally: ${file.fileName}`);
     }
 
     // The file may live on either backend (new or old). Try each in order and
     // accept the first that returns a real file (a valid status AND not the SPA's
     // HTML page — formamd.com/api/* returns text/html which must be rejected).
+    // Local dev's own backend is appended as a LAST-resort fallback only — a
+    // record created against a locally-running backend can have a filePath that
+    // only exists on this machine's disk under a different working directory
+    // (or a DB shared with production, where the file simply isn't on either
+    // configured production host at all). This never runs before the real
+    // production URLs above it, and in production a request to localhost:3000
+    // just fails fast and falls through to the same error as before.
+    const baseUrlsToTry = [...this.remoteApiBaseUrls, 'http://localhost:3000/api'];
     const failures: string[] = [];
-    for (const baseUrl of this.remoteApiBaseUrls) {
+    for (const baseUrl of baseUrlsToTry) {
       const remoteUrl = `${baseUrl}${file.remotePath}`;
       try {
         console.log('[AI lab trends] Fetching remote lab file:', {
