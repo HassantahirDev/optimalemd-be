@@ -489,7 +489,7 @@ Task:
 
 Required JSON shape:
 {
-  "title": "AI Lab Trend Summary",
+  "title": "Lab Analysis",
   "generatedAt": "ISO-8601 timestamp",
   "overallImpression": "brief clinician-facing trend impression",
   "categories": [
@@ -853,7 +853,7 @@ Required JSON shape:
     const allowedFlags = new Set(['normal', 'high', 'low', 'critical', 'unknown']);
 
     return {
-      title: input.title || 'AI Lab Trend Summary',
+      title: input.title || 'Lab Analysis',
       generatedAt: new Date().toISOString(),
       overallImpression: input.overallImpression || 'No trend impression provided.',
       categories: Array.isArray(input.categories)
