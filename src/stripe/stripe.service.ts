@@ -2493,18 +2493,18 @@ export class StripeService {
     let totalDiscount = 0;
 
     tempItems.forEach((tempItem) => {
-      // If payment is made, use the prices that were actually paid
-      // Otherwise, use current subscription status
-      const shouldUseMemberPrice = usePaidPrices 
-        ? paidAsSubscribed 
-        : (isSubscribed && tempItem.membershipPrice !== null);
-      
-      const price = shouldUseMemberPrice && tempItem.membershipPrice !== null 
-        ? tempItem.membershipPrice 
+      // Member pricing is now the ONLY pricing — medications require a premium
+      // membership, so there is no non-member rate to fall back to. Where a
+      // medication has no membershipPrice recorded yet, its standardPrice still
+      // applies (left as-is pending the catalogue pricing rework).
+      const price = tempItem.membershipPrice !== null
+        ? tempItem.membershipPrice
         : tempItem.standardPrice;
-      
-      const discount = shouldUseMemberPrice && tempItem.membershipPrice !== null 
-        ? tempItem.standardPrice - tempItem.membershipPrice 
+
+      // Kept so the UI can still show what the old non-member rate would have
+      // been; it is never added to or subtracted from the amount charged.
+      const discount = tempItem.membershipPrice !== null
+        ? tempItem.standardPrice - tempItem.membershipPrice
         : 0;
 
       items.push({
@@ -2524,6 +2524,19 @@ export class StripeService {
             totalDiscount += discount;
     });
 
+    // Medications are member-only. A patient who isn't premium yet has to start
+    // that membership as part of paying this invoice, so the invoice shows both
+    // monthly charges up front rather than surprising them at checkout.
+    const requiresPremium = !isSubscribed && !usePaidPrices;
+    let premiumMonthly = 0;
+    if (requiresPremium) {
+      try {
+        premiumMonthly = await this.getPremiumMonthlyPrice();
+      } catch (err) {
+        console.error('Failed to read premium membership price for invoice:', err);
+      }
+    }
+
     return {
       items,
       subtotal,
@@ -2532,7 +2545,20 @@ export class StripeService {
       discount: totalDiscount,
       currency: 'usd',
       isPaid: usePaidPrices, // Indicates if showing paid prices
+      // Premium membership, billed as its own monthly subscription alongside
+      // the medication one. Zero/false once the patient is already a member.
+      requiresPremium,
+      premiumMonthly,
+      grandTotal: subtotal + premiumMonthly,
     };
+  }
+
+  /** Monthly premium membership price, in dollars, straight from Stripe. */
+  private async getPremiumMonthlyPrice(): Promise<number> {
+    const priceId = this.configService.get('STRIPE_SUBSCRIPTION_PRICE_ID');
+    if (!priceId) throw new Error('STRIPE_SUBSCRIPTION_PRICE_ID is not configured');
+    const price = await this.stripe.prices.retrieve(priceId);
+    return (price.unit_amount ?? 0) / 100;
   }
 
   /**
@@ -2946,12 +2972,28 @@ export class StripeService {
       });
     }
 
+    // Medications are member-only. If this patient isn't premium yet, start that
+    // membership in the same checkout — as its own subscription, so cancelling
+    // medications later doesn't also cancel their membership. Two subscriptions,
+    // two secrets, confirmed back-to-back with the one card they enter.
+    let premium: { clientSecret: string; subscriptionId: string; amount: number } | null = null;
+    if (!invoice.isSubscribed) {
+      const premiumResult = await this.createSubscription(userId);
+      premium = {
+        clientSecret: (premiumResult as any).clientSecret,
+        subscriptionId: (premiumResult as any).subscriptionId,
+        amount: (premiumResult as any).amount ?? 0,
+      };
+    }
+
     return {
       clientSecret: clientSecret,
       paymentIntentId: paymentIntent.id,
       subscriptionId: subscription.id,
       amount: invoice.total,
       currency: invoice.currency,
+      // Present only when a premium membership had to be started alongside.
+      premium,
     };
   }
 

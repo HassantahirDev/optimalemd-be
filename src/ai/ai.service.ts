@@ -59,6 +59,8 @@ export class AiService {
     [
       'https://formamd-production-cpbfg3cdewf9grat.canadacentral-01.azurewebsites.net/api',
       'https://optimaleproduction-ckfmbfgyccfjg3dc.canadacentral-01.azurewebsites.net/api',
+      // Staging, so labs uploaded there are analysable too.
+      'https://staging-formamd-dzfzabbjc0gyfed4.westus3-01.azurewebsites.net/api',
     ].join(',')
   )
     .split(',')
