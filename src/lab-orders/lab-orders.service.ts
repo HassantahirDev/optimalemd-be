@@ -649,7 +649,8 @@ export class LabOrdersService {
 
   /**
    * Patients whose most recent lab is older than `months` (default 3) and so are
-   * due to schedule again — plus anyone who has never had a lab confirmed.
+   * due to schedule again. Patients with no lab at all are NOT included — they
+   * have nothing to expire, and are usually just new rather than lapsed.
    *
    * "Most recent lab" uses the same rule the patient's own booking screen uses:
    * the latest CONFIRMED or COMPLETED order by scheduledDate. Pending and
@@ -691,12 +692,9 @@ export class LabOrdersService {
     const due = patients
       .map((p) => {
         const last = p.labOrders[0] || null;
-        // Never had one confirmed, or the last one predates the cutoff.
-        if (last && last.scheduledDate >= cutoff) return null;
-
-        const daysSince = last
-          ? Math.floor((Date.now() - last.scheduledDate.getTime()) / 86_400_000)
-          : null;
+        // Must have had a lab, and it must predate the cutoff. No lab at all
+        // means nothing has expired, so they don't belong on this list.
+        if (!last || last.scheduledDate >= cutoff) return null;
 
         return {
           patientId: p.id,
@@ -704,20 +702,14 @@ export class LabOrdersService {
           name: [p.firstName, p.lastName].filter(Boolean).join(' ').trim() || 'Unnamed patient',
           email: p.primaryEmail,
           phone: p.primaryPhone,
-          lastLabDate: last ? last.scheduledDate : null,
-          daysSinceLastLab: daysSince,
-          neverHadLab: !last,
+          lastLabDate: last.scheduledDate,
+          daysSinceLastLab: Math.floor((Date.now() - last.scheduledDate.getTime()) / 86_400_000),
         };
       })
-      .filter(Boolean) as Array<{ daysSinceLastLab: number | null }>;
+      .filter(Boolean) as Array<{ daysSinceLastLab: number }>;
 
-    // Longest overdue first; patients with no lab at all go last, since they may
-    // simply be new rather than lapsed.
-    due.sort((a, b) => {
-      if (a.daysSinceLastLab === null) return 1;
-      if (b.daysSinceLastLab === null) return -1;
-      return b.daysSinceLastLab - a.daysSinceLastLab;
-    });
+    // Longest overdue first.
+    due.sort((a, b) => b.daysSinceLastLab - a.daysSinceLastLab);
 
     return { months, cutoff, total: due.length, patients: due };
   }
