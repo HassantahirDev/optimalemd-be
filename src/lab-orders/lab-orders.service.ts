@@ -646,5 +646,79 @@ export class LabOrdersService {
 
     return { id: orderId };
   }
-}
 
+  /**
+   * Patients whose most recent lab is older than `months` (default 3) and so are
+   * due to schedule again — plus anyone who has never had a lab confirmed.
+   *
+   * "Most recent lab" uses the same rule the patient's own booking screen uses:
+   * the latest CONFIRMED or COMPLETED order by scheduledDate. Pending and
+   * cancelled orders don't count as having been done.
+   */
+  async getPatientsDueForLabs(months = 3, search?: string) {
+    const cutoff = new Date();
+    cutoff.setMonth(cutoff.getMonth() - months);
+
+    const patients = await this.prisma.user.findMany({
+      where: {
+        isActive: true,
+        ...(search
+          ? {
+              OR: [
+                { firstName: { contains: search, mode: 'insensitive' as const } },
+                { lastName: { contains: search, mode: 'insensitive' as const } },
+                { primaryEmail: { contains: search, mode: 'insensitive' as const } },
+              ],
+            }
+          : {}),
+      },
+      select: {
+        id: true,
+        patientId: true,
+        firstName: true,
+        lastName: true,
+        primaryEmail: true,
+        primaryPhone: true,
+        labOrders: {
+          where: { status: { in: ['confirmed', 'completed'] } },
+          orderBy: { scheduledDate: 'desc' },
+          take: 1,
+          select: { id: true, scheduledDate: true, status: true },
+        },
+      },
+    });
+
+    const due = patients
+      .map((p) => {
+        const last = p.labOrders[0] || null;
+        // Never had one confirmed, or the last one predates the cutoff.
+        if (last && last.scheduledDate >= cutoff) return null;
+
+        const daysSince = last
+          ? Math.floor((Date.now() - last.scheduledDate.getTime()) / 86_400_000)
+          : null;
+
+        return {
+          patientId: p.id,
+          patientNumber: p.patientId,
+          name: [p.firstName, p.lastName].filter(Boolean).join(' ').trim() || 'Unnamed patient',
+          email: p.primaryEmail,
+          phone: p.primaryPhone,
+          lastLabDate: last ? last.scheduledDate : null,
+          daysSinceLastLab: daysSince,
+          neverHadLab: !last,
+        };
+      })
+      .filter(Boolean) as Array<{ daysSinceLastLab: number | null }>;
+
+    // Longest overdue first; patients with no lab at all go last, since they may
+    // simply be new rather than lapsed.
+    due.sort((a, b) => {
+      if (a.daysSinceLastLab === null) return 1;
+      if (b.daysSinceLastLab === null) return -1;
+      return b.daysSinceLastLab - a.daysSinceLastLab;
+    });
+
+    return { months, cutoff, total: due.length, patients: due };
+  }
+}
