@@ -954,6 +954,7 @@ export class StripeService {
     let updatedSubscription: Stripe.Subscription;
     let invoicePeriodStart: number | null = null;
     let invoicePeriodEnd: number | null = null;
+    let hostedInvoiceUrl: string | null = null;
     
     try {
       updatedSubscription = await this.stripe.subscriptions.retrieve(subscriptionId);
@@ -964,6 +965,7 @@ export class StripeService {
         try {
           const invoice = await this.stripe.invoices.retrieve(invoiceId);
           const inv = invoice as any;
+          hostedInvoiceUrl = inv.hosted_invoice_url || null;
           if (inv.period_start) {
             invoicePeriodStart = inv.period_start;
             console.log(`📅 Found period_start in invoice: ${invoicePeriodStart}`);
@@ -1070,6 +1072,8 @@ export class StripeService {
         cardBrand,
         cardLast4,
         note: 'Premium membership subscription',
+        // Without this the row has nothing to link to in Billing History.
+        receiptUrl: hostedInvoiceUrl,
         paidAt: new Date(),
         createdByType: 'patient',
       });
@@ -3195,6 +3199,18 @@ export class StripeService {
     // up a second time in Billing History as its own "1 × ... (at $X/month)" row —
     // same invoiceId this PI was tagged with at createMedicationPaymentIntent time.
     const medInvoiceId = (paymentIntent.metadata?.invoiceId as string) || null;
+
+    // Same reason as the membership write: Billing History needs a URL to link
+    // to, otherwise the row has no invoice to open.
+    let medHostedInvoiceUrl: string | null = null;
+    if (medInvoiceId) {
+      try {
+        const medInv = (await this.stripe.invoices.retrieve(medInvoiceId)) as any;
+        medHostedInvoiceUrl = medInv.hosted_invoice_url || null;
+      } catch (err: any) {
+        console.error(`Could not read hosted invoice url for ${medInvoiceId}: ${err.message}`);
+      }
+    }
     await this.paymentLedger.upsertFromStripe({
       stripePaymentIntentId: paymentIntentId,
       stripeInvoiceId: medInvoiceId,
@@ -3211,6 +3227,7 @@ export class StripeService {
       status: 'SUCCEEDED',
       paidAt: new Date(),
       note: 'Medication order',
+      receiptUrl: medHostedInvoiceUrl,
       lineItems: (invoice.items || []).map((it: any) => ({
         description: [it.name, it.strength, it.dose].filter(Boolean).join(' '),
         medicationId: it.medicationId ?? null,
