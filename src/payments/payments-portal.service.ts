@@ -389,7 +389,7 @@ export class PaymentsPortalService implements OnModuleInit {
       paymentMethodType: r.paymentMethodType,
       cardBrand: r.cardBrand,
       cardLast4: r.cardLast4,
-      receiptUrl: r.receiptUrl,
+      receiptUrl: r.receiptUrl || r.hostedInvoiceUrl || null,
       billingEmail: r.billingEmail,
       stripePaymentIntentId: r.stripePaymentIntentId,
       stripeChargeId: r.stripeChargeId,
@@ -549,6 +549,30 @@ export class PaymentsPortalService implements OnModuleInit {
         category: catOrNull(li.category),
       }));
 
+    // Receipt URLs, filled in for any ledger row that doesn't have one stored.
+    // Done at read time deliberately: it covers payments recorded before the
+    // writers started saving the URL, AND acts as a safety net for any writer
+    // that forgets — rather than leaving a row with no invoice to open. The
+    // ledger itself stays a pure mirror with no network calls in it.
+    const missingReceipt = records.filter(
+      (r) =>
+        !r.receiptUrl &&
+        !r.hostedInvoiceUrl &&
+        (r.stripeInvoiceId || r.stripePaymentIntentId),
+    );
+    const derivedReceipts = new Map<string, string>();
+    if (missingReceipt.length > 0) {
+      await Promise.all(
+        missingReceipt.map(async (r) => {
+          const url = await this.lookupReceiptUrl(
+            r.stripeInvoiceId,
+            r.stripePaymentIntentId,
+          );
+          if (url) derivedReceipts.set(r.id, url);
+        }),
+      );
+    }
+
     let lifetimePaid = 0;
     // Payment history = the COMPLETE ledger for this patient (every channel, every
     // status). One row per payment (deduped by the sync), so nothing double-counts.
@@ -567,7 +591,7 @@ export class PaymentsPortalService implements OnModuleInit {
         cardBrand: r.cardBrand,
         cardLast4: r.cardLast4,
         paymentMethodType: r.paymentMethodType,
-        receiptUrl: r.receiptUrl,
+        receiptUrl: r.receiptUrl || r.hostedInvoiceUrl || derivedReceipts.get(r.id) || null,
         description: r.description || r.note || null,
         items: mapItems(r.lineItems),
       };
@@ -924,5 +948,39 @@ export class PaymentsPortalService implements OnModuleInit {
     }
     out.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
     return out;
+  }
+
+  /**
+   * Best available link for a payment: the hosted invoice if there is one,
+   * otherwise the charge's receipt. Tries both Stripe accounts, since POS
+   * payments live on a different one. Returns null rather than throwing —
+   * a missing link must never break Billing History.
+   */
+  private async lookupReceiptUrl(
+    invoiceId: string | null,
+    paymentIntentId: string | null,
+  ): Promise<string | null> {
+    for (const { client } of this.stripeAccounts) {
+      if (invoiceId) {
+        try {
+          const inv = (await client.invoices.retrieve(invoiceId)) as any;
+          if (inv?.hosted_invoice_url) return inv.hosted_invoice_url;
+        } catch {
+          /* wrong account or deleted — fall through */
+        }
+      }
+      if (paymentIntentId) {
+        try {
+          const pi = (await client.paymentIntents.retrieve(paymentIntentId, {
+            expand: ['latest_charge'],
+          })) as any;
+          const url = pi?.latest_charge?.receipt_url;
+          if (url) return url;
+        } catch {
+          /* wrong account — try the next one */
+        }
+      }
+    }
+    return null;
   }
 }
