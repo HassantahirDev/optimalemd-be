@@ -508,7 +508,10 @@ Task:
     "PSA, Free", "Free PSA", "% Free PSA", "PSA, Free:Total Ratio". PSA is frequently
     printed on its own page or in a separate panel from the CMP/CBC tables — check every
     page before concluding it is absent.
-16. Use the lab result collection/specimen/result date shown in the file when visible. If only the lab order scheduled date is known, use that scheduled date.
+16. testName must be the test's name only. Strip any order or LOINC code the lab
+    prints alongside it, so "PSA, Total (2857-1)" is reported as "PSA, Total".
+    The same test must carry the same testName across every file and date.
+17. Use the lab result collection/specimen/result date shown in the file when visible. If only the lab order scheduled date is known, use that scheduled date.
 
 Required JSON shape:
 {
@@ -579,6 +582,22 @@ Required JSON shape:
         `Lab trend analysis failed. ${message}`,
       );
     }
+  }
+
+  /**
+   * Labs print the same test under slightly different labels from one report to
+   * the next — most often by appending an order/LOINC code, e.g. "PSA, Total"
+   * on one panel and "PSA, Total (2857-1)" on another. Grouping is by test name
+   * everywhere downstream, so an unstripped code splits one test into two rows
+   * that can never show a trend. Only a purely numeric parenthetical is removed,
+   * so meaningful ones like "(BUN)", "(calc)" or "(Adult)" survive.
+   */
+  private canonicalizeTestName(testName: string) {
+    return testName
+      .replace(/\s*\(\s*\d{2,6}(?:-\d)?\s*\)\s*$/, '')
+      .replace(/\s+/g, ' ')
+      .replace(/[\s,]+$/, '')
+      .trim();
   }
 
   private isCurrentAnalysisVersion(trendData: LabTrendAnalysisResult | null) {
@@ -896,7 +915,9 @@ Required JSON shape:
                     new Map(category.points.map((point) => {
                       const normalizedPoint = {
                         date: point.date || 'Unknown date',
-                        testName: point.testName || 'Unknown test',
+                        testName:
+                          this.canonicalizeTestName(point.testName || '') ||
+                          'Unknown test',
                         value: String(point.value ?? ''),
                         unit: point.unit ?? null,
                         flag: allowedFlags.has(point.flag) ? point.flag : 'unknown',
