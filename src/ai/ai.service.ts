@@ -481,10 +481,10 @@ ${JSON.stringify(labTimeline, null, 2)}
 
 Task:
 1. Read all attached lab result files, including scanned/visual PDF pages and table images.
-2. Pull historical values and dates for these groups only. Each group's members are
-   listed explicitly — assign every matching result to the group named here, and do
-   not move a test between groups or drop it because it is not literally the group's
-   namesake. A result that matches none of these groups is omitted.
+2. Extract EVERY lab result visible in the files. Nothing is skipped. Group the
+   results as follows — each group's members are listed explicitly, so assign every
+   matching result to the group named here and do not move a test between groups or
+   drop it because it is not literally the group's namesake.
    - Testosterone: Testosterone Total / Free / Bioavailable (any assay suffix),
      Sex Hormone Binding Globulin (SHBG), LH, FSH
    - Estradiol: Estradiol, Estrone
@@ -496,6 +496,15 @@ Task:
    - CMP: glucose, BUN, creatinine, eGFR, electrolytes, calcium, total protein,
      albumin, globulin, A/G ratio, bilirubin, alkaline phosphatase, AST, ALT
    - PSA: total PSA, free PSA, % free PSA, PSA free:total ratio
+   These member lists name the common tests, they are not limits. Any other result
+   that belongs to one of these panels belongs in that group too — e.g. reverse T3
+   and thyroglobulin are thyroid, RDW and MPV are CBC, anion gap is CMP.
+   Any result that fits none of the groups above still has to be reported: put it in
+   an additional group of your own naming (for example vitamin D, iron studies,
+   insulin, IGF-1, cortisol, inflammatory markers), with a short lowercase key and a
+   readable title. Never discard a result because no listed group fits it.
+   Report each result once. If the same test, same date and same value is printed on
+   more than one page or panel, report it a single time in the most appropriate group.
 3. Display trends chronologically.
 4. Include exact values and units when visible.
 5. If a value is not present, omit that item.
@@ -503,8 +512,10 @@ Task:
 7. Important: Quest PDFs often show result tables across multiple pages. Inspect every page. If one page is a requisition/order page, continue to later pages for actual result tables.
 8. Treat rows like "CHOLESTEROL, TOTAL 215 H <200 mg/dL", "GLUCOSE 90 65-99 mg/dL", and "TESTOSTERONE, TOTAL 716 250-827 ng/dL" as readable lab result data.
 9. Return ONLY valid JSON. No markdown, no code fences, no comments.
-10. Every category must have a stable key from this set only:
+10. Use these stable keys for the listed groups:
     testosterone, estradiol, lipids, a1c, thyroid, cbc, cmp, psa
+    For a group of your own naming, use a short lowercase key (letters, digits and
+    hyphens only), e.g. "vitamin-d", "iron", "cortisol".
 11. For flags use only: normal, high, low, critical, unknown.
 12. If there are no visible values for a category, omit that category entirely.
 13. Extract every visible matching result, not just one representative value.
@@ -893,7 +904,11 @@ Required JSON shape:
   private normalizeLabTrendAnalysis(
     input: Partial<LabTrendAnalysisResult>,
   ): LabTrendAnalysisResult {
-    const allowedKeys = new Set([
+    // The eight groups the prompt defines explicitly. These are NOT an allowlist —
+    // a lab result that fits none of them still has to reach the patient, so any
+    // other key the model returns is kept (sanitised) rather than discarded. They
+    // only fix the display order, so the familiar panels lead.
+    const knownKeys = [
       'testosterone',
       'estradiol',
       'lipids',
@@ -902,8 +917,11 @@ Required JSON shape:
       'cbc',
       'cmp',
       'psa',
-    ]);
+    ];
     const allowedFlags = new Set(['normal', 'high', 'low', 'critical', 'unknown']);
+    // A test printed on two panels of the same report (albumin appears in both the
+    // CMP and the endocrinology panel, for instance) is one result, not two.
+    const seenAcrossCategories = new Set<string>();
 
     return {
       title: input.title || 'Lab Analysis',
@@ -911,9 +929,9 @@ Required JSON shape:
       overallImpression: input.overallImpression || 'No trend impression provided.',
       categories: Array.isArray(input.categories)
         ? input.categories
-            .filter((category) => allowedKeys.has(category?.key))
+            .filter((category) => Boolean(this.sanitizeCategoryKey(category?.key)))
             .map((category) => ({
-              key: category.key,
+              key: this.sanitizeCategoryKey(category.key),
               title: category.title || this.toTitleCase(category.key),
               summary: category.summary || '',
               points: Array.isArray(category.points)
@@ -938,16 +956,46 @@ Required JSON shape:
 
                       return [pointKey, normalizedPoint];
                     })).values(),
-                  ).sort((a, b) =>
-                    `${a.date}|${a.testName}`.localeCompare(`${b.date}|${b.testName}`),
                   )
+                    .filter((point) => {
+                      const globalKey = [
+                        point.date,
+                        point.testName.toLowerCase(),
+                        String(point.value).trim().toLowerCase(),
+                      ].join('|');
+                      if (seenAcrossCategories.has(globalKey)) return false;
+                      seenAcrossCategories.add(globalKey);
+                      return true;
+                    })
+                    .sort((a, b) =>
+                      `${a.date}|${a.testName}`.localeCompare(`${b.date}|${b.testName}`),
+                    )
                 : [],
             }))
             .filter((category) => category.points.length > 0)
+            .sort((a, b) => {
+              const ra = knownKeys.indexOf(a.key);
+              const rb = knownKeys.indexOf(b.key);
+              return (ra === -1 ? knownKeys.length : ra) - (rb === -1 ? knownKeys.length : rb);
+            })
         : [],
       limitations: Array.isArray(input.limitations) ? input.limitations : [],
       analysisVersion: input.analysisVersion,
     };
+  }
+
+  /**
+   * Keep whatever grouping the model returned, but make the key safe to use as a
+   * lookup key in the UIs. Returns '' for anything unusable, which drops only the
+   * malformed category — never a well-formed one we simply didn't anticipate.
+   */
+  private sanitizeCategoryKey(key: unknown) {
+    return String(key ?? '')
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 40);
   }
 
   private toTitleCase(value: string) {
