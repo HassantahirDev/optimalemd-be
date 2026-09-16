@@ -481,15 +481,21 @@ ${JSON.stringify(labTimeline, null, 2)}
 
 Task:
 1. Read all attached lab result files, including scanned/visual PDF pages and table images.
-2. Pull historical values and dates for these groups only:
-   - Testosterone
-   - Estradiol
-   - Lipids
-   - A1c
-   - Thyroid labs
-   - CBC
-   - CMP
-   - PSA
+2. Pull historical values and dates for these groups only. Each group's members are
+   listed explicitly — assign every matching result to the group named here, and do
+   not move a test between groups or drop it because it is not literally the group's
+   namesake. A result that matches none of these groups is omitted.
+   - Testosterone: Testosterone Total / Free / Bioavailable (any assay suffix),
+     Sex Hormone Binding Globulin (SHBG), LH, FSH
+   - Estradiol: Estradiol, Estrone
+   - Lipids: total cholesterol, HDL, LDL, triglycerides, non-HDL, and the
+     cholesterol ratios
+   - A1c: Hemoglobin A1c, estimated average glucose
+   - Thyroid labs: TSH, Free/Total T4, Free/Total T3, thyroid antibodies
+   - CBC: hemoglobin, hematocrit, RBC, WBC, platelets, and the differential
+   - CMP: glucose, BUN, creatinine, eGFR, electrolytes, calcium, total protein,
+     albumin, globulin, A/G ratio, bilirubin, alkaline phosphatase, AST, ALT
+   - PSA: total PSA, free PSA, % free PSA, PSA free:total ratio
 3. Display trends chronologically.
 4. Include exact values and units when visible.
 5. If a value is not present, omit that item.
