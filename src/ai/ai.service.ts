@@ -42,6 +42,9 @@ type LabTrendAnalysisResult = {
     }>;
   }>;
   limitations: string[];
+  // Which prompt version produced this note. Stored inside the note itself so a
+  // prompt change can invalidate cached analyses without a schema change.
+  analysisVersion?: string;
 };
 
 @Injectable()
@@ -66,7 +69,7 @@ export class AiService {
     .split(',')
     .map((s) => s.trim().replace(/\/+$/, ''))
     .filter(Boolean);
-  private readonly labTrendAnalysisVersion = 'lab-trends-v3-structured-json-ui';
+  private readonly labTrendAnalysisVersion = 'lab-trends-v4-psa';
 
   constructor(
     private readonly configService: ConfigService,
@@ -272,6 +275,9 @@ export class AiService {
       .find((analysis) => {
         if (!analysis.trendData) return false;
         if (this.isUnreadableLabTrendNote(analysis.labTrendAnalysisNote)) return false;
+        // An analysis from an older prompt is missing whatever that prompt didn't
+        // ask for (PSA, before v4), so it cannot stand in for a current one.
+        if (!this.isCurrentAnalysisVersion(analysis.trendData)) return false;
 
         return analysis.labTrendAnalysisHash === sourceHash ||
           this.cachedTrendCoversFiles(analysis.trendData, files);
@@ -282,6 +288,7 @@ export class AiService {
       const trendData = {
         ...reusablePatientAnalysis.trendData,
         generatedAt: analyzedAt.toISOString(),
+        analysisVersion: this.labTrendAnalysisVersion,
       };
       await this.prisma.appointment.updateMany({
         where: { patientId },
@@ -301,11 +308,17 @@ export class AiService {
       };
     }
 
-    if (!force && canonicalCachedTrendData && !hasUnreadableCachedNote) {
+    if (
+      !force &&
+      canonicalCachedTrendData &&
+      !hasUnreadableCachedNote &&
+      this.isCurrentAnalysisVersion(canonicalCachedTrendData)
+    ) {
       const analyzedAt = appointment.labTrendAnalysisAt || new Date();
       const trendData = {
         ...canonicalCachedTrendData,
         generatedAt: analyzedAt.toISOString(),
+        analysisVersion: this.labTrendAnalysisVersion,
       };
       await this.prisma.appointment.updateMany({
         where: { patientId },
@@ -333,14 +346,18 @@ export class AiService {
     });
     const freshTrendData =
       this.canonicalizeLabTrendDates(rawFreshTrendData, files) || rawFreshTrendData;
-    const mergedTrendData = !force && canonicalCachedTrendData
-      ? this.mergeLabTrendAnalysis(canonicalCachedTrendData, freshTrendData)
-      : freshTrendData;
+    const mergedTrendData =
+      !force &&
+      canonicalCachedTrendData &&
+      this.isCurrentAnalysisVersion(canonicalCachedTrendData)
+        ? this.mergeLabTrendAnalysis(canonicalCachedTrendData, freshTrendData)
+        : freshTrendData;
 
     const analyzedAt = new Date();
     const trendData = {
       ...mergedTrendData,
       generatedAt: analyzedAt.toISOString(),
+      analysisVersion: this.labTrendAnalysisVersion,
     };
     await this.prisma.appointment.updateMany({
       where: { patientId },
@@ -472,6 +489,7 @@ Task:
    - Thyroid labs
    - CBC
    - CMP
+   - PSA
 3. Display trends chronologically.
 4. Include exact values and units when visible.
 5. If a value is not present, omit that item.
@@ -480,16 +498,21 @@ Task:
 8. Treat rows like "CHOLESTEROL, TOTAL 215 H <200 mg/dL", "GLUCOSE 90 65-99 mg/dL", and "TESTOSTERONE, TOTAL 716 250-827 ng/dL" as readable lab result data.
 9. Return ONLY valid JSON. No markdown, no code fences, no comments.
 10. Every category must have a stable key from this set only:
-    testosterone, estradiol, lipids, a1c, thyroid, cbc, cmp
+    testosterone, estradiol, lipids, a1c, thyroid, cbc, cmp, psa
 11. For flags use only: normal, high, low, critical, unknown.
 12. If there are no visible values for a category, omit that category entirely.
 13. Extract every visible matching result, not just one representative value.
 14. For repeated tests across multiple files or dates, include one point per test/date/source file. For example, Total Testosterone and Free Testosterone are separate tests and both must be included for every date where visible.
-15. Use the lab result collection/specimen/result date shown in the file when visible. If only the lab order scheduled date is known, use that scheduled date.
+15. PSA is reported under several names. Treat all of these as the "psa" category and
+    extract every one that is visible: "PSA", "PSA, Total", "Prostate Specific Antigen",
+    "PSA, Free", "Free PSA", "% Free PSA", "PSA, Free:Total Ratio". PSA is frequently
+    printed on its own page or in a separate panel from the CMP/CBC tables — check every
+    page before concluding it is absent.
+16. Use the lab result collection/specimen/result date shown in the file when visible. If only the lab order scheduled date is known, use that scheduled date.
 
 Required JSON shape:
 {
-  "title": "AI Lab Trend Summary",
+  "title": "Lab Analysis",
   "generatedAt": "ISO-8601 timestamp",
   "overallImpression": "brief clinician-facing trend impression",
   "categories": [
@@ -556,6 +579,10 @@ Required JSON shape:
         `Lab trend analysis failed. ${message}`,
       );
     }
+  }
+
+  private isCurrentAnalysisVersion(trendData: LabTrendAnalysisResult | null) {
+    return trendData?.analysisVersion === this.labTrendAnalysisVersion;
   }
 
   private createLabSourceHash(files: LabTrendSourceFile[]) {
@@ -849,11 +876,12 @@ Required JSON shape:
       'thyroid',
       'cbc',
       'cmp',
+      'psa',
     ]);
     const allowedFlags = new Set(['normal', 'high', 'low', 'critical', 'unknown']);
 
     return {
-      title: input.title || 'AI Lab Trend Summary',
+      title: input.title || 'Lab Analysis',
       generatedAt: new Date().toISOString(),
       overallImpression: input.overallImpression || 'No trend impression provided.',
       categories: Array.isArray(input.categories)
@@ -891,6 +919,7 @@ Required JSON shape:
             .filter((category) => category.points.length > 0)
         : [],
       limitations: Array.isArray(input.limitations) ? input.limitations : [],
+      analysisVersion: input.analysisVersion,
     };
   }
 
