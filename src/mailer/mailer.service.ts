@@ -3005,7 +3005,7 @@ For your security, you will be asked to set a new password the first time you lo
               </ul>
             </div>
             
-            <p class="description">You now have access to all premium features and benefits. We're excited to help you on your health journey!</p>
+            <p class="description">You now have access to all Performance features and benefits. We're excited to help you on your health journey!</p>
           </div>
           <div class="footer">
             <p>This is an automated email, please do not reply.</p>

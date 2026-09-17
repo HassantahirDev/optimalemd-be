@@ -96,7 +96,7 @@ export class PaymentsPortalService implements OnModuleInit {
         channel: r.channel,
         billing: r.billing,
         user: r.user,
-        note: r.note,
+        note: this.relabelPlan(r.note),
         ledgerId: r.id,
       };
       for (const key of [
@@ -463,7 +463,7 @@ export class PaymentsPortalService implements OnModuleInit {
       user: r.user || null,
       external: !r.userId,
       customerEmail: r.billingEmail,
-      note: r.description || r.note,
+      note: this.relabelPlan(r.description || r.note),
     }));
   }
 
@@ -542,7 +542,7 @@ export class PaymentsPortalService implements OnModuleInit {
     const catOrNull = (c: any) => (c === 'OTHER' ? null : c);
     const mapItems = (lineItems: any[]) =>
       (lineItems || []).map((li: any) => ({
-        description: li.description,
+        description: this.relabelPlan(li.description),
         quantity: li.quantity,
         amount: Number(li.unitAmount) * li.quantity,
         isSubscription: li.isSubscription,
@@ -592,7 +592,7 @@ export class PaymentsPortalService implements OnModuleInit {
         cardLast4: r.cardLast4,
         paymentMethodType: r.paymentMethodType,
         receiptUrl: r.receiptUrl || r.hostedInvoiceUrl || derivedReceipts.get(r.id) || null,
-        description: r.description || r.note || null,
+        description: this.relabelPlan(r.description || r.note) || null,
         items: mapItems(r.lineItems),
       };
     });
@@ -877,6 +877,21 @@ export class PaymentsPortalService implements OnModuleInit {
 
   // Read-only: every Stripe invoice for this patient (across accounts), for the
   // Invoices tab/tile on the drill-down. Never counted in money totals.
+  /**
+   * The membership is called Performance. Rows written before the rename still say
+   * "Premium" — in our ledger notes and in Stripe's own invoice line descriptions —
+   * and neither can be edited after the fact (the ledger is a mirror; Stripe
+   * descriptions are immutable on finalized invoices). So the label is corrected on
+   * the way out instead, leaving the stored data untouched. Substitution is
+   * synchronous, so a caller never sees the old wording, not even briefly.
+   */
+  private relabelPlan<T extends string | null | undefined>(text: T): T {
+    if (!text) return text;
+    return text
+      .replace(/\bPremium\b/g, 'Performance')
+      .replace(/\bpremium\b/g, 'Performance') as T;
+  }
+
   private async fetchPatientInvoices(stripeCustomerId: string | null, emails: string[]) {
     const customers: { client: Stripe; id: string }[] = [];
     const seenCust = new Set<string>();
@@ -936,7 +951,9 @@ export class PaymentsPortalService implements OnModuleInit {
             // directly in Stripe (dashboard or an auto subscription-renewal invoice).
             source: (inv.metadata?.formamd_category || inv.metadata?.formamd_user_id) ? 'PLATFORM' : 'STRIPE',
             items: lines.map((l: any) => ({
-              description: l.description || l.price?.nickname || l.plan?.nickname || 'Item',
+              description: this.relabelPlan(
+                l.description || l.price?.nickname || l.plan?.nickname || 'Item',
+              ),
               quantity: l.quantity || 1,
               amount: (l.amount || 0) / 100,
             })),

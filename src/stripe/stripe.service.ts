@@ -675,7 +675,7 @@ export class StripeService {
           },
         });
         throw new BadRequestException(
-          'You already have an active premium subscription.',
+          'You already have an active Performance subscription.',
         );
       }
     } else if (user.isSubscribed) {
@@ -771,7 +771,7 @@ export class StripeService {
             payment_method_types: ['card'],
           },
           expand: ['latest_invoice.confirmation_secret'],
-          description: `Premium Subscription – ${`${user.firstName || ''} ${user.lastName || ''}`.trim()}`,
+          description: `Performance Subscription – ${`${user.firstName || ''} ${user.lastName || ''}`.trim()}`,
           metadata: {
             userId: user.id,
             patientName: `${user.firstName || ''} ${user.lastName || ''}`.trim(),
@@ -1071,7 +1071,7 @@ export class StripeService {
         status: 'SUCCEEDED',
         cardBrand,
         cardLast4,
-        note: 'Premium membership subscription',
+        note: 'Performance membership subscription',
         // Without this the row has nothing to link to in Billing History.
         receiptUrl: hostedInvoiceUrl,
         paidAt: new Date(),
@@ -1984,7 +1984,7 @@ export class StripeService {
         receiptUrl: data.receiptUrl,
         hostedInvoiceUrl: data.invoiceUrl,
         paidAt: data.paidAt,
-        note: 'Premium membership subscription',
+        note: 'Performance membership subscription',
       });
     } catch (e: any) {
       // Ledger must never break the webhook flow.
