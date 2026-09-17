@@ -761,6 +761,15 @@ export class AppointmentsService {
       throw new BadRequestException('Cancelled appointments cannot be updated');
     }
 
+    if (
+      (updateAppointmentDto as any).status === AppointmentStatus.COMPLETED &&
+      !this.hasPrescribedMedications((appointment as any).medications)
+    ) {
+      throw new BadRequestException(
+        'Prescribe at least one medication for this appointment before marking it completed.',
+      );
+    }
+
     // Update status-specific fields
     const updateData: any = { ...updateAppointmentDto };
 
@@ -778,6 +787,16 @@ export class AppointmentsService {
       where: { id },
       data: updateData
     });
+
+    // Completing the visit from this path sends the same "care plan ready" note,
+    // unless the doctor already signed (which sent it).
+    if (
+      updateData.status === AppointmentStatus.COMPLETED &&
+      (appointment.status as AppointmentStatus) !== AppointmentStatus.COMPLETED &&
+      !appointment.notesSignedAt
+    ) {
+      await this.sendCarePlanReadyEmail(id);
+    }
 
     return updatedAppointment;
   }
@@ -805,6 +824,21 @@ export class AppointmentsService {
     // Only email on the actual transition INTO no-show, not on re-saves / note edits
     // of an already-recorded no-show.
     const isNewNoShow = visitStatus === 'NO_SHOW' && appointment.visitStatus !== 'NO_SHOW';
+    // Same rule for "care plan ready": only on the transition INTO completed, and
+    // only if signing the note hasn't already sent it.
+    const isNewCompleted =
+      visitStatus === 'COMPLETED' &&
+      appointment.status !== AppointmentStatus.COMPLETED &&
+      !appointment.notesSignedAt;
+
+    if (
+      visitStatus === 'COMPLETED' &&
+      !this.hasPrescribedMedications((appointment as any).medications)
+    ) {
+      throw new BadRequestException(
+        'Prescribe at least one medication for this appointment before marking the visit completed.',
+      );
+    }
 
     // Mirror booking status from the recorded clinical outcome.
     const now = new Date();
@@ -841,6 +875,10 @@ export class AppointmentsService {
         ...bookingMirror,
       },
     });
+
+    if (isNewCompleted) {
+      await this.sendCarePlanReadyEmail(appointmentId);
+    }
 
     // Fire the "sorry we missed you" email — non-fatal, must never block the status
     // update itself just because the mail server hiccups.
@@ -1011,6 +1049,62 @@ export class AppointmentsService {
   /**
    * Sign notes for an appointment (sets notesSignedAt timestamp)
    */
+  /**
+   * True only when at least one medication is actually prescribed on the
+   * appointment. `medications` is a JSON object keyed by medical service, whose
+   * values are either string[] (legacy) or MedicationObject[] (current) — so an
+   * opened-but-empty category like { "Hair Loss": [] } must NOT count, which is
+   * why this is stricter than the display check (`Object.keys(...).length > 0`)
+   * the patient list uses for its badge.
+   */
+  private hasPrescribedMedications(medications: any): boolean {
+    if (!medications || typeof medications !== 'object' || Array.isArray(medications)) {
+      return false;
+    }
+    return Object.values(medications).some((entries: any) => {
+      if (!Array.isArray(entries)) return false;
+      return entries.some((entry: any) => {
+        if (typeof entry === 'string') return entry.trim().length > 0;
+        if (entry && typeof entry === 'object') {
+          return Boolean(entry.name || entry.medication || entry.medicationName || entry.id);
+        }
+        return false;
+      });
+    });
+  }
+
+  /**
+   * "Your care plan is ready" — fired when the visit is closed out. Never throws:
+   * a mail failure must not roll back the signature or the status change the
+   * doctor just made.
+   */
+  private async sendCarePlanReadyEmail(appointmentId: string) {
+    try {
+      const appt = await this.prisma.appointment.findUnique({
+        where: { id: appointmentId },
+        include: {
+          patient: {
+            select: { id: true, firstName: true, lastName: true, primaryEmail: true, email: true },
+          },
+        },
+      });
+      const to = appt?.patient?.primaryEmail || appt?.patient?.email;
+      if (!to) return;
+
+      const patientName =
+        `${appt.patient.firstName || ''} ${appt.patient.lastName || ''}`.trim() || 'there';
+      const carePlanLink = buildAutoLoginLink(
+        this.jwtService,
+        this.configService,
+        appt.patient,
+        `/dashboard/care-plan-details/${appointmentId}`,
+      );
+      await this.mailerService.sendCarePlanReadyEmail(to, patientName, carePlanLink);
+    } catch (err) {
+      console.error('[care plan ready] email failed:', err);
+    }
+  }
+
   async signNotes(appointmentId: string, doctorId: string): Promise<AppointmentResponseDto> {
     // Check if appointment exists and belongs to the doctor
     const appointment = await this.prisma.appointment.findFirst({
@@ -1029,11 +1123,23 @@ export class AppointmentsService {
       throw new BadRequestException('Notes have already been signed for this appointment.');
     }
 
+    if (!this.hasPrescribedMedications((appointment as any).medications)) {
+      throw new BadRequestException(
+        'Prescribe at least one medication for this appointment before signing the notes.',
+      );
+    }
+
     // Set notesSignedAt timestamp
     const updatedAppointment = await this.prisma.appointment.update({
       where: { id: appointmentId },
       data: { notesSignedAt: new Date() },
     });
+
+    // Tell the patient their care plan is ready — unless completing the visit
+    // already told them, so signing afterwards doesn't send a second copy.
+    if (appointment.status !== AppointmentStatus.COMPLETED) {
+      await this.sendCarePlanReadyEmail(appointmentId);
+    }
 
     return updatedAppointment;
   }

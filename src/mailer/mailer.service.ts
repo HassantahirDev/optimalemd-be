@@ -1624,6 +1624,79 @@ export class MailerService implements OnModuleInit {
     }
   }
 
+  /**
+   * Sent once the visit is closed out — the doctor signs the note, or records the
+   * visit as completed, whichever happens first. Tells the patient their care plan
+   * is viewable and that they can authorise payment for the treatment plan.
+   */
+  async sendCarePlanReadyEmail(
+    patientEmail: string,
+    patientName: string,
+    carePlanLink?: string,
+  ): Promise<void> {
+    const html = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+          body { font-family: Arial, sans-serif; line-height: 1.6; margin: 0; padding: 20px; background-color: #f4f4f4; color: #333333; }
+          .container { max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); overflow: hidden; }
+          .header { background-color: #000000; padding: 25px; text-align: center; }
+          .logo { color: #ffffff; font-size: 24px; font-weight: bold; text-transform: uppercase; margin: 0; }
+          .content { padding: 30px; text-align: center; }
+          .title { color: #dc2626; font-size: 24px; font-weight: bold; margin-bottom: 20px; }
+          .info-box { background-color: #f9f9f9; border-left: 4px solid #dc2626; padding: 20px; margin: 20px 0; text-align: left; }
+          .footer { background-color: #000000; color: #ffffff; padding: 20px; text-align: center; font-size: 12px; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">
+            <h1 class="logo">FormaMD</h1>
+          </div>
+          <div class="content">
+            <h2 class="title">Your Care Plan Is Ready</h2>
+            <p>Dear ${patientName},</p>
+            <p>Your care plan is ready to view. You can also authorize payment for your current treatment plan on the portal.</p>
+
+            ${carePlanLink ? `
+            <div style="text-align: center; margin: 30px 0;">
+              <a href="${carePlanLink}" target="_blank" style="display: inline-block; background-color: #dc2626; color: #ffffff; text-decoration: none; font-weight: bold; font-size: 16px; padding: 14px 32px; border-radius: 8px;">View Your Care Plan</a>
+              <p style="margin: 12px 0 0 0; font-size: 12px; color: #6b7280;">This secure link takes you straight to your care plan — no need to log in again.</p>
+            </div>` : ''}
+
+            <div class="info-box">
+              <p style="margin: 0;">Once payment is made, your order will be processed and shipped within 5 business days.</p>
+            </div>
+
+            <p style="margin-top: 30px;">Best regards,<br><strong>The FormaMD Team</strong></p>
+          </div>
+          <div class="footer">
+            <p>This is an automated email, please do not reply.</p>
+            <p>&copy; ${new Date().getFullYear()} FormaMD</p>
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+
+    try {
+      const fromEmail = this.configService.get<string>('APPOINTMENT_SMTP_FROM') || this.configService.get<string>('SMTP_FROM');
+      await this.appointmentTransporter.sendMail({
+        from: `"FormaMD" <${fromEmail}>`,
+        to: patientEmail,
+        subject: 'Your Care Plan Is Ready to View | FormaMD',
+        html,
+      });
+      console.log(`Care plan ready email sent successfully to ${patientEmail}`);
+    } catch (error) {
+      console.error('Failed to send care plan ready email:', error);
+      throw error;
+    }
+  }
+
   async sendDoctorCancellationNotification(
     doctorEmail: string,
     doctorName: string,
