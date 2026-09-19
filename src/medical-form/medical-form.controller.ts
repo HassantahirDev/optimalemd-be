@@ -145,6 +145,31 @@ export class MedicalFormController {
     };
   }
 
+  @Get('biometrics-history')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @ApiOperation({ summary: "Weight/BMI history for the signed-in patient, newest visit first" })
+  async getMyBiometricsHistory(@Request() req: any) {
+    const patientId = req.user?.id || req.user?.sub;
+    return {
+      success: true,
+      message: 'Biometrics history retrieved successfully',
+      data: await this.medicalFormService.getBiometricsHistory(patientId),
+    };
+  }
+
+  @Get('biometrics-history/:patientId')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @ApiOperation({ summary: "Weight/BMI history for a patient (clinician access)" })
+  async getBiometricsHistoryForPatient(@Param('patientId') patientId: string) {
+    return {
+      success: true,
+      message: 'Biometrics history retrieved successfully',
+      data: await this.medicalFormService.getBiometricsHistory(patientId),
+    };
+  }
+
   @Get('patient/:patientId')
   @UseGuards(JwtAuthGuard)
   @ApiBearerAuth('JWT-auth')
