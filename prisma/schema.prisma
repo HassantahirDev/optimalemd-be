@@ -1349,6 +1349,11 @@ model Medication {
   membershipPrice Decimal? @db.Decimal(10, 2) // Discounted price for members (optional)
   pricingNotes    String?   // Additional pricing information or notes
   prescription    String?   // Full prescription text
+  // Explicit link to the Stripe price this medicine is billed from. Set once from a
+  // reviewed mapping — automatic name matching resolves only 6 of 28 correctly, so
+  // this column is the authoritative source and is never inferred at runtime.
+  // Null = no Stripe price; the doctor types the amount by hand.
+  stripePriceId   String?
   isActive        Boolean  @default(true)
   
   // Legacy fields for backward compatibility

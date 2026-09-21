@@ -1,4 +1,6 @@
 import { Injectable, NotFoundException, BadRequestException, ConflictException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import Stripe from 'stripe';
 import { PrismaService } from '../prisma/prisma.service';
 import {
   CreateMedicationDto,
@@ -8,7 +10,53 @@ import {
 
 @Injectable()
 export class MedicationsService {
-  constructor(private prisma: PrismaService) {}
+  // Stripe prices change rarely and the modal opens often, so the whole active
+  // price list is fetched once and reused. One list call beats ~150 retrieves.
+  private stripePriceCache: { at: number; prices: Map<string, { amount: number | null; interval: string }> } | null = null;
+  private readonly stripePriceCacheMs = 5 * 60 * 1000;
+
+  constructor(
+    private prisma: PrismaService,
+    private readonly configService: ConfigService,
+  ) {}
+
+  /**
+   * Amount + interval for every active Stripe price, keyed by price id.
+   * Never throws: if Stripe is unreachable the catalogue still loads, medicines
+   * simply show no Stripe price and the doctor types the amount.
+   */
+  private async getStripePriceMap() {
+    const now = Date.now();
+    if (this.stripePriceCache && now - this.stripePriceCache.at < this.stripePriceCacheMs) {
+      return this.stripePriceCache.prices;
+    }
+
+    const key = this.configService.get<string>('STRIPE_SECRET_KEY');
+    const prices = new Map<string, { amount: number | null; interval: string }>();
+    if (!key) {
+      this.stripePriceCache = { at: now, prices };
+      return prices;
+    }
+
+    try {
+      const stripe = new Stripe(key, { apiVersion: '2025-10-29.clover' as any });
+      for await (const price of stripe.prices.list({ limit: 100, active: true })) {
+        prices.set(price.id, {
+          amount: price.unit_amount == null ? null : price.unit_amount / 100,
+          interval: price.recurring
+            ? `${(price.recurring.interval_count || 1) > 1 ? `${price.recurring.interval_count} ` : ''}${price.recurring.interval}`
+            : 'one-time',
+        });
+      }
+      this.stripePriceCache = { at: now, prices };
+    } catch (err) {
+      console.error('[medications] Could not read Stripe prices:', err);
+      // Cache the empty result briefly so a Stripe outage doesn't retry on
+      // every modal open.
+      this.stripePriceCache = { at: now, prices };
+    }
+    return prices;
+  }
 
   /**
    * Create a new medication
@@ -144,14 +192,24 @@ export class MedicationsService {
       orderBy: { name: 'asc' }
     });
 
+    // Attach the live Stripe amount for any medicine with an explicit price link.
+    const stripePrices = await this.getStripePriceMap();
     const grouped: Record<string, MedicationResponseDto[]> = {};
-    
+
     medications.forEach(med => {
       const category = med.therapyCategory || 'Other';
       if (!grouped[category]) {
         grouped[category] = [];
       }
-      grouped[category].push(med);
+      const linked = med.stripePriceId ? stripePrices.get(med.stripePriceId) : undefined;
+      grouped[category].push({
+        ...med,
+        stripePrice: linked?.amount ?? null,
+        stripeInterval: linked?.interval ?? null,
+        // True when the medicine IS linked but the price could not be read —
+        // lets the UI say "unavailable" rather than "no price".
+        stripePriceUnavailable: Boolean(med.stripePriceId && !linked),
+      } as any);
     });
 
     return grouped;

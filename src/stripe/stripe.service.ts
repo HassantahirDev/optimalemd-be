@@ -2436,6 +2436,7 @@ export class StripeService {
       route?: string | null;
       standardPrice: number;
       membershipPrice: number | null;
+      priceOverride: number | null;
     }> = [];
 
     Object.entries(medicationsData).forEach(([category, meds]) => {
@@ -2445,13 +2446,23 @@ export class StripeService {
           if (medication) {
             const standardPrice = Number(medication.standardPrice);
             const membershipPrice = medication.membershipPrice ? Number(medication.membershipPrice) : null;
-            
+            // The doctor can adjust the amount for this prescription (a different
+            // dose than the catalogue default, say). It is stored on the
+            // appointment's medications JSON, never written back to the catalogue,
+            // and it is what the patient is actually charged.
+            const rawOverride = Number(med.priceOverride);
+            const priceOverride =
+              med.priceOverride !== null &&
+              med.priceOverride !== undefined &&
+              med.priceOverride !== '' &&
+              Number.isFinite(rawOverride) &&
+              rawOverride >= 0
+                ? Math.round(rawOverride * 100) / 100
+                : null;
+            const effective = priceOverride ?? (membershipPrice ?? standardPrice);
+
             standardTotal += standardPrice;
-            if (membershipPrice !== null) {
-              memberTotal += membershipPrice;
-            } else {
-              memberTotal += standardPrice;
-            }
+            memberTotal += effective;
 
             tempItems.push({
               medicationId: medication.id,
@@ -2462,6 +2473,7 @@ export class StripeService {
               route: medication.route,
               standardPrice,
               membershipPrice,
+              priceOverride,
             });
           }
         }
@@ -2491,6 +2503,7 @@ export class StripeService {
       membershipPrice: number | null;
       price: number;
       discount: number;
+      priceOverride: number | null;
     }> = [];
 
     let subtotal = 0;
@@ -2501,15 +2514,21 @@ export class StripeService {
       // membership, so there is no non-member rate to fall back to. Where a
       // medication has no membershipPrice recorded yet, its standardPrice still
       // applies (left as-is pending the catalogue pricing rework).
-      const price = tempItem.membershipPrice !== null
-        ? tempItem.membershipPrice
-        : tempItem.standardPrice;
+      // A doctor-set amount for this prescription overrides the catalogue price.
+      const price = tempItem.priceOverride !== null
+        ? tempItem.priceOverride
+        : tempItem.membershipPrice !== null
+          ? tempItem.membershipPrice
+          : tempItem.standardPrice;
 
       // Kept so the UI can still show what the old non-member rate would have
-      // been; it is never added to or subtracted from the amount charged.
-      const discount = tempItem.membershipPrice !== null
-        ? tempItem.standardPrice - tempItem.membershipPrice
-        : 0;
+      // been; it is never added to or subtracted from the amount charged. An
+      // overridden line has no meaningful comparison, so it shows none.
+      const discount = tempItem.priceOverride !== null
+        ? 0
+        : tempItem.membershipPrice !== null
+          ? tempItem.standardPrice - tempItem.membershipPrice
+          : 0;
 
       items.push({
         medicationId: tempItem.medicationId,
@@ -2520,6 +2539,7 @@ export class StripeService {
         route: tempItem.route,
         standardPrice: tempItem.standardPrice,
         membershipPrice: tempItem.membershipPrice,
+        priceOverride: tempItem.priceOverride,
               price,
               discount,
             });
