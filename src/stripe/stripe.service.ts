@@ -2388,7 +2388,11 @@ export class StripeService {
     // Get medications from appointment
     const medicationsData = (appointment as any).medications as Record<string, any[]> | null;
     
-    if (!medicationsData || Object.keys(medicationsData).length === 0) {
+    const prescribedCategories = medicationsData
+      ? Object.entries(medicationsData).filter(([, meds]) => Array.isArray(meds) && meds.length > 0)
+      : [];
+
+    if (!medicationsData || prescribedCategories.length === 0) {
       return {
         items: [],
         subtotal: 0,
@@ -2401,7 +2405,11 @@ export class StripeService {
 
     // Fetch medication details from database
     const medicationIds: string[] = [];
-    Object.values(medicationsData).forEach((meds: any[]) => {
+    // The medications JSON can carry a "__noMedications" marker alongside real
+    // therapy categories — it is a boolean, not an array, so every consumer here
+    // has to skip non-array values or it throws on .forEach.
+    Object.values(medicationsData).forEach((meds: any) => {
+      if (!Array.isArray(meds)) return;
       meds.forEach((med: any) => {
         if (typeof med === 'object' && med.id) {
           medicationIds.push(med.id);
@@ -2438,7 +2446,8 @@ export class StripeService {
       membershipPrice: number | null;
     }> = [];
 
-    Object.entries(medicationsData).forEach(([category, meds]) => {
+    Object.entries(medicationsData).forEach(([category, meds]: [string, any]) => {
+      if (!Array.isArray(meds)) return;
       meds.forEach((med: any) => {
         if (typeof med === 'object' && med.id) {
           const medication = medications.find(m => m.id === med.id);

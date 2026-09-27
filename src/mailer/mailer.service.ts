@@ -1633,6 +1633,9 @@ export class MailerService implements OnModuleInit {
     patientEmail: string,
     patientName: string,
     carePlanLink?: string,
+    /** False when the visit was closed with no medication — the email must not
+     *  then invite payment for a treatment plan that doesn't exist. */
+    hasMedications = true,
   ): Promise<void> {
     const html = `
       <!DOCTYPE html>
@@ -1659,7 +1662,9 @@ export class MailerService implements OnModuleInit {
           <div class="content">
             <h2 class="title">Your Care Plan Is Ready</h2>
             <p>Dear ${patientName},</p>
-            <p>Your care plan is ready to view. You can also authorize payment for your current treatment plan on the portal.</p>
+            <p>${hasMedications
+              ? 'Your care plan is ready to view. You can also authorize payment for your current treatment plan on the portal.'
+              : 'Your care plan is ready to view.'}</p>
 
             ${carePlanLink ? `
             <div style="text-align: center; margin: 30px 0;">
@@ -1667,9 +1672,10 @@ export class MailerService implements OnModuleInit {
               <p style="margin: 12px 0 0 0; font-size: 12px; color: #6b7280;">This secure link takes you straight to your care plan — no need to log in again.</p>
             </div>` : ''}
 
+            ${hasMedications ? `
             <div class="info-box">
               <p style="margin: 0;">Once payment is made, your order will be processed and shipped within 5 business days.</p>
-            </div>
+            </div>` : ''}
 
             <p style="margin-top: 30px;">Best regards,<br><strong>The FormaMD Team</strong></p>
           </div>
