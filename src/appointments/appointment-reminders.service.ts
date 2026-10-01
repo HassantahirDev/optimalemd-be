@@ -1,11 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { ConfigService } from '@nestjs/config';
-import { JwtService } from '@nestjs/jwt';
 import { AppointmentStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { MailerService } from '../mailer/mailer.service';
-import { buildAutoLoginLink } from '../common/utils/auto-login-link.util';
 
 type ReminderKind = '24h' | '30m';
 
@@ -19,7 +17,6 @@ export class AppointmentRemindersService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly mailerService: MailerService,
-    private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
   ) {}
 
@@ -110,6 +107,7 @@ export class AppointmentRemindersService {
         createdAt: true,
         appointmentDate: true,
         appointmentTime: true,
+        googleMeetLink: true,
         patient: {
           select: { id: true, firstName: true, lastName: true, primaryEmail: true, email: true },
         },
@@ -155,14 +153,8 @@ export class AppointmentRemindersService {
         ? `Dr. ${appt.doctor.firstName} ${appt.doctor.lastName}`
         : 'your provider';
 
-      // Straight to this appointment's own page, signed in.
-      const appointmentLink = buildAutoLoginLink(
-        this.jwtService,
-        this.configService,
-        appt.patient,
-        `/dashboard/care-plan-details/${appt.id}`,
-      );
-
+      // The video link for THIS appointment. When it is missing the email simply
+      // omits the button rather than linking somewhere that isn't the meeting.
       await this.mailerService.sendAppointmentReminderEmail(
         to,
         patientName,
@@ -170,7 +162,7 @@ export class AppointmentRemindersService {
         appt.appointmentDate.toISOString().split('T')[0],
         appt.appointmentTime,
         kind,
-        appointmentLink,
+        appt.googleMeetLink || undefined,
       );
       this.logger.log(`Sent ${kind} reminder for appointment ${appt.id}`);
     } catch (err) {

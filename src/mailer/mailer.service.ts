@@ -1716,7 +1716,7 @@ export class MailerService implements OnModuleInit {
     appointmentDate: string,
     appointmentTime: string,
     kind: '24h' | '30m',
-    appointmentLink?: string,
+    googleMeetLink?: string,
     timezone?: string,
   ): Promise<void> {
     const targetTimezone = timezone || 'America/Chicago';
@@ -1787,10 +1787,10 @@ export class MailerService implements OnModuleInit {
               <div class="info-item"><span class="info-label">Time:</span> ${formattedTimeWithTz}</div>
             </div>
 
-            ${appointmentLink ? `
+            ${googleMeetLink ? `
             <div style="text-align: center; margin: 30px 0;">
-              <a href="${appointmentLink}" target="_blank" style="display: inline-block; background-color: #dc2626; color: #ffffff; text-decoration: none; font-weight: bold; font-size: 16px; padding: 14px 32px; border-radius: 8px;">View Your Appointment</a>
-              <p style="margin: 12px 0 0 0; font-size: 12px; color: #6b7280;">This secure link takes you straight to your appointment — no need to log in again.</p>
+              <a href="${googleMeetLink}" target="_blank" style="display: inline-block; background-color: #dc2626; color: #ffffff; text-decoration: none; font-weight: bold; font-size: 16px; padding: 14px 32px; border-radius: 8px;">Join Now</a>
+              <p style="margin: 12px 0 0 0; font-size: 12px; color: #6b7280;">Or copy this link: <span style="word-break: break-all;">${googleMeetLink}</span></p>
             </div>` : ''}
 
             <p style="margin-top: 30px;">Best regards,<br><strong>The FormaMD Team</strong></p>
