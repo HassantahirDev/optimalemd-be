@@ -816,7 +816,11 @@ export class NewSignupService {
         status: 'SUCCEEDED',
         paidAt: welcomeOrder.paidAt ?? new Date(),
         receiptUrl,
-        note: `Signup order ${welcomeOrder.orderNumber}`,
+        // Naming the intake type explains the amount without anyone having to
+        // look up the order to see why it was 150 rather than 65.
+        note: (welcomeOrder as any).isMedicalMarijuana
+          ? `Signup order ${welcomeOrder.orderNumber} — medical marijuana intake`
+          : `Signup order ${welcomeOrder.orderNumber}`,
       });
 
       // Actually spend the reserved partner credit now that payment truly succeeded —
