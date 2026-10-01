@@ -11,6 +11,10 @@ datasource db {
 } 
 
 model User {
+  // Texas medical-marijuana intake: set when the patient answers yes to the
+  // prompt on the state step at signup. Carries a $150 welcome fee instead of
+  // $65, and exempts them from the lab-results requirement for booking.
+  isMedicalMarijuana Boolean @default(false)
   id        String   @id @default(uuid())
   patientId String?  @unique // Sequential patient ID (OPT-0001, OPT-0002, etc.)
   
@@ -1256,6 +1260,11 @@ model WelcomeOrder {
   orderNumber       String   @unique // Generated order number
   status            WelcomeOrderStatus @default(PENDING)
   
+  // Set when this order is a Texas medical-marijuana intake, which is why the
+  // amount is 150 rather than 65. Recorded on the order so the charge can be
+  // explained later without inferring it from the user row.
+  isMedicalMarijuana Boolean @default(false)
+
   // Order details
   totalAmount       Decimal  @db.Decimal(10, 2)
   discountAmount    Decimal  @db.Decimal(10, 2) @default(0)

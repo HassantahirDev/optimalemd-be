@@ -167,31 +167,44 @@ export class NewSignupService {
     };
   }
 
+  /** Welcome fee, decided server-side. The client may ask for the intake type; it may not name its own price. */
+  static readonly WELCOME_FEE_STANDARD = 65;
+  static readonly WELCOME_FEE_MEDICAL_MARIJUANA = 150;
+
   // Create a new welcome order
   async createWelcomeOrder(createDto: CreateWelcomeOrderDto) {
     const orderNumber = this.generateOrderNumber();
+
+    // The price is derived from the intake type here, never taken from the
+    // request. The client used to send finalAmount and it was trusted verbatim,
+    // so anything could be posted as the welcome fee.
+    const isMedicalMarijuana = Boolean((createDto as any).isMedicalMarijuana);
+    const expectedAmount = isMedicalMarijuana
+      ? NewSignupService.WELCOME_FEE_MEDICAL_MARIJUANA
+      : NewSignupService.WELCOME_FEE_STANDARD;
 
     // Partner platform credit, applied server-side (never trust a client-sent discount
     // for this) — 1 cent of credit = 1 cent off. Reserved here, not yet spent from the
     // partner's balance; that happens in updatePaymentStatus once payment truly succeeds,
     // so a never-completed signup never burns real credit.
     const credit = await this.partnersService.findAvailableCreditByEmail(createDto.email);
-    const clientFinalCents = Math.round(createDto.finalAmount * 100);
+    const clientFinalCents = Math.round(expectedAmount * 100);
     const creditAppliedCents = credit ? Math.min(credit.availableCents, clientFinalCents) : 0;
     const finalAmount = creditAppliedCents > 0
-      ? Math.round((createDto.finalAmount - creditAppliedCents / 100) * 100) / 100
-      : createDto.finalAmount;
+      ? Math.round((expectedAmount - creditAppliedCents / 100) * 100) / 100
+      : expectedAmount;
     const discountAmount = creditAppliedCents > 0
-      ? Math.round((createDto.discountAmount + creditAppliedCents / 100) * 100) / 100
-      : createDto.discountAmount;
+      ? Math.round(creditAppliedCents / 100 * 100) / 100
+      : 0;
 
     const welcomeOrder = await this.prisma.welcomeOrder.create({
       data: {
         email: createDto.email,
         orderNumber,
-        totalAmount: createDto.totalAmount,
+        totalAmount: expectedAmount,
         discountAmount,
         finalAmount,
+        isMedicalMarijuana,
         status: WelcomeOrderStatus.PENDING,
         currentStep: 0,
         currentSubStep: 0,
@@ -612,6 +625,9 @@ export class NewSignupService {
         isEmailVerified: false,
         hasCompletedIntakeForm: true,
         intakeFormCompletedAt: new Date(),
+        // Carried from the welcome order, which is the record that was actually
+        // priced and paid — never re-read from the client at this point.
+        isMedicalMarijuana: Boolean((welcomeOrder as any)?.isMedicalMarijuana),
       };
       
       // Handle dateOfBirth
