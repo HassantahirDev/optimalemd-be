@@ -2699,6 +2699,11 @@ export class StripeService {
       appointmentId,
     );
     if (existingActiveSub) {
+      // findActiveMedicationSubscriptionFromStripe treats past_due and unpaid as
+      // "live" too — those block a second subscription but must NOT read as paid,
+      // so only a genuinely billing subscription stamps SUCCEEDED.
+      const isBilling = ['active', 'trialing'].includes(existingActiveSub.status);
+
       await this.prisma.medicationPayment.upsert({
         where: { appointmentId },
         create: {
@@ -2707,13 +2712,18 @@ export class StripeService {
           stripeCustomerId: customerId,
           amount: invoice.total,
           currency: invoice.currency,
-          status: 'SUCCEEDED',
+          status: isBilling ? 'SUCCEEDED' : 'PENDING',
           subscriptionStatus: existingActiveSub.status as any,
         },
         update: {
           stripeSubscriptionId: existingActiveSub.id,
           stripeCustomerId: customerId,
           subscriptionStatus: existingActiveSub.status as any,
+          // Without this the row keeps whatever status it had from an earlier
+          // abandoned attempt (usually PENDING), and getMedicationPaymentStatus
+          // returns paid:false — so the portal kept offering "Pay invoice" for a
+          // subscription Stripe was already billing.
+          ...(isBilling ? { status: 'SUCCEEDED' as const } : {}),
         },
       });
       throw new BadRequestException(
@@ -3344,15 +3354,28 @@ export class StripeService {
         // Use calculated period end or fallback to currentPeriodEnd
         const finalPeriodEnd = calculatedPeriodEnd || currentPeriodEnd;
 
-        // Note: These fields will be available after Prisma client regeneration
+        // Stripe is the source of truth. If it is actively billing this
+        // subscription, the local row must say SUCCEEDED — otherwise `paid`
+        // below stays false and the portal keeps offering "Pay invoice" for a
+        // subscription the patient is already being charged for. Self-heals rows
+        // left PENDING by an abandoned first attempt.
+        const stripeIsBilling = subscription.status === 'active' || subscription.status === 'trialing';
+        const reconciledStatus =
+          stripeIsBilling && payment.status !== 'SUCCEEDED' ? { status: 'SUCCEEDED' as const } : {};
+
         await this.prisma.medicationPayment.update({
           where: { appointmentId },
           data: {
             subscriptionStatus: dbSubscriptionStatus as any,
             subscriptionEndDate: finalPeriodEnd as any,
             subscriptionCanceledAt: (cancelAtPeriodEnd ? ((payment as any).subscriptionCanceledAt || new Date()) : null) as any,
+            ...reconciledStatus,
           },
         });
+        if (Object.keys(reconciledStatus).length) {
+          payment.status = 'SUCCEEDED' as any;
+          console.log(`✅ Reconciled medication payment ${appointmentId} to SUCCEEDED from live Stripe subscription`);
+        }
       } catch (error: any) {
         console.error('Error retrieving subscription status:', error);
         // If subscription doesn't exist in Stripe, clean up stale data
