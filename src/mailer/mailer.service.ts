@@ -1633,6 +1633,9 @@ export class MailerService implements OnModuleInit {
     patientEmail: string,
     patientName: string,
     carePlanLink?: string,
+    /** False when the visit was closed with no medication — the email must not
+     *  then invite payment for a treatment plan that doesn't exist. */
+    hasMedications = true,
   ): Promise<void> {
     const html = `
       <!DOCTYPE html>
@@ -1659,7 +1662,9 @@ export class MailerService implements OnModuleInit {
           <div class="content">
             <h2 class="title">Your Care Plan Is Ready</h2>
             <p>Dear ${patientName},</p>
-            <p>Your care plan is ready to view. You can also authorize payment for your current treatment plan on the portal.</p>
+            <p>${hasMedications
+              ? 'Your care plan is ready to view. You can also authorize payment for your current treatment plan on the portal.'
+              : 'Your care plan is ready to view.'}</p>
 
             ${carePlanLink ? `
             <div style="text-align: center; margin: 30px 0;">
@@ -1667,9 +1672,10 @@ export class MailerService implements OnModuleInit {
               <p style="margin: 12px 0 0 0; font-size: 12px; color: #6b7280;">This secure link takes you straight to your care plan — no need to log in again.</p>
             </div>` : ''}
 
+            ${hasMedications ? `
             <div class="info-box">
               <p style="margin: 0;">Once payment is made, your order will be processed and shipped within 5 business days.</p>
-            </div>
+            </div>` : ''}
 
             <p style="margin-top: 30px;">Best regards,<br><strong>The FormaMD Team</strong></p>
           </div>
@@ -1693,6 +1699,122 @@ export class MailerService implements OnModuleInit {
       console.log(`Care plan ready email sent successfully to ${patientEmail}`);
     } catch (error) {
       console.error('Failed to send care plan ready email:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Appointment reminder, 24 hours and 30 minutes before the visit.
+   * Formats the time exactly like the other appointment emails: build the UTC
+   * instant from the date + "HH:MM", then render it in the clinic timezone with
+   * its abbreviation.
+   */
+  async sendAppointmentReminderEmail(
+    patientEmail: string,
+    patientName: string,
+    doctorName: string,
+    appointmentDate: string,
+    appointmentTime: string,
+    kind: '24h' | '30m',
+    appointmentLink?: string,
+    timezone?: string,
+  ): Promise<void> {
+    const targetTimezone = timezone || 'America/Chicago';
+    const [year, month, day] = appointmentDate.split('-').map(Number);
+    const [hours, minutes] = appointmentTime.split(':').map(Number);
+    const utcDate = new Date(Date.UTC(year, month - 1, day, hours, minutes, 0));
+
+    const formattedDate = new Intl.DateTimeFormat('en-US', {
+      timeZone: targetTimezone,
+      weekday: 'long',
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+    }).format(utcDate);
+
+    const formattedTime = new Intl.DateTimeFormat('en-US', {
+      timeZone: targetTimezone,
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: true,
+    }).format(utcDate);
+    const timeMatch = formattedTime.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+    const displayTime = timeMatch ? `${timeMatch[1]}:${timeMatch[2]} ${timeMatch[3]}` : formattedTime;
+    const timezoneAbbr = this.getTimezoneAbbreviation(targetTimezone, utcDate);
+    const formattedTimeWithTz = `${displayTime} ${timezoneAbbr ? `(${timezoneAbbr})` : '(UTC)'}`;
+
+    const isSoon = kind === '30m';
+    const heading = isSoon ? 'Your Appointment Starts Soon' : 'Your Appointment Is Tomorrow';
+    const lead = isSoon
+      ? 'This is a reminder that your appointment begins in about 30 minutes.'
+      : 'This is a reminder that your appointment is coming up in 24 hours.';
+    const subject = isSoon
+      ? 'Starting soon: your appointment | FormaMD'
+      : 'Reminder: your appointment is tomorrow | FormaMD';
+
+    const html = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+          body { font-family: Arial, sans-serif; line-height: 1.6; margin: 0; padding: 20px; background-color: #f4f4f4; color: #333333; }
+          .container { max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); overflow: hidden; }
+          .header { background-color: #000000; padding: 25px; text-align: center; }
+          .logo { color: #ffffff; font-size: 24px; font-weight: bold; text-transform: uppercase; margin: 0; }
+          .content { padding: 30px; text-align: center; }
+          .title { color: #dc2626; font-size: 24px; font-weight: bold; margin-bottom: 20px; }
+          .info-box { background-color: #f9f9f9; border-left: 4px solid #dc2626; padding: 20px; margin: 20px 0; text-align: left; }
+          .info-item { margin: 10px 0; }
+          .info-label { font-weight: bold; color: #333333; }
+          .footer { background-color: #000000; color: #ffffff; padding: 20px; text-align: center; font-size: 12px; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">
+            <h1 class="logo">FormaMD</h1>
+          </div>
+          <div class="content">
+            <h2 class="title">${heading}</h2>
+            <p>Dear ${patientName},</p>
+            <p>${lead}</p>
+
+            <div class="info-box">
+              <div class="info-item"><span class="info-label">Provider:</span> ${doctorName}</div>
+              <div class="info-item"><span class="info-label">Date:</span> ${formattedDate}</div>
+              <div class="info-item"><span class="info-label">Time:</span> ${formattedTimeWithTz}</div>
+            </div>
+
+            ${appointmentLink ? `
+            <div style="text-align: center; margin: 30px 0;">
+              <a href="${appointmentLink}" target="_blank" style="display: inline-block; background-color: #dc2626; color: #ffffff; text-decoration: none; font-weight: bold; font-size: 16px; padding: 14px 32px; border-radius: 8px;">View Your Appointment</a>
+              <p style="margin: 12px 0 0 0; font-size: 12px; color: #6b7280;">This secure link takes you straight to your appointment — no need to log in again.</p>
+            </div>` : ''}
+
+            <p style="margin-top: 30px;">Best regards,<br><strong>The FormaMD Team</strong></p>
+          </div>
+          <div class="footer">
+            <p>This is an automated email, please do not reply.</p>
+            <p>&copy; ${new Date().getFullYear()} FormaMD</p>
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+
+    try {
+      const fromEmail = this.configService.get<string>('APPOINTMENT_SMTP_FROM') || this.configService.get<string>('SMTP_FROM');
+      await this.appointmentTransporter.sendMail({
+        from: `"FormaMD" <${fromEmail}>`,
+        to: patientEmail,
+        subject,
+        html,
+      });
+      console.log(`${kind} appointment reminder sent to ${patientEmail}`);
+    } catch (error) {
+      console.error(`Failed to send ${kind} appointment reminder:`, error);
       throw error;
     }
   }

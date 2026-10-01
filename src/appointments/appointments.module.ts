@@ -4,6 +4,7 @@ import { JwtModule } from '@nestjs/jwt';
 import { AppointmentsController } from './appointments.controller';
 import { AppointmentsService } from './appointments.service';
 import { AppointmentsCleanupService } from './appointments-cleanup.service';
+import { AppointmentRemindersService } from './appointment-reminders.service';
 import { BookingsService } from './bookings.service';
 import { PrismaModule } from '../prisma/prisma.module';
 import { MailerModule } from '../mailer/mailer.module';
@@ -26,7 +27,7 @@ import { GoogleCalendarModule } from '../google-calendar/google-calendar.module'
     }),
   ],
   controllers: [AppointmentsController],
-  providers: [AppointmentsService, AppointmentsCleanupService, BookingsService],
+  providers: [AppointmentsService, AppointmentsCleanupService, AppointmentRemindersService, BookingsService],
   exports: [AppointmentsService, BookingsService],
 })
 export class AppointmentsModule {}

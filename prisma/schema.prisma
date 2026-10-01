@@ -843,6 +843,11 @@ model Appointment {
   slotId            String?  // Made optional - slots are tied to doctor schedules
   appointmentDate   DateTime @db.Date
   appointmentTime   String   // Format: "HH:MM"
+  // Set the moment a reminder is claimed, never cleared. Doubles as the
+  // cross-instance lock: two servers running the cron both try to claim, and the
+  // conditional update means only one wins.
+  reminder24hSentAt DateTime?
+  reminder30mSentAt DateTime?
   selectedSlotTime  String?  // Store the slot time user selected (for later doctor assignment)
   duration          Int      // Duration in minutes
   

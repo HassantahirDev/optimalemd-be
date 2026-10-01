@@ -763,10 +763,10 @@ export class AppointmentsService {
 
     if (
       (updateAppointmentDto as any).status === AppointmentStatus.COMPLETED &&
-      !this.hasPrescribedMedications((appointment as any).medications)
+      !this.canCloseOutVisit((appointment as any).medications)
     ) {
       throw new BadRequestException(
-        'Prescribe at least one medication for this appointment before marking it completed.',
+        'Prescribe at least one medication for this appointment, or mark it as no medication required, before marking it completed.',
       );
     }
 
@@ -833,10 +833,10 @@ export class AppointmentsService {
 
     if (
       visitStatus === 'COMPLETED' &&
-      !this.hasPrescribedMedications((appointment as any).medications)
+      !this.canCloseOutVisit((appointment as any).medications)
     ) {
       throw new BadRequestException(
-        'Prescribe at least one medication for this appointment before marking the visit completed.',
+        'Prescribe at least one medication for this appointment, or mark it as no medication required, before marking the visit completed.',
       );
     }
 
@@ -1050,6 +1050,28 @@ export class AppointmentsService {
    * Sign notes for an appointment (sets notesSignedAt timestamp)
    */
   /**
+   * Written into the appointment's `medications` JSON when a doctor records that
+   * this visit needs no medication. It distinguishes "nothing prescribed yet"
+   * from "nothing prescribed, deliberately" — the two are otherwise identical in
+   * the data, and only the second should be allowed to close out a visit.
+   */
+  static readonly NO_MEDICATION_KEY = '__noMedications';
+
+  private isExplicitlyNoMedication(medications: any): boolean {
+    return Boolean(
+      medications &&
+        typeof medications === 'object' &&
+        !Array.isArray(medications) &&
+        medications[AppointmentsService.NO_MEDICATION_KEY] === true,
+    );
+  }
+
+  /** The visit may be signed/completed once either is true. */
+  private canCloseOutVisit(medications: any): boolean {
+    return this.hasPrescribedMedications(medications) || this.isExplicitlyNoMedication(medications);
+  }
+
+  /**
    * True only when at least one medication is actually prescribed on the
    * appointment. `medications` is a JSON object keyed by medical service, whose
    * values are either string[] (legacy) or MedicationObject[] (current) — so an
@@ -1061,7 +1083,8 @@ export class AppointmentsService {
     if (!medications || typeof medications !== 'object' || Array.isArray(medications)) {
       return false;
     }
-    return Object.values(medications).some((entries: any) => {
+    return Object.entries(medications).some(([key, entries]: [string, any]) => {
+      if (key === AppointmentsService.NO_MEDICATION_KEY) return false;
       if (!Array.isArray(entries)) return false;
       return entries.some((entry: any) => {
         if (typeof entry === 'string') return entry.trim().length > 0;
@@ -1099,7 +1122,12 @@ export class AppointmentsService {
         appt.patient,
         `/dashboard/care-plan-details/${appointmentId}`,
       );
-      await this.mailerService.sendCarePlanReadyEmail(to, patientName, carePlanLink);
+      await this.mailerService.sendCarePlanReadyEmail(
+        to,
+        patientName,
+        carePlanLink,
+        this.hasPrescribedMedications((appt as any).medications),
+      );
     } catch (err) {
       console.error('[care plan ready] email failed:', err);
     }
@@ -1123,7 +1151,7 @@ export class AppointmentsService {
       throw new BadRequestException('Notes have already been signed for this appointment.');
     }
 
-    if (!this.hasPrescribedMedications((appointment as any).medications)) {
+    if (!this.canCloseOutVisit((appointment as any).medications)) {
       throw new BadRequestException(
         'Prescribe at least one medication for this appointment before signing the notes.',
       );
