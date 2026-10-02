@@ -946,6 +946,18 @@ export class NewSignupService {
       // Generate patient ID
       const patientId = await generateNextPatientId(this.prisma);
 
+      // This is the path that actually creates the account during signup (the
+      // password step), and it is handed only userData — it never sees the
+      // welcome order. The medical-marijuana answer was given before the account
+      // existed, so it lives on the order; look it up by the same email that
+      // priced the order, or the flag is silently lost and the patient is still
+      // blocked by the lab requirement they were told they were exempt from.
+      const paidOrder = await this.prisma.welcomeOrder.findFirst({
+        where: { email: normalizedEmail },
+        orderBy: { createdAt: 'desc' },
+        select: { isMedicalMarijuana: true },
+      });
+
       // Create user with only the provided fields
       const user = await this.prisma.user.create({
         data: {
@@ -956,6 +968,7 @@ export class NewSignupService {
           gender: userData.gender,
           password: hashedPassword,
           patientId, // Assign sequential patient ID
+          isMedicalMarijuana: Boolean(paidOrder?.isMedicalMarijuana),
           isActive: userData.isActive ?? true,
           isEmailVerified: userData.isEmailVerified ?? false,
           hasCompletedMedicalForm: userData.hasCompletedMedicalForm ?? false,
