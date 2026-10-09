@@ -1,5 +1,7 @@
 import { Injectable, BadRequestException, NotFoundException, ForbiddenException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { Cron } from '@nestjs/schedule';
+import { Prisma } from '@prisma/client';
 import Stripe from 'stripe';
 import { PrismaService } from '../prisma/prisma.service';
 import { AppointmentsService } from '../appointments/appointments.service';
@@ -13,6 +15,11 @@ import { CreatePaymentIntentDto, ConfirmPaymentDto } from './dto';
 @Injectable()
 export class StripeService {
   private stripe: Stripe;
+
+  /** Appointments whose post-confirmation work is running on this instance. */
+  private readonly confirmationsInFlight = new Set<string>();
+  private readonly RECOVERY_MIN_AGE_MS = 15 * 60_000;
+  private readonly RECOVERY_MAX_AGE_MS = 6 * 60 * 60_000;
 
   constructor(
     private configService: ConfigService,
@@ -248,10 +255,18 @@ export class StripeService {
   }
 
   /**
-   * Confirm payment and update appointment status
+   * Confirm payment and update appointment status.
+   *
+   * Only the writes that make the booking real run before we respond: one
+   * Stripe call and one transaction. The ledger row, referral credits, Meet
+   * link and emails run afterwards in runPostConfirmation — the frontend never
+   * reads any of them from this response. If the process dies before that work
+   * finishes, recoverUnfinishedConfirmations picks it up.
    */
   async confirmPayment(confirmPaymentDto: ConfirmPaymentDto) {
     const { paymentIntentId, appointmentId, isFreeAppointment, patientTimezone } = confirmPaymentDto;
+
+    let receiptUrl: string | null = null;
 
     // Handle free appointments
     if (isFreeAppointment) {
@@ -265,72 +280,193 @@ export class StripeService {
         throw new BadRequestException('Payment intent ID is required for paid appointments');
       }
 
-    // Verify payment intent
-    const paymentIntent = await this.stripe.paymentIntents.retrieve(paymentIntentId);
-    
-    if (paymentIntent.status !== 'succeeded') {
-      throw new BadRequestException('Payment not completed');
-    }
-
-    // Update payment status
-    const updatedPayment = await this.prisma.payment.update({
-      where: { paymentIntent: paymentIntentId },
-      data: {
-        status: 'SUCCEEDED',
-        paidAt: new Date(),
-      },
-      select: {
-        amount: true,
-        appointmentId: true,
-        partnerCreditPartnerId: true,
-        partnerCreditAppliedCents: true,
-        partnerCreditDeducted: true,
-      },
-    });
-
-    // Actually spend the reserved partner credit now that payment truly succeeded —
-    // never at payment-intent-creation time (see createPaymentIntent). Guarded by
-    // partnerCreditDeducted so a retried confirm-payment call never double-spends.
-    if (
-      updatedPayment.partnerCreditPartnerId &&
-      (updatedPayment.partnerCreditAppliedCents ?? 0) > 0 &&
-      !updatedPayment.partnerCreditDeducted
-    ) {
-      await this.partnersService.spendCredit(updatedPayment.partnerCreditPartnerId, updatedPayment.partnerCreditAppliedCents!);
-      await this.prisma.payment.update({
-        where: { paymentIntent: paymentIntentId },
-        data: { partnerCreditDeducted: true },
+      // Verify payment intent. Expanding the charge here gives us the receipt
+      // link too, so the intent is fetched once instead of twice.
+      const paymentIntent = await this.stripe.paymentIntents.retrieve(paymentIntentId, {
+        expand: ['latest_charge'],
       });
+
+      if (paymentIntent.status !== 'succeeded') {
+        throw new BadRequestException('Payment not completed');
+      }
+
+      const charge = paymentIntent.latest_charge;
+      if (charge && typeof charge !== 'string') {
+        receiptUrl = (charge as Stripe.Charge).receipt_url ?? null;
+      }
     }
 
-    // --- Dual-write consult payment into the unified ledger (additive; Part A) ---
-    // Existing Payment logic above is untouched.
-    const paidAppt = await this.prisma.appointment.findUnique({
-      where: { id: updatedPayment.appointmentId },
-      select: { patientId: true },
+    const existing = await this.prisma.appointment.findUnique({
+      where: { id: appointmentId },
+      select: { id: true },
     });
-    // No line items for a flat consult fee — the receipt link is what "expand" shows
-    // for this row instead. Best-effort; never blocks the write if Stripe can't be
-    // reached for it right now.
-    const receiptUrl = await this.getReceiptUrl(paymentIntentId);
-    await this.paymentLedger.upsertFromStripe({
-      stripePaymentIntentId: paymentIntentId,
-      userId: paidAppt?.patientId ?? null,
-      appointmentId: updatedPayment.appointmentId,
-      channel: 'PLATFORM',
-      category: 'APPOINTMENT',
-      billing: 'ONE_TIME',
-      amount: Number(updatedPayment.amount),
-      currency: 'usd',
-      status: 'SUCCEEDED',
-      paidAt: new Date(),
-      receiptUrl,
-      note: 'Consultation / appointment payment',
-    });
+
+    if (!existing) {
+      throw new NotFoundException('Appointment not found');
     }
 
-    // Generate Google Meet link for the appointment
-    const appointment = await this.prisma.appointment.findUnique({
+    // Payment, partner credit, appointment and slot commit together, so the
+    // appointment can never be confirmed while its slot is still bookable.
+    const paidPayment = await this.prisma.$transaction(
+      async (tx) => {
+        let payment: { amount: Prisma.Decimal; appointmentId: string } | null = null;
+
+        if (!isFreeAppointment) {
+          // Update payment status
+          const updatedPayment = await tx.payment.update({
+            where: { paymentIntent: paymentIntentId },
+            data: {
+              status: 'SUCCEEDED',
+              paidAt: new Date(),
+            },
+            select: {
+              amount: true,
+              appointmentId: true,
+              partnerCreditPartnerId: true,
+              partnerCreditAppliedCents: true,
+              partnerCreditDeducted: true,
+            },
+          });
+
+          // Actually spend the reserved partner credit now that payment truly succeeded —
+          // never at payment-intent-creation time (see createPaymentIntent). Guarded by
+          // partnerCreditDeducted so a retried confirm-payment call never double-spends.
+          if (
+            updatedPayment.partnerCreditPartnerId &&
+            (updatedPayment.partnerCreditAppliedCents ?? 0) > 0 &&
+            !updatedPayment.partnerCreditDeducted
+          ) {
+            await this.partnersService.spendCredit(
+              updatedPayment.partnerCreditPartnerId,
+              updatedPayment.partnerCreditAppliedCents!,
+              tx,
+            );
+            await tx.payment.update({
+              where: { paymentIntent: paymentIntentId },
+              data: { partnerCreditDeducted: true },
+            });
+          }
+
+          payment = { amount: updatedPayment.amount, appointmentId: updatedPayment.appointmentId };
+        }
+
+        // Update appointment status to confirmed and mark as paid. The Meet link
+        // is added by runPostConfirmation.
+        const confirmed = await tx.appointment.update({
+          where: { id: appointmentId },
+          data: {
+            status: 'CONFIRMED',
+            isPaid: true,
+            confirmedAt: new Date(),
+          },
+          select: { slotId: true },
+        });
+
+        // Update slot availability (if slotId exists)
+        if (confirmed.slotId) {
+          await tx.slot.update({
+            where: { id: confirmed.slotId },
+            data: {
+              isAvailable: false,
+            },
+          });
+        }
+
+        return payment;
+      },
+      // The pool is small on the App Service plan; wait for a connection rather
+      // than failing a patient's confirmation under load.
+      { maxWait: 10_000, timeout: 15_000 },
+    );
+
+    this.confirmationsInFlight.add(appointmentId);
+    void this.runPostConfirmation(
+      appointmentId,
+      patientTimezone,
+      paidPayment && paymentIntentId
+        ? { paymentIntentId, appointmentId: paidPayment.appointmentId, amount: Number(paidPayment.amount), receiptUrl }
+        : null,
+    )
+      .catch((error) => console.error(`Post-confirmation work failed for appointment ${appointmentId}:`, error))
+      .finally(() => this.confirmationsInFlight.delete(appointmentId));
+
+    return {
+      success: true,
+      message: 'Payment confirmed and appointment booked successfully',
+    };
+  }
+
+  /**
+   * Everything confirmPayment used to do inline after confirming. Bookkeeping
+   * and the Meet link + emails don't depend on each other, so they run side by
+   * side; within each, the original order is kept.
+   */
+  private async runPostConfirmation(
+    appointmentId: string,
+    patientTimezone: string | undefined,
+    ledger: { paymentIntentId: string; appointmentId: string; amount: number; receiptUrl: string | null } | null,
+  ): Promise<void> {
+    const appointment = await this.loadAppointmentForConfirmation(appointmentId);
+    if (!appointment) return;
+
+    const bookkeeping = async () => {
+      // --- Dual-write consult payment into the unified ledger (additive; Part A) ---
+      // No line items for a flat consult fee — the receipt link is what "expand" shows
+      // for this row instead.
+      if (ledger) {
+        await this.paymentLedger.upsertFromStripe({
+          stripePaymentIntentId: ledger.paymentIntentId,
+          userId: appointment.patientId ?? null,
+          appointmentId: ledger.appointmentId,
+          channel: 'PLATFORM',
+          category: 'APPOINTMENT',
+          billing: 'ONE_TIME',
+          amount: ledger.amount,
+          currency: 'usd',
+          status: 'SUCCEEDED',
+          paidAt: new Date(),
+          receiptUrl: ledger.receiptUrl,
+          note: 'Consultation / appointment payment',
+        });
+      }
+
+      // Qualify referral if this is the patient's first paid appointment
+      try {
+        const confirmedCount = await this.prisma.appointment.count({
+          where: {
+            patientId: appointment.patientId,
+            isPaid: true,
+            status: 'CONFIRMED',
+          },
+        });
+        if (confirmedCount === 1) {
+          await this.referralService.qualifyReferral(appointment.patientId);
+        }
+      } catch (refErr) {
+        console.error('Referral qualification failed (non-fatal):', refErr);
+      }
+
+      // Apply any pending credits to this appointment
+      try {
+        await this.referralService.applyCreditsToAppointment(appointment.patientId, appointmentId);
+      } catch (creditErr) {
+        console.error('Credit application failed (non-fatal):', creditErr);
+      }
+    };
+
+    const results = await Promise.allSettled([
+      bookkeeping(),
+      this.sendConfirmationMeetAndEmails(appointment, patientTimezone),
+    ]);
+    for (const result of results) {
+      if (result.status === 'rejected') {
+        console.error(`Post-confirmation step failed for appointment ${appointmentId}:`, result.reason);
+      }
+    }
+  }
+
+  private loadAppointmentForConfirmation(appointmentId: string) {
+    return this.prisma.appointment.findUnique({
       where: { id: appointmentId },
       include: {
         patient: {
@@ -354,16 +490,23 @@ export class StripeService {
         },
       },
     });
+  }
 
-    if (!appointment) {
-      throw new NotFoundException('Appointment not found');
-    }
-
+  /**
+   * Create the Meet link, email patient and doctor, then store the link.
+   *
+   * The link is stored LAST on purpose: a confirmed, paid appointment with no
+   * link is how recoverUnfinishedConfirmations knows this didn't finish.
+   */
+  private async sendConfirmationMeetAndEmails(
+    appointment: NonNullable<Awaited<ReturnType<StripeService['loadAppointmentForConfirmation']>>>,
+    patientTimezone?: string,
+  ): Promise<void> {
     const patientName = `${appointment.patient.firstName} ${appointment.patient.lastName}`;
     const doctorName = appointment.doctor ? `Dr. ${appointment.doctor.firstName} ${appointment.doctor.lastName}` : 'To be assigned';
-    
-    // Generate Google Meet link with patient's timezone
     const additionalServices = (appointment as any).additionalServices as Array<{ id: string; name: string; duration: number }> | null;
+
+    // Generate Google Meet link with patient's timezone
     const meetResult = await this.googleCalendarService.generateMeetLink(
       appointment.appointmentDate,
       appointment.appointmentTime,
@@ -378,121 +521,122 @@ export class StripeService {
       appointment.doctorId || undefined
     );
 
-    // Update appointment status to confirmed, mark as paid, and store Google Meet link and event ID
-    const updatedAppointment = await this.prisma.appointment.update({
-      where: { id: appointmentId },
-      data: {
-        status: 'CONFIRMED',
-        isPaid: true,
-        confirmedAt: new Date(),
-        googleMeetLink: meetResult.meetLink,
-        googleEventId: meetResult.eventId || null,
-      },
-      include: {
-        patient: {
-          select: {
-            firstName: true,
-            lastName: true,
-            primaryEmail: true,
-          },
-        },
-        doctor: {
-          select: {
-            firstName: true,
-            lastName: true,
-            email: true,
-          },
-        },
-        service: {
-          select: {
-            name: true,
-          },
-        },
-      },
-    });
-
     // NOTE: Patient email is already included when creating the event via generateMeetLink
     // No need to update the event again, which would cause duplicate email notifications
 
-    // Update slot availability (if slotId exists)
-    if (updatedAppointment.slotId) {
-      await this.prisma.slot.update({
-        where: { id: updatedAppointment.slotId },
-        data: {
-          isAvailable: false,
-        },
-      });
-    }
+    // Send email notifications to both patient and doctor (if assigned), in parallel
+    const appointmentDate = appointment.appointmentDate.toISOString().split('T')[0];
+    const amount = appointment.amount.toString();
 
-    // Qualify referral if this is the patient's first paid appointment
-    try {
-      const confirmedCount = await this.prisma.appointment.count({
-        where: {
-          patientId: appointment.patientId,
-          isPaid: true,
-          status: 'CONFIRMED',
-        },
-      });
-      if (confirmedCount === 1) {
-        await this.referralService.qualifyReferral(appointment.patientId);
-      }
-    } catch (refErr) {
-      console.error('Referral qualification failed (non-fatal):', refErr);
-    }
-
-    // Apply any pending credits to this appointment
-    try {
-      await this.referralService.applyCreditsToAppointment(appointment.patientId, appointmentId);
-    } catch (creditErr) {
-      console.error('Credit application failed (non-fatal):', creditErr);
-    }
-
-    // Send email notifications to both patient and doctor (if assigned)
-    try {
-      const patientName = `${updatedAppointment.patient.firstName} ${updatedAppointment.patient.lastName}`;
-      const appointmentDate = updatedAppointment.appointmentDate.toISOString().split('T')[0];
-      const amount = updatedAppointment.amount.toString();
-      const doctorName = updatedAppointment.doctor ? `Dr. ${updatedAppointment.doctor.firstName} ${updatedAppointment.doctor.lastName}` : 'To be assigned';
-
+    const emails: Promise<unknown>[] = [
       // Send confirmation email to patient with their timezone
-      const additionalServices = (updatedAppointment as any).additionalServices as Array<{ id: string; name: string; duration: number }> | null;
-      await this.mailerService.sendAppointmentConfirmationEmail(
-        updatedAppointment.patient.primaryEmail || '',
+      this.mailerService.sendAppointmentConfirmationEmail(
+        appointment.patient.primaryEmail || '',
         patientName,
         doctorName,
-        updatedAppointment.service.name,
+        appointment.service.name,
         appointmentDate,
-        updatedAppointment.appointmentTime,
+        appointment.appointmentTime,
         amount,
-        updatedAppointment.googleMeetLink || undefined,
+        meetResult.meetLink || undefined,
         patientTimezone, // Use patient's timezone from frontend
         additionalServices || undefined
-      );
+      ),
+    ];
 
-      // Send email to doctor if assigned
-      if (updatedAppointment.doctor && updatedAppointment.doctor.email) {
-        await this.mailerService.sendDoctorAppointmentNotification(
-          updatedAppointment.doctor.email,
+    // Send email to doctor if assigned
+    if (appointment.doctor && appointment.doctor.email) {
+      emails.push(
+        this.mailerService.sendDoctorAppointmentNotification(
+          appointment.doctor.email,
           doctorName,
           patientName,
-          updatedAppointment.service.name,
+          appointment.service.name,
           appointmentDate,
-          updatedAppointment.appointmentTime,
+          appointment.appointmentTime,
           amount,
-          updatedAppointment.googleMeetLink || undefined,
+          meetResult.meetLink || undefined,
           'America/Chicago',
           additionalServices || undefined
-        );
-      }
-    } catch (error) {
-      console.error('Failed to send confirmation email:', error);
-      // Don't throw error to avoid breaking the payment confirmation process
+        ),
+      );
     }
 
-    return {
-      success: true,
-      message: 'Payment confirmed and appointment booked successfully',
-    };
+    for (const result of await Promise.allSettled(emails)) {
+      if (result.status === 'rejected') {
+        console.error('Failed to send confirmation email:', result.reason);
+      }
+    }
+
+    await this.prisma.appointment.update({
+      where: { id: appointment.id },
+      data: {
+        googleMeetLink: meetResult.meetLink,
+        googleEventId: meetResult.eventId || null,
+      },
+    });
+  }
+
+  /**
+   * Finish confirmations whose post-confirmation work was cut off (e.g. the
+   * instance restarted right after responding). Only confirmPayment leaves a
+   * CONFIRMED + paid appointment without a Meet link, so that combination,
+   * confirmed recently, is the marker.
+   *
+   * The patient's browser timezone isn't stored, so recovered emails use the
+   * mailer's default (America/Chicago).
+   */
+  @Cron('0 */5 * * * *') // every 5 minutes
+  async recoverUnfinishedConfirmations(): Promise<void> {
+    const now = Date.now();
+
+    try {
+      const candidates = await this.prisma.appointment.findMany({
+        where: {
+          status: 'CONFIRMED',
+          isPaid: true,
+          googleMeetLink: null,
+          // Old enough that the original run is clearly not still going, recent
+          // enough that historical rows are never touched.
+          confirmedAt: {
+            gte: new Date(now - this.RECOVERY_MAX_AGE_MS),
+            lte: new Date(now - this.RECOVERY_MIN_AGE_MS),
+          },
+          // Skip rows another instance claimed (claiming bumps updatedAt).
+          updatedAt: { lte: new Date(now - this.RECOVERY_MIN_AGE_MS) },
+        },
+        select: { id: true, updatedAt: true },
+        take: 20,
+      });
+
+      for (const candidate of candidates) {
+        if (this.confirmationsInFlight.has(candidate.id)) continue;
+
+        // Claim it: succeeds only if nobody touched the row since we read it,
+        // so when several instances sweep at once exactly one proceeds.
+        const claim = await this.prisma.appointment.updateMany({
+          where: { id: candidate.id, googleMeetLink: null, updatedAt: candidate.updatedAt },
+          data: { updatedAt: new Date() },
+        });
+        if (claim.count === 0) continue;
+
+        this.confirmationsInFlight.add(candidate.id);
+        try {
+          const appointment = await this.loadAppointmentForConfirmation(candidate.id);
+          if (appointment) {
+            await this.sendConfirmationMeetAndEmails(appointment);
+            console.log(`Recovered unfinished confirmation for appointment ${candidate.id}`);
+          }
+        } catch (error) {
+          console.error(`Failed to recover confirmation for appointment ${candidate.id}:`, error);
+        } finally {
+          this.confirmationsInFlight.delete(candidate.id);
+        }
+      }
+    } catch (error) {
+      // A recovery failure must never take the scheduler down.
+      console.error('Confirmation recovery sweep failed:', error);
+    }
   }
 
   /**

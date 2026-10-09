@@ -49,6 +49,9 @@ export class MailerService implements OnModuleInit {
       port: Number(port) || 587,
       secure: useSecure,
       auth: { user, pass },
+      // Reuse SMTP connections instead of a fresh Gmail handshake per email.
+      pool: true,
+      maxConnections: 3,
     });
 
     try {
@@ -87,6 +90,9 @@ export class MailerService implements OnModuleInit {
       port: Number(port) || 587,
       secure: useSecure,
       auth: { user, pass },
+      // Reuse SMTP connections instead of a fresh Gmail handshake per email.
+      pool: true,
+      maxConnections: 3,
     });
 
     try {

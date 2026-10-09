@@ -7,7 +7,7 @@ import {
 import { PrismaService } from '../prisma/prisma.service';
 import { MailerService } from '../mailer/mailer.service';
 import * as bcrypt from 'bcrypt';
-import { CommissionType, PartnerReferralStatus, CommissionStatus } from '@prisma/client';
+import { CommissionType, PartnerReferralStatus, CommissionStatus, Prisma } from '@prisma/client';
 
 /**
  * Referral Partner (business affiliate) program. Fully self-contained —
@@ -412,15 +412,20 @@ export class PartnersService {
   }
 
   /** Spend up to `cents` of a partner's credit. Returns how much was actually deducted. */
-  async spendCredit(partnerId: string, cents: number): Promise<number> {
+  async spendCredit(
+    partnerId: string,
+    cents: number,
+    // Pass a transaction client to spend atomically with the caller's own writes.
+    db: Prisma.TransactionClient = this.prisma,
+  ): Promise<number> {
     if (cents <= 0) return 0;
-    const partner = await this.prisma.referralPartner.findUnique({
+    const partner = await db.referralPartner.findUnique({
       where: { id: partnerId },
       select: { creditBalanceCents: true },
     });
     const spend = Math.min(cents, partner?.creditBalanceCents ?? 0);
     if (spend <= 0) return 0;
-    await this.prisma.referralPartner.update({
+    await db.referralPartner.update({
       where: { id: partnerId },
       data: { creditBalanceCents: { decrement: spend } },
     });
