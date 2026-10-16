@@ -234,7 +234,7 @@ export class LabOrdersController {
   @ApiOperation({
     summary: 'Patients due to schedule labs again (Admin)',
     description:
-      "Patients whose most recent confirmed/completed lab is older than the given number of months (default 3), longest overdue first.",
+      "Patients (members or not) with a confirmed/completed appointment in the last 6 months or an upcoming one, whose most recent confirmed/completed lab is older than the given number of months (default 3), longest overdue first.",
   })
   async getPatientsDueForLabs(
     @Query('months') months?: string,

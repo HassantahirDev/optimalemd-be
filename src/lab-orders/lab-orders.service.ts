@@ -1,4 +1,5 @@
 import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import { AppointmentStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { UploadsService } from '../uploads/uploads.service';
 import { CreateLabOrderDto, LabTestTypeDto, LabOrderDto } from './dto/lab-orders.dto';
@@ -655,14 +656,36 @@ export class LabOrdersService {
    * "Most recent lab" uses the same rule the patient's own booking screen uses:
    * the latest CONFIRMED or COMPLETED order by scheduledDate. Pending and
    * cancelled orders don't count as having been done.
+   *
+   * Only patients under active care are listed: anyone — member or not — with a
+   * real appointment dated within the last SEEN_WITHIN_MONTHS months or booked
+   * for the future. Covers members, $145 pay-per-visit patients and appointments
+   * an admin created for them. "Real" = CONFIRMED, IN_PROGRESS or COMPLETED;
+   * unpaid PENDING bookings, cancellations and no-shows don't count.
    */
   async getPatientsDueForLabs(months = 3, search?: string) {
+    const SEEN_WITHIN_MONTHS = 6;
+    const now = new Date();
     const cutoff = new Date();
     cutoff.setMonth(cutoff.getMonth() - months);
+    const seenSince = new Date();
+    seenSince.setMonth(seenSince.getMonth() - SEEN_WITHIN_MONTHS);
+
+    const activeCareStatuses = [
+      AppointmentStatus.CONFIRMED,
+      AppointmentStatus.IN_PROGRESS,
+      AppointmentStatus.COMPLETED,
+    ];
+    // Past 6 months OR upcoming — no upper bound on the date.
+    const recentOrUpcoming = {
+      status: { in: activeCareStatuses },
+      appointmentDate: { gte: seenSince },
+    };
 
     const patients = await this.prisma.user.findMany({
       where: {
         isActive: true,
+        patientAppointments: { some: recentOrUpcoming },
         ...(search
           ? {
               OR: [
@@ -686,8 +709,29 @@ export class LabOrdersService {
           take: 1,
           select: { id: true, scheduledDate: true, status: true },
         },
+        // Most recent visit that has already happened (may be older than 6
+        // months when the patient only qualifies through an upcoming booking).
+        patientAppointments: {
+          where: { status: { in: activeCareStatuses }, appointmentDate: { lte: now } },
+          orderBy: { appointmentDate: 'desc' },
+          take: 1,
+          select: { appointmentDate: true },
+        },
       },
     });
+
+    // Earliest upcoming visit per patient, for display.
+    const upcoming = await this.prisma.appointment.findMany({
+      where: {
+        patientId: { in: patients.map((p) => p.id) },
+        status: { in: activeCareStatuses },
+        appointmentDate: { gt: now },
+      },
+      orderBy: { appointmentDate: 'asc' },
+      select: { patientId: true, appointmentDate: true },
+    });
+    const nextVisits = new Map<string, Date>();
+    for (const a of upcoming) if (!nextVisits.has(a.patientId)) nextVisits.set(a.patientId, a.appointmentDate);
 
     const due = patients
       .map((p) => {
@@ -703,6 +747,8 @@ export class LabOrdersService {
           email: p.primaryEmail,
           phone: p.primaryPhone,
           lastLabDate: last.scheduledDate,
+          lastVisitDate: p.patientAppointments[0]?.appointmentDate ?? null,
+          nextVisitDate: nextVisits.get(p.id) ?? null,
           daysSinceLastLab: Math.floor((Date.now() - last.scheduledDate.getTime()) / 86_400_000),
         };
       })
@@ -711,6 +757,6 @@ export class LabOrdersService {
     // Longest overdue first.
     due.sort((a, b) => b.daysSinceLastLab - a.daysSinceLastLab);
 
-    return { months, cutoff, total: due.length, patients: due };
+    return { months, cutoff, seenWithinMonths: SEEN_WITHIN_MONTHS, total: due.length, patients: due };
   }
 }
