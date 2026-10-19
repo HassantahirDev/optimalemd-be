@@ -1,4 +1,6 @@
 import { Injectable, BadRequestException, NotFoundException } from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
+import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 import { MailerService } from '../mailer/mailer.service';
 import * as fs from 'fs';
@@ -12,6 +14,8 @@ export class UploadsService {
   constructor(
     private prisma: PrismaService,
     private mailerService: MailerService,
+    private jwtService: JwtService,
+    private configService: ConfigService,
   ) {
     // Create uploads directory at project root
     this.uploadsDir = path.join(process.cwd(), 'uploads', 'user-documents');
@@ -19,6 +23,34 @@ export class UploadsService {
     // Ensure uploads directory exists
     if (!fs.existsSync(this.uploadsDir)) {
       fs.mkdirSync(this.uploadsDir, { recursive: true });
+    }
+  }
+
+  /**
+   * Build a "book your follow-up" link that also signs the patient in. Embeds a
+   * short-lived JWT (same shape as a normal patient login) so clicking the button
+   * from the lab-results email lands them straight on the booking page — logged in
+   * if they weren't already. Falls back to a plain link if signing fails.
+   */
+  private buildAutoLoginBookingLink(patient: { id: string; primaryEmail: string | null; firstName?: string | null }): string {
+    // Patient emails always target production, matching the verification-email pattern.
+    const base = (this.configService.get<string>('PUBLIC_APP_URL') || 'https://formamd.com').replace(/\/+$/, '');
+    // prefill=lab-followup tells the booking page to preselect Telehealth (primary)
+    // + Lab Testing (medical service) for the post-results follow-up.
+    const next = '/dashboard/book-appointment?prefill=lab-followup';
+    try {
+      const token = this.jwtService.sign(
+        // userType is REQUIRED by JwtStrategy.validate — without it every guarded
+        // call (e.g. /auth/me) returns 401 "Invalid token payload".
+        // name/email are carried so the auto-login page can populate localStorage
+        // identically to the regular email+password login flow.
+        { sub: patient.id, email: patient.primaryEmail, userType: 'user', name: patient.firstName || '' },
+        { expiresIn: '3d' },
+      );
+      return `${base}/auto-login?token=${encodeURIComponent(token)}&next=${encodeURIComponent(next)}`;
+    } catch (e) {
+      // If token signing fails, still give a usable link (they'll log in manually).
+      return `${base}${next}`;
     }
   }
 
@@ -237,12 +269,18 @@ export class UploadsService {
         const patientName = `${labOrder.patient.firstName} ${labOrder.patient.lastName}`;
         const testNames = labOrder.items.map(item => item.labTestType.name).join(', ');
 
+        // Build a one-click "book follow-up" link that also signs the patient in.
+        // A short-lived auto-login token is embedded so the patient lands straight
+        // on the booking page without re-entering credentials.
+        const bookingLink = this.buildAutoLoginBookingLink(labOrder.patient);
+
         // Attach the uploaded results file
         await this.mailerService.sendLabResultsEmail(
           labOrder.patient.primaryEmail,
           patientName,
           testNames,
           filePath, // Pass file path for attachment
+          bookingLink,
         );
       } catch (error) {
         console.error('Failed to send lab results email:', error);
