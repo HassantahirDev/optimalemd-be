@@ -409,6 +409,124 @@ export class AdminManagementService {
     return created;
   }
 
+  // ==========================================================================
+  // Payment-portal users (payments.formamd.com). Super-admin MANAGES these
+  // accounts here, but managing them does NOT grant portal access — admins
+  // still cannot enter the payments portal or see payment data there.
+  // ==========================================================================
+  private readonly paymentUserSelect = {
+    id: true,
+    email: true,
+    firstName: true,
+    lastName: true,
+    role: true,
+    isActive: true,
+    mustChangePassword: true,
+    createdAt: true,
+    updatedAt: true,
+  };
+
+  async listPaymentUsers() {
+    return this.prisma.paymentUser.findMany({
+      orderBy: { createdAt: 'desc' },
+      select: this.paymentUserSelect,
+    });
+  }
+
+  async createPaymentUser(body: {
+    email: string;
+    password: string;
+    firstName?: string;
+    lastName?: string;
+    role?: string;
+  }) {
+    const email = body.email?.toLowerCase().trim();
+    if (!email || !body.password) {
+      throw new BadRequestException('email and password are required');
+    }
+    if (body.password.length < 6) {
+      throw new BadRequestException('Password must be at least 6 characters');
+    }
+
+    const existing = await this.prisma.paymentUser.findUnique({ where: { email } });
+    if (existing) {
+      throw new BadRequestException('A payment user with this email already exists');
+    }
+
+    const hashedPassword = await bcrypt.hash(body.password, 12);
+    const created = await this.prisma.paymentUser.create({
+      data: {
+        email,
+        password: hashedPassword,
+        firstName: body.firstName?.trim() || null,
+        lastName: body.lastName?.trim() || null,
+        role: body.role === 'payment_admin' ? 'payment_admin' : 'payment_staff',
+        mustChangePassword: true,
+      },
+      select: this.paymentUserSelect,
+    });
+
+    // Email the payment user their credentials + portal login URL (non-fatal).
+    try {
+      const frontendUrl = (this.configService.get<string>('FRONTEND_URL') || '').replace(/\/$/, '');
+      const loginUrl = `${frontendUrl}/payments-login`;
+      await this.mailerService.sendPaymentUserCreatedEmail(
+        email,
+        body.firstName?.trim() || 'there',
+        body.password,
+        loginUrl,
+      );
+    } catch (err) {
+      console.error('Failed to send payment-user credentials email (non-fatal):', err);
+    }
+
+    return created;
+  }
+
+  async updatePaymentUser(
+    id: string,
+    body: Partial<{ firstName: string; lastName: string; role: string; isActive: boolean }>,
+  ) {
+    const existing = await this.prisma.paymentUser.findUnique({ where: { id } });
+    if (!existing) throw new NotFoundException('Payment user not found');
+
+    const data: any = {};
+    if (body.firstName !== undefined) data.firstName = body.firstName?.trim() || null;
+    if (body.lastName !== undefined) data.lastName = body.lastName?.trim() || null;
+    if (body.isActive !== undefined) data.isActive = body.isActive;
+    if (body.role !== undefined) {
+      data.role = body.role === 'payment_admin' ? 'payment_admin' : 'payment_staff';
+    }
+
+    return this.prisma.paymentUser.update({
+      where: { id },
+      data,
+      select: this.paymentUserSelect,
+    });
+  }
+
+  async resetPaymentUserPassword(id: string, newPassword: string) {
+    if (!newPassword || newPassword.length < 6) {
+      throw new BadRequestException('Password must be at least 6 characters');
+    }
+    const existing = await this.prisma.paymentUser.findUnique({ where: { id } });
+    if (!existing) throw new NotFoundException('Payment user not found');
+
+    const hashedPassword = await bcrypt.hash(newPassword, 12);
+    await this.prisma.paymentUser.update({
+      where: { id },
+      data: { password: hashedPassword, mustChangePassword: true },
+    });
+    return { message: 'Password reset successfully' };
+  }
+
+  async deletePaymentUser(id: string) {
+    const existing = await this.prisma.paymentUser.findUnique({ where: { id } });
+    if (!existing) throw new NotFoundException('Payment user not found');
+    await this.prisma.paymentUser.delete({ where: { id } });
+    return { message: 'Payment user deleted successfully' };
+  }
+
   async updateAssistant(
     assistantId: string,
     body: Partial<{

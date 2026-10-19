@@ -91,6 +91,11 @@ export class DetailsStepDto {
 
 // Create Welcome Order DTO
 export class CreateWelcomeOrderDto {
+  /** Texas medical-marijuana intake. Decides the welcome fee server-side ($150 vs $65). */
+  @IsOptional()
+  @IsBoolean()
+  isMedicalMarijuana?: boolean;
+
   @IsEmail()
   email: string;
 
@@ -275,6 +280,12 @@ export class CreateUserStepByStepDto {
   @IsOptional()
   @IsString()
   referralCode?: string;
+
+  // Partner-program attribution id set by the tracking snippet (cookie/localStorage).
+  // Separate from referralCode (patient-to-patient program) — see ReferralPartner.
+  @IsOptional()
+  @IsString()
+  visitorId?: string;
 
   @IsOptional()
   @IsBoolean()

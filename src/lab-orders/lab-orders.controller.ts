@@ -229,6 +229,32 @@ export class LabOrdersController {
     };
   }
 
+  @Get('admin/due-for-labs')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Patients due to schedule labs again (Admin)',
+    description:
+      "Patients (members or not) with a confirmed/completed appointment in the last 6 months or an upcoming one, whose most recent confirmed/completed lab is older than the given number of months (default 3), longest overdue first.",
+  })
+  async getPatientsDueForLabs(
+    @Query('months') months?: string,
+    @Query('search') search?: string,
+  ) {
+    const monthsNum = Math.min(24, Math.max(1, parseInt(months || '3', 10) || 3));
+    const data = await this.labOrdersService.getPatientsDueForLabs(
+      monthsNum,
+      search?.trim() || undefined,
+    );
+    return {
+      success: true,
+      statusCode: HttpStatus.OK,
+      message: 'Patients due for labs retrieved successfully',
+      data,
+      timestamp: new Date().toISOString(),
+      path: '/api/lab-orders/admin/due-for-labs',
+    };
+  }
+
   @Patch('admin/:orderId/status')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
@@ -307,6 +333,35 @@ export class LabOrdersController {
       data: order,
       timestamp: new Date().toISOString(),
       path: `/api/lab-orders/admin/patient/${patientId}`,
+    };
+  }
+
+  @Delete('admin/:orderId')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Permanently delete a lab order (Admin)',
+    description:
+      'Hard-deletes a lab order along with its test items, uploaded result files, and per-order documents. Does not affect the appointment, medical form, or anything else tied to the patient.',
+  })
+  @ApiParam({
+    name: 'orderId',
+    description: 'Lab order ID',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Lab order permanently deleted',
+  })
+  async adminDeleteLabOrder(
+    @Param('orderId') orderId: string,
+  ): Promise<BaseApiResponse<{ id: string }>> {
+    const result = await this.labOrdersService.adminDeleteLabOrder(orderId);
+    return {
+      success: true,
+      statusCode: HttpStatus.OK,
+      message: 'Lab order permanently deleted',
+      data: result,
+      timestamp: new Date().toISOString(),
+      path: `/api/lab-orders/admin/${orderId}`,
     };
   }
 }

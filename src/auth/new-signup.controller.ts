@@ -140,6 +140,22 @@ export class NewSignupController {
     return this.newSignupService.resumeSignupByEmail(email);
   }
 
+  // Resuming a PAID but abandoned signup, without charging again. Public like
+  // the rest of this controller, so ownership is proven by clicking a signed
+  // link emailed to that address — the email lookup only decides whether to
+  // send one.
+  @Post('resume/request-link')
+  async requestResumeLink(@Body() body: { email: string }) {
+    const data = await this.newSignupService.requestResumeLink(body.email);
+    return { success: true, data };
+  }
+
+  @Post('resume/verify-token')
+  async verifyResumeToken(@Body() body: { token: string }) {
+    const data = await this.newSignupService.verifyResumeToken(body.token);
+    return { success: true, data };
+  }
+
   // Complete signup and create user
   @Post('welcome-order/:welcomeOrderId/complete')
   @HttpCode(HttpStatus.CREATED)
@@ -168,6 +184,15 @@ export class NewSignupController {
       body.paymentIntentId, 
       body.status as any
     );
+  }
+
+  // Confirm a welcome order that's fully covered by partner credit ($0 due) — no
+  // Stripe payment intent exists for these, so it can't go through the normal
+  // payment-status endpoint above.
+  @Post('welcome-order/:welcomeOrderId/confirm-free')
+  @HttpCode(HttpStatus.OK)
+  async confirmFreeWelcomeOrder(@Param('welcomeOrderId') welcomeOrderId: string) {
+    return this.newSignupService.confirmFreeWelcomeOrder(welcomeOrderId);
   }
 
   // Get welcome order status by user ID

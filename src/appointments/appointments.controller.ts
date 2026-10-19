@@ -44,6 +44,7 @@ import {
   AppointmentResponseDto,
   AppointmentWithRelationsResponseDto,
   AdminCreateAppointmentDto,
+  PatientOverrideBookingDto,
 } from './dto';
 import {
   CreateBookingDto,
@@ -358,6 +359,41 @@ export class AppointmentsController {
       data,
       timestamp: new Date().toISOString(),
       path: '/api/appointments/my-pending-unpaid',
+    };
+  }
+
+  // NOTE: these two routes MUST stay declared before 'patient/:patientId' below —
+  // Nest/Express match routes in declaration order, so a param route like
+  // 'patient/:patientId' greedily captures literal segments (e.g. 'override-status')
+  // registered after it, and this handler would never be reached.
+  @Get('patient/override-status')
+  @ApiOperation({ summary: 'Patient: check whether admin booking override is currently enabled for me' })
+  async getOverrideStatus(@CurrentUser() user: any) {
+    return { success: true, data: { enabled: !!user?.adminBookingOverrideEnabled } };
+  }
+
+  @Post('patient/create-with-override')
+  @ApiOperation({
+    summary: 'Patient: book using an admin-granted one-time override',
+    description:
+      'Same underlying flow as admin/create-confirmed (any doctor, custom out-of-slot time, no payment) — only usable when an admin has enabled adminBookingOverrideEnabled for this patient. Consumed automatically after one successful booking.',
+  })
+  @ApiOkResponse({ description: 'Appointment created', type: BaseApiResponse<AppointmentResponseDto> })
+  async createWithAdminOverride(
+    @CurrentUser() user: any,
+    @Body() dto: PatientOverrideBookingDto,
+  ): Promise<BaseApiResponse<AppointmentResponseDto>> {
+    if (user?.userType !== 'user') {
+      throw new ForbiddenException('Only patients can use this endpoint.');
+    }
+    const data = await this.appointmentsService.createWithAdminOverride(user.id, dto);
+    return {
+      success: true,
+      statusCode: 201,
+      message: 'Appointment created successfully',
+      data,
+      timestamp: new Date().toISOString(),
+      path: '/api/appointments/patient/create-with-override',
     };
   }
 
@@ -1559,7 +1595,57 @@ export class AppointmentsController {
     }
   }
 
- 
+  @Patch('doctor/:doctorId/slots/:slotId/availability')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Doctor: block or unblock a single slot' })
+  @ApiParam({ name: 'doctorId', description: 'Doctor ID' })
+  @ApiParam({ name: 'slotId', description: 'Slot ID' })
+  @ApiOkResponse({ description: 'Slot availability updated' })
+  async setSlotAvailability(
+    @Param('doctorId') doctorId: string,
+    @Param('slotId') slotId: string,
+    @Body('isAvailable') isAvailable: boolean,
+  ): Promise<BaseApiResponse<{ id: string; isAvailable: boolean }>> {
+    const data = await this.appointmentsService.setSlotAvailability(doctorId, slotId, isAvailable);
+    return {
+      success: true,
+      statusCode: 200,
+      message: isAvailable ? 'Slot unblocked' : 'Slot blocked',
+      data,
+      timestamp: new Date().toISOString(),
+      path: `/api/appointments/doctor/${doctorId}/slots/${slotId}/availability`,
+    };
+  }
+
+  @Patch('doctor/:doctorId/day/:date/availability')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: "Doctor: block or unblock every open slot on a given day (booked slots are left untouched)" })
+  @ApiParam({ name: 'doctorId', description: 'Doctor ID' })
+  @ApiParam({ name: 'date', description: 'Date in YYYY-MM-DD format' })
+  @ApiOkResponse({ description: 'Day availability updated' })
+  async setDayAvailability(
+    @Param('doctorId') doctorId: string,
+    @Param('date') date: string,
+    @Body('isAvailable') isAvailable: boolean,
+  ): Promise<BaseApiResponse<{ updated: number; skippedBooked: number }>> {
+    const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+    if (!dateRegex.test(date)) {
+      throw new BadRequestException('Invalid date format. Use YYYY-MM-DD');
+    }
+    const data = await this.appointmentsService.setDayAvailability(doctorId, date, isAvailable);
+    return {
+      success: true,
+      statusCode: 200,
+      message: isAvailable
+        ? `Unblocked ${data.updated} slot(s)`
+        : `Blocked ${data.updated} slot(s)${data.skippedBooked > 0 ? ` (${data.skippedBooked} booked slot(s) left untouched)` : ''}`,
+      data,
+      timestamp: new Date().toISOString(),
+      path: `/api/appointments/doctor/${doctorId}/day/${date}/availability`,
+    };
+  }
 
   @Post('admin/create-confirmed')
   @ApiOperation({ summary: 'Admin: Create confirmed appointment' })

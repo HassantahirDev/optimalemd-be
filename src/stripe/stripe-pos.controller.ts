@@ -144,6 +144,16 @@ export class StripePosController {
     }
   }
 
+  // Search our own patient accounts to attach an in-person sale (Part C).
+  @Get('search-patients')
+  async searchPatients(@Query('q') q: string) {
+    try {
+      return { ok: true, patients: await this.stripePosService.searchPatients(q || '') };
+    } catch (err: any) {
+      throw new HttpException({ ok: false, error: err.message }, 400);
+    }
+  }
+
   @Get('catalog/one-time')
   async catalogOneTime() {
     try {

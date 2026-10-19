@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { MailerService } from '../mailer/mailer.service';
 import { CreateContactDto, ContactResponseDto, UpdateContactStatusDto } from './dto/contact.dto';
@@ -128,5 +128,65 @@ This email was automatically generated from the FormaMD contact form.
       textContent,
       htmlContent
     );
+  }
+
+  /**
+   * Help request raised from the patient's Lab Analysis screen. Goes straight to
+   * the support inbox — deliberately separate from the website contact form,
+   * which routes elsewhere and persists a Contact record. Nothing is stored
+   * here; it's a message, not a lead.
+   */
+  async sendLabAnalysisHelpRequest(input: {
+    email: string;
+    phone: string;
+    message: string;
+    patientName?: string;
+  }): Promise<{ sent: boolean }> {
+    const email = (input.email || '').trim();
+    const phone = (input.phone || '').trim();
+    const message = (input.message || '').trim();
+    if (!email || !phone || !message) {
+      throw new BadRequestException('Email, phone and message are required');
+    }
+    const name = (input.patientName || '').trim() || 'A patient';
+    const supportInbox = 'support@formamd.com';
+
+    const textContent = [
+      'Lab Analysis help request',
+      '',
+      `From: ${name}`,
+      `Email: ${email}`,
+      `Phone: ${phone}`,
+      '',
+      'Message:',
+      message,
+      '',
+      'Sent from the Lab Analysis screen in the patient portal.',
+    ].join('\n');
+
+    const htmlContent = `
+      <div style="font-family: Arial, sans-serif; color:#333; max-width:600px;">
+        <h2 style="margin:0 0 16px;">Lab Analysis help request</h2>
+        <p style="margin:0 0 6px;"><strong>From:</strong> ${name}</p>
+        <p style="margin:0 0 6px;"><strong>Email:</strong> <a href="mailto:${email}">${email}</a></p>
+        <p style="margin:0 0 16px;"><strong>Phone:</strong> ${phone}</p>
+        <div style="background:#f8f9fa;border-left:4px solid #000;padding:16px;border-radius:4px;">
+          <p style="margin:0 0 8px;"><strong>Message</strong></p>
+          <p style="margin:0;white-space:pre-line;">${message}</p>
+        </div>
+        <p style="color:#888;font-size:12px;margin-top:20px;">
+          Sent from the Lab Analysis screen in the patient portal.
+        </p>
+      </div>
+    `;
+
+    await this.mailerService.sendEmail(
+      supportInbox,
+      `Lab Analysis help request from ${name}`,
+      textContent,
+      htmlContent,
+    );
+
+    return { sent: true };
   }
 }

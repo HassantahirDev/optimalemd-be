@@ -63,15 +63,51 @@ export class AiController {
   async getStoredLabTrends(
     @CurrentUser() user: any,
     @Query('patientId') patientId?: string,
+    @Headers('authorization') authorization?: string,
   ) {
     // Patients can only ever see their own trends.
     const targetPatientId = user.userType === 'user' ? user.id : patientId;
     if (!targetPatientId) {
       throw new ForbiddenException('patientId is required');
     }
+
+    let data = await this.aiService.getStoredLabTrendsForPatient(targetPatientId);
+
+    // A patient can't trigger the clinician-only analysis endpoint themselves —
+    // if they have real uploaded results but nothing's been analyzed yet, run it
+    // for them once here so their dashboard doesn't wait on a doctor to click
+    // "Analyze" first. Best-effort: never blocks the response on failure.
+    if (user.userType === 'user' && data.length === 0) {
+      const triggered = await this.aiService.ensureLabTrendsAnalyzedForPatient(targetPatientId, authorization);
+      if (triggered) {
+        data = await this.aiService.getStoredLabTrendsForPatient(targetPatientId);
+      }
+    }
+
     return {
       success: true,
-      data: await this.aiService.getStoredLabTrendsForPatient(targetPatientId),
+      data,
+    };
+  }
+
+  // TEMPORARY (dev/testing): lets a patient force a fresh analysis of their own
+  // labs from the dashboard, so changes to the analysis pipeline can be seen
+  // without waiting for a clinician to re-run it. Scoped to the caller's own
+  // record only — a patient can never target another patient here. Remove
+  // along with the "Re-analyze" button on the patient homepage.
+  @Post('lab-trends/refresh')
+  @ApiOperation({ summary: 'Re-run the calling patient\'s own lab analysis (temporary)' })
+  async refreshOwnLabTrends(
+    @CurrentUser() user: any,
+    @Headers('authorization') authorization?: string,
+  ) {
+    if (user.userType !== 'user') {
+      throw new ForbiddenException('Clinicians should use POST /ai/gemini/lab-trends');
+    }
+    await this.aiService.ensureLabTrendsAnalyzedForPatient(user.id, authorization, true);
+    return {
+      success: true,
+      data: await this.aiService.getStoredLabTrendsForPatient(user.id),
     };
   }
 

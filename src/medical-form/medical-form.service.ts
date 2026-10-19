@@ -78,6 +78,52 @@ export class MedicalFormService {
     return this.mapToResponseDto(medicalForm);
   }
 
+  /**
+   * Weight/BMI per visit, newest first — one entry per medical form that actually
+   * recorded a measurement. Dated by the appointment it belongs to (that's the
+   * visit the reading was taken at); forms with no appointment fall back to when
+   * the form itself was created. Read-only.
+   */
+  async getBiometricsHistory(patientId: string) {
+    const forms = await this.prisma.medicalForm.findMany({
+      where: { patientId },
+      select: {
+        id: true,
+        weight: true,
+        height: true,
+        waist: true,
+        bmi: true,
+        createdAt: true,
+        updatedAt: true,
+        appointment: { select: { id: true, appointmentDate: true } },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    const num = (v: string | null | undefined) => {
+      if (!v) return null;
+      const m = String(v).match(/-?\d+(\.\d+)?/);
+      if (!m) return null;
+      const n = Number(m[0]);
+      return Number.isFinite(n) ? n : null;
+    };
+
+    return forms
+      .map((f) => ({
+        id: f.id,
+        appointmentId: f.appointment?.id || null,
+        date: (f.appointment?.appointmentDate || f.createdAt).toISOString(),
+        weight: num(f.weight),
+        weightRaw: f.weight || null,
+        bmi: num(f.bmi),
+        height: f.height || null,
+        waist: num(f.waist),
+      }))
+      // A form with neither reading contributes no column to the history table.
+      .filter((e) => e.weight !== null || e.bmi !== null || e.waist !== null)
+      .sort((a, b) => b.date.localeCompare(a.date));
+  }
+
   async getMedicalFormByPatientId(patientId: string): Promise<MedicalFormResponseDto> {
     const medicalForm = await this.prisma.medicalForm.findFirst({
       where: { patientId },

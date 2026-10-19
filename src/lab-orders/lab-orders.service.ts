@@ -1,4 +1,5 @@
 import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import { AppointmentStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { UploadsService } from '../uploads/uploads.service';
 import { CreateLabOrderDto, LabTestTypeDto, LabOrderDto } from './dto/lab-orders.dto';
@@ -605,5 +606,157 @@ export class LabOrdersService {
       updatedAt: order.updatedAt,
     };
   }
-}
 
+  /**
+   * Admin: permanently remove a lab order — the order itself, its selected test items,
+   * every uploaded result file, and its per-order paperwork documents. Nothing else is
+   * touched: LabOrder has no other required relations anywhere in the schema (checked
+   * against prisma/schema.prisma), so this can't cascade into appointments, medical
+   * forms, payments, etc. — it only ever removes what belonged to this one lab order.
+   */
+  async adminDeleteLabOrder(orderId: string): Promise<{ id: string }> {
+    const order = await this.prisma.labOrder.findUnique({
+      where: { id: orderId },
+      include: { resultFiles: true, documents: true },
+    });
+
+    if (!order) {
+      throw new NotFoundException('Lab order not found');
+    }
+
+    const fs = require('fs');
+    const filePaths = [
+      order.receiptPath,
+      order.resultsPath,
+      ...order.resultFiles.map((f) => f.filePath),
+      ...order.documents.map((d) => d.filePath),
+    ].filter((p): p is string => !!p);
+
+    // DB row (and its LabOrderItem / LabResultFile / PatientDocument children, all
+    // onDelete: Cascade) is the source of truth — delete it first, then best-effort
+    // clean up the files on disk so a file-system hiccup never leaves an orphaned order.
+    await this.prisma.labOrder.delete({ where: { id: orderId } });
+
+    for (const filePath of filePaths) {
+      try {
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      } catch {
+        // Non-fatal — the DB record is already gone, which is what matters.
+      }
+    }
+
+    return { id: orderId };
+  }
+
+  /**
+   * Patients whose most recent lab is older than `months` (default 3) and so are
+   * due to schedule again. Patients with no lab at all are NOT included — they
+   * have nothing to expire, and are usually just new rather than lapsed.
+   *
+   * "Most recent lab" uses the same rule the patient's own booking screen uses:
+   * the latest CONFIRMED or COMPLETED order by scheduledDate. Pending and
+   * cancelled orders don't count as having been done.
+   *
+   * Only patients under active care are listed: anyone — member or not — with a
+   * real appointment dated within the last SEEN_WITHIN_MONTHS months or booked
+   * for the future. Covers members, $145 pay-per-visit patients and appointments
+   * an admin created for them. "Real" = CONFIRMED, IN_PROGRESS or COMPLETED;
+   * unpaid PENDING bookings, cancellations and no-shows don't count.
+   */
+  async getPatientsDueForLabs(months = 3, search?: string) {
+    const SEEN_WITHIN_MONTHS = 6;
+    const now = new Date();
+    const cutoff = new Date();
+    cutoff.setMonth(cutoff.getMonth() - months);
+    const seenSince = new Date();
+    seenSince.setMonth(seenSince.getMonth() - SEEN_WITHIN_MONTHS);
+
+    const activeCareStatuses = [
+      AppointmentStatus.CONFIRMED,
+      AppointmentStatus.IN_PROGRESS,
+      AppointmentStatus.COMPLETED,
+    ];
+    // Past 6 months OR upcoming — no upper bound on the date.
+    const recentOrUpcoming = {
+      status: { in: activeCareStatuses },
+      appointmentDate: { gte: seenSince },
+    };
+
+    const patients = await this.prisma.user.findMany({
+      where: {
+        isActive: true,
+        patientAppointments: { some: recentOrUpcoming },
+        ...(search
+          ? {
+              OR: [
+                { firstName: { contains: search, mode: 'insensitive' as const } },
+                { lastName: { contains: search, mode: 'insensitive' as const } },
+                { primaryEmail: { contains: search, mode: 'insensitive' as const } },
+              ],
+            }
+          : {}),
+      },
+      select: {
+        id: true,
+        patientId: true,
+        firstName: true,
+        lastName: true,
+        primaryEmail: true,
+        primaryPhone: true,
+        labOrders: {
+          where: { status: { in: ['confirmed', 'completed'] } },
+          orderBy: { scheduledDate: 'desc' },
+          take: 1,
+          select: { id: true, scheduledDate: true, status: true },
+        },
+        // Most recent visit that has already happened (may be older than 6
+        // months when the patient only qualifies through an upcoming booking).
+        patientAppointments: {
+          where: { status: { in: activeCareStatuses }, appointmentDate: { lte: now } },
+          orderBy: { appointmentDate: 'desc' },
+          take: 1,
+          select: { appointmentDate: true },
+        },
+      },
+    });
+
+    // Earliest upcoming visit per patient, for display.
+    const upcoming = await this.prisma.appointment.findMany({
+      where: {
+        patientId: { in: patients.map((p) => p.id) },
+        status: { in: activeCareStatuses },
+        appointmentDate: { gt: now },
+      },
+      orderBy: { appointmentDate: 'asc' },
+      select: { patientId: true, appointmentDate: true },
+    });
+    const nextVisits = new Map<string, Date>();
+    for (const a of upcoming) if (!nextVisits.has(a.patientId)) nextVisits.set(a.patientId, a.appointmentDate);
+
+    const due = patients
+      .map((p) => {
+        const last = p.labOrders[0] || null;
+        // Must have had a lab, and it must predate the cutoff. No lab at all
+        // means nothing has expired, so they don't belong on this list.
+        if (!last || last.scheduledDate >= cutoff) return null;
+
+        return {
+          patientId: p.id,
+          patientNumber: p.patientId,
+          name: [p.firstName, p.lastName].filter(Boolean).join(' ').trim() || 'Unnamed patient',
+          email: p.primaryEmail,
+          phone: p.primaryPhone,
+          lastLabDate: last.scheduledDate,
+          lastVisitDate: p.patientAppointments[0]?.appointmentDate ?? null,
+          nextVisitDate: nextVisits.get(p.id) ?? null,
+          daysSinceLastLab: Math.floor((Date.now() - last.scheduledDate.getTime()) / 86_400_000),
+        };
+      })
+      .filter(Boolean) as Array<{ daysSinceLastLab: number }>;
+
+    // Longest overdue first.
+    due.sort((a, b) => b.daysSinceLastLab - a.daysSinceLastLab);
+
+    return { months, cutoff, seenWithinMonths: SEEN_WITHIN_MONTHS, total: due.length, patients: due };
+  }
+}

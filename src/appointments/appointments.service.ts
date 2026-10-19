@@ -1,9 +1,11 @@
 import { Injectable, NotFoundException, BadRequestException, ConflictException, ForbiddenException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { JwtService } from '@nestjs/jwt';
 import Stripe from 'stripe';
 import { PrismaService } from '../prisma/prisma.service';
 import { MailerService } from '../mailer/mailer.service';
 import { GoogleCalendarService } from '../google-calendar/google-calendar.service';
+import { buildAutoLoginLink } from '../common/utils/auto-login-link.util';
 import {
   CreateAppointmentDto,
   UpdateAppointmentDto,
@@ -30,6 +32,7 @@ export class AppointmentsService {
     private mailerService: MailerService,
     private googleCalendarService: GoogleCalendarService,
     private configService: ConfigService,
+    private jwtService: JwtService,
   ) {
     const stripeKey = this.configService.get<string>('STRIPE_SECRET_KEY');
     if (stripeKey) {
@@ -763,6 +766,15 @@ export class AppointmentsService {
       throw new BadRequestException('Cancelled appointments cannot be updated');
     }
 
+    if (
+      (updateAppointmentDto as any).status === AppointmentStatus.COMPLETED &&
+      !this.canCloseOutVisit((appointment as any).medications)
+    ) {
+      throw new BadRequestException(
+        'Prescribe at least one medication for this appointment, or mark it as no medication required, before marking it completed.',
+      );
+    }
+
     // Update status-specific fields
     const updateData: any = { ...updateAppointmentDto };
 
@@ -781,6 +793,16 @@ export class AppointmentsService {
       data: updateData
     });
 
+    // Completing the visit from this path sends the same "care plan ready" note,
+    // unless the doctor already signed (which sent it).
+    if (
+      updateData.status === AppointmentStatus.COMPLETED &&
+      (appointment.status as AppointmentStatus) !== AppointmentStatus.COMPLETED &&
+      !appointment.notesSignedAt
+    ) {
+      await this.sendCarePlanReadyEmail(id);
+    }
+
     return updatedAppointment;
   }
 
@@ -795,8 +817,33 @@ export class AppointmentsService {
     visitStatusNote: string | undefined,
     setByUserId: string,
   ): Promise<AppointmentResponseDto> {
-    const appointment = await this.prisma.appointment.findUnique({ where: { id: appointmentId } });
+    const appointment = await this.prisma.appointment.findUnique({
+      where: { id: appointmentId },
+      include: {
+        patient: { select: { id: true, firstName: true, lastName: true, primaryEmail: true } },
+        doctor: { select: { firstName: true, lastName: true } },
+      },
+    });
     if (!appointment) throw new NotFoundException('Appointment not found');
+
+    // Only email on the actual transition INTO no-show, not on re-saves / note edits
+    // of an already-recorded no-show.
+    const isNewNoShow = visitStatus === 'NO_SHOW' && appointment.visitStatus !== 'NO_SHOW';
+    // Same rule for "care plan ready": only on the transition INTO completed, and
+    // only if signing the note hasn't already sent it.
+    const isNewCompleted =
+      visitStatus === 'COMPLETED' &&
+      appointment.status !== AppointmentStatus.COMPLETED &&
+      !appointment.notesSignedAt;
+
+    if (
+      visitStatus === 'COMPLETED' &&
+      !this.canCloseOutVisit((appointment as any).medications)
+    ) {
+      throw new BadRequestException(
+        'Prescribe at least one medication for this appointment, or mark it as no medication required, before marking the visit completed.',
+      );
+    }
 
     // Mirror booking status from the recorded clinical outcome.
     const now = new Date();
@@ -833,6 +880,38 @@ export class AppointmentsService {
         ...bookingMirror,
       },
     });
+
+    if (isNewCompleted) {
+      await this.sendCarePlanReadyEmail(appointmentId);
+    }
+
+    // Fire the "sorry we missed you" email — non-fatal, must never block the status
+    // update itself just because the mail server hiccups.
+    if (isNewNoShow && appointment.patient?.primaryEmail) {
+      try {
+        const patientName = `${appointment.patient.firstName || ''} ${appointment.patient.lastName || ''}`.trim() || 'there';
+        const doctorName = appointment.doctor
+          ? `Dr. ${appointment.doctor.firstName} ${appointment.doctor.lastName}`
+          : 'your provider';
+        const bookingLink = buildAutoLoginLink(
+          this.jwtService,
+          this.configService,
+          appointment.patient,
+          '/dashboard/book-appointment',
+        );
+        await this.mailerService.sendNoShowEmail(
+          appointment.patient.primaryEmail,
+          patientName,
+          doctorName,
+          appointment.appointmentDate.toISOString().split('T')[0],
+          appointment.appointmentTime,
+          bookingLink,
+        );
+      } catch (err) {
+        console.error('Failed to send no-show email:', err);
+      }
+    }
+
     return updated as any;
   }
 
@@ -975,6 +1054,90 @@ export class AppointmentsService {
   /**
    * Sign notes for an appointment (sets notesSignedAt timestamp)
    */
+  /**
+   * Written into the appointment's `medications` JSON when a doctor records that
+   * this visit needs no medication. It distinguishes "nothing prescribed yet"
+   * from "nothing prescribed, deliberately" — the two are otherwise identical in
+   * the data, and only the second should be allowed to close out a visit.
+   */
+  static readonly NO_MEDICATION_KEY = '__noMedications';
+
+  private isExplicitlyNoMedication(medications: any): boolean {
+    return Boolean(
+      medications &&
+        typeof medications === 'object' &&
+        !Array.isArray(medications) &&
+        medications[AppointmentsService.NO_MEDICATION_KEY] === true,
+    );
+  }
+
+  /** The visit may be signed/completed once either is true. */
+  private canCloseOutVisit(medications: any): boolean {
+    return this.hasPrescribedMedications(medications) || this.isExplicitlyNoMedication(medications);
+  }
+
+  /**
+   * True only when at least one medication is actually prescribed on the
+   * appointment. `medications` is a JSON object keyed by medical service, whose
+   * values are either string[] (legacy) or MedicationObject[] (current) — so an
+   * opened-but-empty category like { "Hair Loss": [] } must NOT count, which is
+   * why this is stricter than the display check (`Object.keys(...).length > 0`)
+   * the patient list uses for its badge.
+   */
+  private hasPrescribedMedications(medications: any): boolean {
+    if (!medications || typeof medications !== 'object' || Array.isArray(medications)) {
+      return false;
+    }
+    return Object.entries(medications).some(([key, entries]: [string, any]) => {
+      if (key === AppointmentsService.NO_MEDICATION_KEY) return false;
+      if (!Array.isArray(entries)) return false;
+      return entries.some((entry: any) => {
+        if (typeof entry === 'string') return entry.trim().length > 0;
+        if (entry && typeof entry === 'object') {
+          return Boolean(entry.name || entry.medication || entry.medicationName || entry.id);
+        }
+        return false;
+      });
+    });
+  }
+
+  /**
+   * "Your care plan is ready" — fired when the visit is closed out. Never throws:
+   * a mail failure must not roll back the signature or the status change the
+   * doctor just made.
+   */
+  private async sendCarePlanReadyEmail(appointmentId: string) {
+    try {
+      const appt = await this.prisma.appointment.findUnique({
+        where: { id: appointmentId },
+        include: {
+          patient: {
+            select: { id: true, firstName: true, lastName: true, primaryEmail: true, email: true },
+          },
+        },
+      });
+      const to = appt?.patient?.primaryEmail || appt?.patient?.email;
+      if (!to) return;
+
+      const patientName =
+        `${appt.patient.firstName || ''} ${appt.patient.lastName || ''}`.trim() || 'there';
+      const carePlanLink = buildAutoLoginLink(
+        this.jwtService,
+        this.configService,
+        appt.patient,
+        `/dashboard/care-plan-details/${appointmentId}`,
+      );
+      await this.mailerService.sendCarePlanReadyEmail(
+        to,
+        patientName,
+        carePlanLink,
+        this.hasPrescribedMedications((appt as any).medications),
+      );
+    } catch (err) {
+      console.error('[care plan ready] email failed:', err);
+    }
+  }
+
   async signNotes(appointmentId: string, doctorId: string): Promise<AppointmentResponseDto> {
     // Check if appointment exists and belongs to the doctor
     const appointment = await this.prisma.appointment.findFirst({
@@ -993,11 +1156,23 @@ export class AppointmentsService {
       throw new BadRequestException('Notes have already been signed for this appointment.');
     }
 
+    if (!this.canCloseOutVisit((appointment as any).medications)) {
+      throw new BadRequestException(
+        'Prescribe at least one medication for this appointment before signing the notes.',
+      );
+    }
+
     // Set notesSignedAt timestamp
     const updatedAppointment = await this.prisma.appointment.update({
       where: { id: appointmentId },
       data: { notesSignedAt: new Date() },
     });
+
+    // Tell the patient their care plan is ready — unless completing the visit
+    // already told them, so signing afterwards doesn't send a second copy.
+    if (appointment.status !== AppointmentStatus.COMPLETED) {
+      await this.sendCarePlanReadyEmail(appointmentId);
+    }
 
     return updatedAppointment;
   }
@@ -1501,7 +1676,13 @@ export class AppointmentsService {
               }
             }
           },
-          medicalForm: true, // Include medical form data
+          // The patient-portal appointments list doesn't render medical form
+          // content at all (CarePlanDetails fetches its own single-appointment
+          // record separately, with its own medicalForm data, when a patient
+          // drills into one). MedicalForm has 100+ columns of intake-questionnaire
+          // text — pulling the full row for every appointment in the list was
+          // multiplying the response payload for no reason. Existence only.
+          medicalForm: { select: { id: true } },
           rescheduleLogs: { orderBy: { createdAt: 'asc' } } // Reschedule audit history
         },
         skip,
@@ -1956,8 +2137,74 @@ export class AppointmentsService {
       }));
   }
 
+  /**
+   * Doctor self-service: block or unblock ONE slot. Blocking just flips
+   * `Slot.isAvailable` to false — the same field/derivation `getDoctorSlots` already
+   * uses to report a slot as 'blocked' (no appointment + !isAvailable). A booked slot
+   * can never be blocked — that would be indistinguishable from cancelling it — and
+   * un-blocking never touches a booked slot either, since it's not this doctor's to
+   * silently reopen while a patient holds it.
+   */
+  async setSlotAvailability(doctorId: string, slotId: string, isAvailable: boolean): Promise<{ id: string; isAvailable: boolean }> {
+    const slot = await this.prisma.slot.findUnique({
+      where: { id: slotId },
+      include: { schedule: true, appointment: { select: { id: true, status: true } } },
+    });
+
+    if (!slot) {
+      throw new NotFoundException('Slot not found');
+    }
+    if (slot.schedule.doctorId !== doctorId) {
+      throw new BadRequestException('This slot does not belong to you');
+    }
+
+    const hasActiveAppointment = slot.appointment.some((a) => a.status !== 'CANCELLED');
+    if (hasActiveAppointment) {
+      throw new BadRequestException('This slot has a booked appointment and cannot be blocked or unblocked directly');
+    }
+
+    const updated = await this.prisma.slot.update({
+      where: { id: slotId },
+      data: { isAvailable },
+      select: { id: true, isAvailable: true },
+    });
+
+    return updated;
+  }
+
+  /**
+   * Doctor self-service: block or unblock every slot for a whole day at once. Only
+   * touches slots with no active appointment — booked slots are always left exactly
+   * as they are, whichever direction this is called with.
+   */
+  async setDayAvailability(doctorId: string, date: string, isAvailable: boolean): Promise<{ updated: number; skippedBooked: number }> {
+    const targetDate = dateStringToUTC(date);
+    const startOfDay = getUTCMidnight(targetDate);
+    const endOfDay = getUTCEndOfDay(targetDate);
+
+    const schedules = await this.prisma.schedule.findMany({
+      where: { doctorId, date: { gte: startOfDay, lte: endOfDay } },
+      include: {
+        slots: { include: { appointment: { select: { id: true, status: true } } } },
+      },
+    });
+
+    const allSlots = schedules.flatMap((s) => s.slots);
+    const blockable = allSlots.filter((s) => !s.appointment.some((a) => a.status !== 'CANCELLED'));
+    const skippedBooked = allSlots.length - blockable.length;
+
+    if (blockable.length > 0) {
+      await this.prisma.slot.updateMany({
+        where: { id: { in: blockable.map((s) => s.id) } },
+        data: { isAvailable },
+      });
+    }
+
+    return { updated: blockable.length, skippedBooked };
+  }
+
   async adminCreateConfirmed(dto: any): Promise<any> {
-    const { patientId, doctorId, serviceId, primaryServiceId, slotId, appointmentDate, appointmentTime, duration, patientNotes, patientTimezone } = dto;
+    const { patientId, doctorId, serviceId, additionalServiceIds, primaryServiceId, slotId, appointmentDate, appointmentTime, duration, patientNotes, patientTimezone } = dto;
 
     // Basic validations
     const patient = await this.prisma.user.findUnique({ where: { id: patientId }, select: { id: true, isActive: true } });
@@ -1973,6 +2220,31 @@ export class AppointmentsService {
     const service = await this.prisma.service.findUnique({ where: { id: serviceId }, select: { id: true, isActive: true } });
     if (!service || !service.isActive) {
       throw new BadRequestException('Invalid or inactive service');
+    }
+
+    // Multi-select medical services. Each service's own duration is kept only for
+    // display (the additionalServices JSON blob below) — it is NEVER summed into the
+    // booked duration. One slot = one appointment, no matter how many services are
+    // attached to it; the `duration` param above (the slot's own span, or the admin's
+    // custom-time duration) is what's actually booked, unchanged by this selection.
+    let additionalServicesData: Array<{ id: string; name: string; duration: number }> = [];
+    const uniqueAdditionalServiceIds = Array.from(
+      new Set((additionalServiceIds || []).filter((id: string) => id && id !== serviceId)),
+    ) as string[];
+    if (uniqueAdditionalServiceIds.length > 0) {
+      const additionalServices = await this.prisma.service.findMany({
+        where: { id: { in: uniqueAdditionalServiceIds } },
+        select: { id: true, name: true, duration: true, isActive: true },
+      });
+      if (additionalServices.length !== uniqueAdditionalServiceIds.length) {
+        throw new BadRequestException('One or more additional services are invalid');
+      }
+      for (const additional of additionalServices) {
+        if (!additional.isActive) {
+          throw new BadRequestException(`Service "${additional.name}" is not active`);
+        }
+        additionalServicesData.push({ id: additional.id, name: additional.name, duration: additional.duration });
+      }
     }
 
     // Validate primary service
@@ -2004,9 +2276,14 @@ export class AppointmentsService {
       });
       const clash = daySlots.find((s) => toMin(s.startTime) < endMin && startMin < toMin(s.endTime));
       if (clash) {
-        throw new BadRequestException(
-          `A slot already exists in the schedule for ${clash.startTime}–${clash.endTime} on this date. Please book that slot instead of creating a custom time.`,
-        );
+        // Send the raw UTC times as their own fields (same as every slot object already
+        // does) instead of baking them into the sentence — the frontend formats these
+        // with the exact same formatTime() it already uses for the slot dropdown.
+        throw new BadRequestException({
+          message: `A slot already exists in the schedule for ${clash.startTime}–${clash.endTime} on this date. Please book that slot instead of creating a custom time.`,
+          clashStartTime: clash.startTime,
+          clashEndTime: clash.endTime,
+        });
       }
     }
 
@@ -2026,6 +2303,7 @@ export class AppointmentsService {
         appointmentDate: dateStringToUTC(appointmentDate),
         appointmentTime,
         duration,
+        additionalServices: additionalServicesData.length > 0 ? additionalServicesData : undefined,
         status: 'CONFIRMED',
         patientNotes: patientNotes ?? null,
         carePlan: defaultCarePlan,
@@ -2160,6 +2438,37 @@ export class AppointmentsService {
     }
 
     return created as any;
+  }
+
+  /**
+   * Patient books using an admin-granted one-time override: exact same underlying flow as
+   * adminCreateConfirmed (any doctor, custom out-of-slot time, no payment) — just entered
+   * from the patient's own booking page instead of the admin panel. patientId always comes
+   * from the authenticated session (never the request body), so a patient can only ever
+   * book for themselves this way. The override is consumed (flipped back off) the moment
+   * the appointment is successfully created, so it's a one-time grant.
+   */
+  async createWithAdminOverride(userId: string, dto: any): Promise<any> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, isActive: true, adminBookingOverrideEnabled: true },
+    });
+    if (!user || !user.isActive) {
+      throw new BadRequestException('Invalid or inactive patient');
+    }
+    if (!user.adminBookingOverrideEnabled) {
+      throw new ForbiddenException('Admin booking override is not enabled for your account.');
+    }
+
+    const created = await this.adminCreateConfirmed({ ...dto, patientId: userId });
+
+    // Consume the one-time grant — only after the appointment was actually created.
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { adminBookingOverrideEnabled: false },
+    });
+
+    return created;
   }
 
   async getUnassignedAppointments(params: { page?: number; limit?: number; status?: string }): Promise<any[]> {

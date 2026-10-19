@@ -124,9 +124,128 @@ export class AuthService {
     } else if (userType === 'assistant') {
       // Handle assistant doctor login
       return this.loginAssistant(normalizedEmail, password);
+    } else if (userType === 'payment') {
+      // Handle payment-portal staff login (payments.formamd.com)
+      return this.loginPaymentUser(normalizedEmail, password);
+    } else if (userType === 'partner') {
+      // Handle referral-partner login (partners.formamd.com)
+      return this.loginPartner(normalizedEmail, password);
     } else {
-      throw new BadRequestException('Invalid user type. Must be "user", "doctor", "admin", or "assistant"');
+      throw new BadRequestException('Invalid user type. Must be "user", "doctor", "admin", "assistant", "payment", or "partner"');
     }
+  }
+
+  /**
+   * Login referral-partner (partners.formamd.com). Separate role entirely —
+   * these accounts can ONLY access the partner portal; they are not admins,
+   * doctors, patients, or payment staff.
+   */
+  private async loginPartner(email: string, password: string): Promise<any> {
+    const partner = await this.prisma.referralPartner.findUnique({
+      where: { email },
+    });
+
+    if (!partner) {
+      throw new UnauthorizedException('Invalid credentials');
+    }
+    if (!partner.isActive) {
+      throw new UnauthorizedException('Account is deactivated');
+    }
+
+    const isPasswordValid = await bcrypt.compare(password, partner.password);
+    if (!isPasswordValid) {
+      throw new UnauthorizedException('Invalid credentials');
+    }
+
+    const payload = {
+      sub: partner.id,
+      email: partner.email,
+      userType: 'partner',
+    };
+    const accessToken = this.jwtService.sign(payload);
+
+    const { password: _, ...safe } = partner;
+    return {
+      accessToken,
+      partner: safe,
+      mustChangePassword: partner.mustChangePassword,
+      userType: 'partner' as any,
+    };
+  }
+
+  // Partner password changes are handled by PartnersService (self-contained
+  // partner module) via POST /partners/me/change-password.
+
+  /**
+   * Login payment-portal user (payments.formamd.com). Separate role entirely —
+   * these accounts can ONLY access the payments portal; they are not admins,
+   * doctors, or patients.
+   */
+  private async loginPaymentUser(email: string, password: string): Promise<any> {
+    const paymentUser = await this.prisma.paymentUser.findUnique({
+      where: { email },
+    });
+
+    if (!paymentUser) {
+      throw new UnauthorizedException('Invalid credentials');
+    }
+    if (!paymentUser.isActive) {
+      throw new UnauthorizedException('Account is deactivated');
+    }
+
+    const isPasswordValid = await bcrypt.compare(password, paymentUser.password);
+    if (!isPasswordValid) {
+      throw new UnauthorizedException('Invalid credentials');
+    }
+
+    const payload = {
+      sub: paymentUser.id,
+      email: paymentUser.email,
+      userType: 'payment',
+      role: paymentUser.role,
+    };
+    const accessToken = this.jwtService.sign(payload);
+
+    const { password: _, ...safe } = paymentUser;
+    return {
+      accessToken,
+      paymentUser: safe,
+      mustChangePassword: paymentUser.mustChangePassword,
+      userType: 'payment' as any,
+    };
+  }
+
+  /**
+   * Payment user changes their own password (forced first-time change).
+   */
+  async changePaymentUserPassword(paymentUserId: string, currentPassword: string, newPassword: string) {
+    const paymentUser = await this.prisma.paymentUser.findUnique({ where: { id: paymentUserId } });
+    if (!paymentUser) {
+      throw new UnauthorizedException('Payment user not found');
+    }
+
+    const isValid = await bcrypt.compare(currentPassword, paymentUser.password);
+    if (!isValid) {
+      throw new BadRequestException('Current password is incorrect');
+    }
+
+    const errors: string[] = [];
+    if (newPassword.length < 8) errors.push('at least 8 characters');
+    if (!/[A-Z]/.test(newPassword)) errors.push('an uppercase letter');
+    if (!/[a-z]/.test(newPassword)) errors.push('a lowercase letter');
+    if (!/[0-9]/.test(newPassword)) errors.push('a number');
+    if (!/[^A-Za-z0-9]/.test(newPassword)) errors.push('a special character');
+    if (errors.length) {
+      throw new BadRequestException(`Password must contain: ${errors.join(', ')}`);
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 12);
+    await this.prisma.paymentUser.update({
+      where: { id: paymentUserId },
+      data: { password: hashedPassword, mustChangePassword: false },
+    });
+
+    return { message: 'Password changed successfully' };
   }
 
   /**

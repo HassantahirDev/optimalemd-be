@@ -6,6 +6,8 @@ import { AppointmentsService } from '../appointments/appointments.service';
 import { MailerService } from '../mailer/mailer.service';
 import { GoogleCalendarService } from '../google-calendar/google-calendar.service';
 import { ReferralService } from '../referral/referral.service';
+import { PaymentLedgerService } from '../payments/payment-ledger.service';
+import { PartnersService } from '../partners/partners.service';
 import { CreatePaymentIntentDto, ConfirmPaymentDto } from './dto';
 
 @Injectable()
@@ -19,6 +21,8 @@ export class StripeService {
     private mailerService: MailerService,
     private googleCalendarService: GoogleCalendarService,
     private referralService: ReferralService,
+    private paymentLedger: PaymentLedgerService,
+    private partnersService: PartnersService,
   ) {
     const stripeKey = this.configService.get('STRIPE_SECRET_KEY');
     if (!stripeKey) {
@@ -47,12 +51,14 @@ export class StripeService {
    * Create a payment intent for an appointment or welcome order
    */
   async createPaymentIntent(createPaymentIntentDto: CreatePaymentIntentDto) {
-    const { appointmentId, welcomeOrderId, amount, currency = 'usd' } = createPaymentIntentDto;
+    const { appointmentId, welcomeOrderId, currency = 'usd' } = createPaymentIntentDto;
+    let amount = createPaymentIntentDto.amount;
 
     let metadata: any = {};
     let description = '';
 
     let stripeCustomerId: string | undefined;
+    let appointmentCreditApplied: { partnerId: string; appliedCents: number } | null = null;
 
     if (appointmentId) {
       const appointment = await this.prisma.appointment.findUnique({
@@ -66,6 +72,27 @@ export class StripeService {
 
       if (!appointment) throw new NotFoundException('Appointment not found');
       if (appointment.isPaid) throw new BadRequestException('Appointment is already paid');
+
+      // Partner platform credit — same mechanism as the welcome-order signup fee.
+      // Applied authoritatively here (never trust a client-sent discount), reserved
+      // on the Payment row, and only actually spent from the partner's balance once
+      // this payment truly succeeds (see confirmPayment).
+      const appointmentCredit = await this.partnersService.findAvailableCreditByEmail(
+        appointment.patient.primaryEmail || '',
+      );
+      if (appointmentCredit && appointmentCredit.availableCents > 0 && amount) {
+        const amountCents = Math.round(amount * 100);
+        // Stripe requires a minimum charge (50 cents) — cap the applied credit so the
+        // appointment never lands in an unchargeable $0.01–$0.49 gap. A fully-covered
+        // ($0) appointment isn't built yet (unlike the welcome order's confirm-free
+        // path) — this leaves a minimum charge instead of erroring out.
+        const maxApplyCents = Math.max(0, amountCents - 50);
+        const applyCents = Math.min(appointmentCredit.availableCents, maxApplyCents);
+        if (applyCents > 0) {
+          amount = (amountCents - applyCents) / 100;
+          appointmentCreditApplied = { partnerId: appointmentCredit.partnerId, appliedCents: applyCents };
+        }
+      }
 
       const patientName = `${appointment.patient.firstName} ${appointment.patient.lastName}`;
       const doctorName = appointment.doctor ? `Dr. ${appointment.doctor.firstName} ${appointment.doctor.lastName}` : 'Doctor TBD';
@@ -103,6 +130,10 @@ export class StripeService {
       if (!welcomeOrder) throw new NotFoundException('Welcome order not found');
       if (welcomeOrder.paymentStatus === 'SUCCEEDED') throw new BadRequestException('Welcome order is already paid');
 
+      // Authoritative — never trust a client-sent amount here. finalAmount already
+      // reflects any partner platform credit applied at order-creation time.
+      amount = Number(welcomeOrder.finalAmount);
+
       const patientName = welcomeOrder.user
         ? `${welcomeOrder.user.firstName} ${welcomeOrder.user.lastName}`
         : welcomeOrder.email;
@@ -133,17 +164,31 @@ export class StripeService {
 
     if (!amount || amount <= 0) throw new BadRequestException('Amount must be greater than 0');
 
+    // Idempotency key scoped to the one appointment/welcome-order + amount being paid.
+    // A retried or double-submitted request (double-click before the button disables, a
+    // dropped-response retry, the checkout page reloaded mid-flow) reuses THIS SAME
+    // PaymentIntent instead of Stripe creating a second, separate one — the same class of
+    // fix already applied to the medication-subscription flow below (idemBase/-sub keys)
+    // to prevent double charges; this is the appointment/welcome-order counterpart, which
+    // never had the same protection.
+    const idempotencyKey = appointmentId
+      ? `pi-appt-${appointmentId}-${Math.round(amount * 100)}`
+      : `pi-welcome-${welcomeOrderId}-${Math.round(amount * 100)}`;
+
     // Create payment intent
     let paymentIntent;
     try {
-      paymentIntent = await this.stripe.paymentIntents.create({
-        amount: Math.round(amount * 100),
-        currency,
-        metadata,
-        description,
-        ...(stripeCustomerId && { customer: stripeCustomerId }),
-        receipt_email: metadata.patientEmail,
-      });
+      paymentIntent = await this.stripe.paymentIntents.create(
+        {
+          amount: Math.round(amount * 100),
+          currency,
+          metadata,
+          description,
+          ...(stripeCustomerId && { customer: stripeCustomerId }),
+          receipt_email: metadata.patientEmail,
+        },
+        { idempotencyKey },
+      );
     } catch (stripeError: any) {
       console.error('Stripe API Error:', stripeError);
       throw new BadRequestException(
@@ -156,16 +201,38 @@ export class StripeService {
       throw new BadRequestException('Failed to generate payment client secret');
     }
 
-    // Create payment record
+    // Create (or replace) the payment record for this appointment. appointmentId is
+    // @unique on Payment, so a retried/re-opened payment (e.g. clicking "Complete Payment"
+    // again on an unpaid-reservation banner) hits an existing row from the first attempt —
+    // upsert so it's updated with the fresh payment intent instead of crashing on the
+    // unique constraint.
     if (appointmentId) {
-      await this.prisma.payment.create({
-        data: {
+      await this.prisma.payment.upsert({
+        where: { appointmentId },
+        create: {
           appointmentId,
           stripePaymentId: paymentIntent.id,
           amount,
           currency,
           status: 'PENDING',
           paymentIntent: paymentIntent.id,
+          ...(appointmentCreditApplied && {
+            partnerCreditPartnerId: appointmentCreditApplied.partnerId,
+            partnerCreditAppliedCents: appointmentCreditApplied.appliedCents,
+          }),
+        },
+        update: {
+          stripePaymentId: paymentIntent.id,
+          amount,
+          currency,
+          status: 'PENDING',
+          paymentIntent: paymentIntent.id,
+          paidAt: null,
+          ...(appointmentCreditApplied && {
+            partnerCreditPartnerId: appointmentCreditApplied.partnerId,
+            partnerCreditAppliedCents: appointmentCreditApplied.appliedCents,
+            partnerCreditDeducted: false,
+          }),
         },
       });
     }
@@ -206,12 +273,59 @@ export class StripeService {
     }
 
     // Update payment status
-    await this.prisma.payment.update({
+    const updatedPayment = await this.prisma.payment.update({
       where: { paymentIntent: paymentIntentId },
       data: {
         status: 'SUCCEEDED',
         paidAt: new Date(),
       },
+      select: {
+        amount: true,
+        appointmentId: true,
+        partnerCreditPartnerId: true,
+        partnerCreditAppliedCents: true,
+        partnerCreditDeducted: true,
+      },
+    });
+
+    // Actually spend the reserved partner credit now that payment truly succeeded —
+    // never at payment-intent-creation time (see createPaymentIntent). Guarded by
+    // partnerCreditDeducted so a retried confirm-payment call never double-spends.
+    if (
+      updatedPayment.partnerCreditPartnerId &&
+      (updatedPayment.partnerCreditAppliedCents ?? 0) > 0 &&
+      !updatedPayment.partnerCreditDeducted
+    ) {
+      await this.partnersService.spendCredit(updatedPayment.partnerCreditPartnerId, updatedPayment.partnerCreditAppliedCents!);
+      await this.prisma.payment.update({
+        where: { paymentIntent: paymentIntentId },
+        data: { partnerCreditDeducted: true },
+      });
+    }
+
+    // --- Dual-write consult payment into the unified ledger (additive; Part A) ---
+    // Existing Payment logic above is untouched.
+    const paidAppt = await this.prisma.appointment.findUnique({
+      where: { id: updatedPayment.appointmentId },
+      select: { patientId: true },
+    });
+    // No line items for a flat consult fee — the receipt link is what "expand" shows
+    // for this row instead. Best-effort; never blocks the write if Stripe can't be
+    // reached for it right now.
+    const receiptUrl = await this.getReceiptUrl(paymentIntentId);
+    await this.paymentLedger.upsertFromStripe({
+      stripePaymentIntentId: paymentIntentId,
+      userId: paidAppt?.patientId ?? null,
+      appointmentId: updatedPayment.appointmentId,
+      channel: 'PLATFORM',
+      category: 'APPOINTMENT',
+      billing: 'ONE_TIME',
+      amount: Number(updatedPayment.amount),
+      currency: 'usd',
+      status: 'SUCCEEDED',
+      paidAt: new Date(),
+      receiptUrl,
+      note: 'Consultation / appointment payment',
     });
     }
 
@@ -495,6 +609,34 @@ export class StripeService {
     }
   }
 
+  /**
+   * Preview the premium subscription price BEFORE the patient commits — lets the
+   * Subscribe modal show "Partner credit applied: -$X" and the true price up front,
+   * instead of only finding out what was charged after confirming. Read-only; applies
+   * nothing, spends nothing.
+   */
+  async previewSubscriptionPrice(userId: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { primaryEmail: true, email: true },
+    });
+    const priceId = this.configService.get('STRIPE_SUBSCRIPTION_PRICE_ID');
+    if (!priceId) throw new Error('STRIPE_SUBSCRIPTION_PRICE_ID is not configured');
+
+    const price = await this.stripe.prices.retrieve(priceId);
+    const priceCents = price.unit_amount ?? 0;
+
+    const email = user?.primaryEmail || user?.email || '';
+    const credit = email ? await this.partnersService.findAvailableCreditByEmail(email) : null;
+    const creditAppliedCents = credit ? Math.min(credit.availableCents, priceCents) : 0;
+
+    return {
+      priceCents,
+      creditAppliedCents,
+      finalCents: priceCents - creditAppliedCents,
+    };
+  }
+
   async createSubscription(userId: string) {
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
@@ -533,7 +675,7 @@ export class StripeService {
           },
         });
         throw new BadRequestException(
-          'You already have an active premium subscription.',
+          'You already have an active Performance subscription.',
         );
       }
     } else if (user.isSubscribed) {
@@ -570,31 +712,84 @@ export class StripeService {
       throw new Error('STRIPE_SUBSCRIPTION_PRICE_ID is not configured');
     }
 
-    // Create subscription with payment intent
+    // Any partner platform credit left over after the welcome order (or a partner
+    // subscribing directly without ever having one) applies here as a one-time
+    // discount on this subscription's very first invoice — capped at one month's
+    // price so it never goes negative or rolls into a second free month by itself.
+    // A pending Stripe invoice item attaches automatically to the next invoice
+    // generated for this customer, which is exactly the one subscriptions.create is
+    // about to generate below.
+    let partnerCreditForSub: { partnerId: string; appliedCents: number } | null = null;
+    const credit = await this.partnersService.findAvailableCreditByEmail(email);
+    if (credit && credit.availableCents > 0) {
+      try {
+        const price = await this.stripe.prices.retrieve(priceId);
+        const priceCents = price.unit_amount ?? 0;
+        const applyCents = Math.min(credit.availableCents, priceCents);
+        if (applyCents > 0) {
+          await this.stripe.invoiceItems.create(
+            {
+              customer: customerId,
+              amount: -applyCents,
+              currency: 'usd',
+              description: 'Partner platform credit',
+            },
+            // Same 5-minute bucket as the subscription's own idempotency key below —
+            // a retried request reuses this exact invoice item instead of stacking a
+            // second discount onto whatever invoice comes next for this customer.
+            { idempotencyKey: `credit-item-${userId}-${Math.floor(Date.now() / 300_000)}` },
+          );
+          partnerCreditForSub = { partnerId: credit.partnerId, appliedCents: applyCents };
+        }
+      } catch (err: any) {
+        console.error(`Failed to apply partner credit to subscription: ${err.message}`);
+        // Non-fatal — subscription still proceeds at full price.
+      }
+    }
+
+    // Create subscription with payment intent. The "already subscribed" checks above
+    // only close the door on a SECOND request made after the first one already landed
+    // in Stripe — two near-simultaneous requests (double-click, retry) can both pass
+    // that check before either commits. The idempotency key closes that race at the
+    // Stripe API level: a retried/duplicate request within the SAME 5-minute window
+    // reuses this SAME subscription instead of creating a second one, so the customer
+    // can't be signed up (and charged) for two premium subscriptions from one click.
+    // Bucketed by time (not just userId) so a genuine resubscribe later — after a
+    // cancellation, say — isn't blocked by Stripe replaying a stale idempotency key
+    // from the earlier, now-canceled subscription (idempotency keys live 24h on Stripe's
+    // side; a bare per-user key would incorrectly collide with that).
+    const idempotencyKey = `sub-premium-${userId}-${Math.floor(Date.now() / 300_000)}`;
     let subscription: Stripe.Subscription;
     try {
-      subscription = await this.stripe.subscriptions.create({
-        customer: customerId,
-        items: [{ price: priceId }],
-        payment_behavior: 'default_incomplete',
-        payment_settings: {
-          save_default_payment_method: 'on_subscription',
-          payment_method_types: ['card'],
+      subscription = await this.stripe.subscriptions.create(
+        {
+          customer: customerId,
+          items: [{ price: priceId }],
+          payment_behavior: 'default_incomplete',
+          payment_settings: {
+            save_default_payment_method: 'on_subscription',
+            payment_method_types: ['card'],
+          },
+          expand: ['latest_invoice.confirmation_secret'],
+          description: `Performance Subscription – ${`${user.firstName || ''} ${user.lastName || ''}`.trim()}`,
+          metadata: {
+            userId: user.id,
+            patientName: `${user.firstName || ''} ${user.lastName || ''}`.trim(),
+            patientEmail: user.primaryEmail || user.email || '',
+            type: 'premium_subscription',
+          },
         },
-        expand: ['latest_invoice.confirmation_secret'],
-        description: `Premium Subscription – ${`${user.firstName || ''} ${user.lastName || ''}`.trim()}`,
-        metadata: {
-          userId: user.id,
-          patientName: `${user.firstName || ''} ${user.lastName || ''}`.trim(),
-          patientEmail: user.primaryEmail || user.email || '',
-          type: 'premium_subscription',
-        },
-      });
+        { idempotencyKey },
+      );
     } catch (stripeError: any) {
       console.error('Stripe subscription creation error:', stripeError);
       throw new BadRequestException(
         stripeError.message || 'Failed to create subscription with Stripe'
       );
+    }
+
+    if (partnerCreditForSub) {
+      await this.partnersService.spendCredit(partnerCreditForSub.partnerId, partnerCreditForSub.appliedCents);
     }
 
     // The invoice's OWN payment. The clover API exposes it as
@@ -759,6 +954,7 @@ export class StripeService {
     let updatedSubscription: Stripe.Subscription;
     let invoicePeriodStart: number | null = null;
     let invoicePeriodEnd: number | null = null;
+    let hostedInvoiceUrl: string | null = null;
     
     try {
       updatedSubscription = await this.stripe.subscriptions.retrieve(subscriptionId);
@@ -769,6 +965,7 @@ export class StripeService {
         try {
           const invoice = await this.stripe.invoices.retrieve(invoiceId);
           const inv = invoice as any;
+          hostedInvoiceUrl = inv.hosted_invoice_url || null;
           if (inv.period_start) {
             invoicePeriodStart = inv.period_start;
             console.log(`📅 Found period_start in invoice: ${invoicePeriodStart}`);
@@ -835,6 +1032,55 @@ export class StripeService {
     });
 
     console.log(`✅ User subscription updated successfully in database`);
+
+    // Write the premium payment into the unified ledger IMMEDIATELY, so it shows
+    // in the payments platform right away — not only after a webhook/sync. This is
+    // idempotent on the payment-intent id, so the webhook (which also writes the
+    // old SubscriptionTransaction table) and the sync later update the SAME row —
+    // no duplicate, and the sync won't relabel it IMPORTED because the type is set.
+    try {
+      let cardBrand: string | null = null;
+      let cardLast4: string | null = null;
+      const chargeId =
+        typeof paymentIntent.latest_charge === 'string'
+          ? paymentIntent.latest_charge
+          : (paymentIntent.latest_charge as any)?.id;
+      if (chargeId) {
+        try {
+          const charge = await this.stripe.charges.retrieve(chargeId);
+          cardBrand = charge.payment_method_details?.card?.brand ?? null;
+          cardLast4 = charge.payment_method_details?.card?.last4 ?? null;
+        } catch {
+          /* card details are non-critical; the sync fills them later */
+        }
+      }
+      await this.paymentLedger.upsertFromStripe({
+        stripePaymentIntentId: paymentIntentId,
+        stripeInvoiceId: invoiceId || null,
+        stripeSubscriptionId: subscriptionId,
+        stripeCustomerId:
+          typeof paymentIntent.customer === 'string'
+            ? paymentIntent.customer
+            : (paymentIntent.customer as any)?.id ?? null,
+        userId,
+        channel: 'PLATFORM',
+        category: 'MEMBERSHIP',
+        billing: 'SUBSCRIPTION',
+        amount: paymentIntent.amount / 100,
+        currency: paymentIntent.currency || 'usd',
+        status: 'SUCCEEDED',
+        cardBrand,
+        cardLast4,
+        note: 'Performance membership subscription',
+        // Without this the row has nothing to link to in Billing History.
+        receiptUrl: hostedInvoiceUrl,
+        paidAt: new Date(),
+        createdByType: 'patient',
+      });
+      console.log(`🧾 [LEDGER] Premium subscription payment written for user ${userId}`);
+    } catch (ledgerErr: any) {
+      console.error('[ledger] premium confirm dual-write failed:', ledgerErr.message);
+    }
 
     // Send subscription confirmation email
     try {
@@ -1412,6 +1658,10 @@ export class StripeService {
     // We find the authoritative premium subscription and adopt it, so a cancellation made
     // directly in Stripe (or a missed webhook) is always reflected here.
     if (user.stripeCustomerId) {
+      // Captured BEFORE the lookup below can overwrite user.stripeSubscriptionId — this is
+      // what tells us whether the DB was ever pointing at a real Stripe subscription.
+      const hadStripeSubscriptionId = !!user.stripeSubscriptionId;
+
       const livePremium = await this.findPremiumSubscriptionFromStripe(
         user.stripeCustomerId,
       );
@@ -1423,8 +1673,9 @@ export class StripeService {
             data: { stripeSubscriptionId: livePremium.id },
           });
         }
-      } else {
-        // No premium subscription exists in Stripe at all — ensure DB reflects unsubscribed.
+      } else if (hadStripeSubscriptionId) {
+        // A real Stripe subscription this user WAS linked to has since disappeared/canceled —
+        // genuine cleanup case. Ensure DB reflects unsubscribed.
         if (user.isSubscribed || user.stripeSubscriptionId) {
           await this.prisma.user.update({
             where: { id: userId },
@@ -1439,6 +1690,10 @@ export class StripeService {
         user.subscriptionStatus = 'canceled';
         user.stripeSubscriptionId = null;
       }
+      // else: no Stripe subscription was ever linked (stripeSubscriptionId was already
+      // null) and Stripe has none either — nothing to reconcile. In particular this
+      // leaves an admin-granted premium (isSubscribed=true, no stripeSubscriptionId)
+      // untouched instead of silently reverting it to unsubscribed.
     }
 
     let stripeSubscription: any = null;
@@ -1698,15 +1953,39 @@ export class StripeService {
             : null,
       };
 
-      await this.prisma.subscriptionTransaction.upsert({
+      const subTxn = await this.prisma.subscriptionTransaction.upsert({
         where: { stripeInvoiceId: invoice.id },
         create: { stripeInvoiceId: invoice.id, ...data },
         update: data,
+        select: { id: true },
       });
 
       console.log(
         `🧾 [LEDGER] Recorded premium subscription transaction for invoice ${invoice.id} (${status})`,
       );
+
+      // --- Dual-write into the unified payment ledger (additive; Part A) ---
+      // Existing subscriptionTransaction logic above is untouched.
+      await this.paymentLedger.upsertFromStripe({
+        stripeInvoiceId: invoice.id,
+        stripePaymentIntentId: data.stripePaymentIntentId,
+        stripeSubscriptionId: data.stripeSubscriptionId,
+        stripeCustomerId: data.stripeCustomerId,
+        userId,
+        subscriptionTransactionId: subTxn.id,
+        channel: 'PLATFORM',
+        category: 'MEMBERSHIP',
+        billing: 'SUBSCRIPTION',
+        amount: data.amount,
+        currency: data.currency,
+        status,
+        cardBrand: data.cardBrand,
+        cardLast4: data.cardLast4,
+        receiptUrl: data.receiptUrl,
+        hostedInvoiceUrl: data.invoiceUrl,
+        paidAt: data.paidAt,
+        note: 'Performance membership subscription',
+      });
     } catch (e: any) {
       // Ledger must never break the webhook flow.
       console.error(`❌ [LEDGER] Failed to record subscription transaction: ${e.message}`);
@@ -1883,7 +2162,21 @@ export class StripeService {
         case 'invoice.payment_succeeded': {
           // This fires on successful monthly renewal payments
           const invoice = event.data.object as any;
-          
+
+          // --- Part D: platform-emitted invoices (channel=INVOICE) ---
+          // These carry our metadata and are NOT subscriptions. Flip the PENDING
+          // ledger record to SUCCEEDED and run the med lifecycle if applicable.
+          // Premium-subscription handling below is left byte-for-byte unchanged.
+          if (invoice.metadata?.formamd_category) {
+            await this.paymentLedger.markInvoiceStatus(invoice.id, 'SUCCEEDED', {
+              paidAt: invoice.status_transitions?.paid_at
+                ? new Date(invoice.status_transitions.paid_at * 1000)
+                : new Date(),
+              receiptUrl: invoice.hosted_invoice_url || null,
+            });
+            break;
+          }
+
           if (!invoice.subscription) {
             console.log('ℹ️  Invoice not related to subscription, skipping');
             return { received: true };
@@ -1970,7 +2263,13 @@ export class StripeService {
         case 'invoice.payment_failed': {
           // This fires when monthly renewal payment fails
           const invoice = event.data.object as any;
-          
+
+          // --- Part D: platform-emitted invoices (channel=INVOICE) ---
+          if (invoice.metadata?.formamd_category) {
+            await this.paymentLedger.markInvoiceStatus(invoice.id, 'FAILED');
+            break;
+          }
+
           if (!invoice.subscription) {
             console.log('ℹ️  Invoice not related to subscription, skipping');
             return { received: true };
@@ -2010,6 +2309,22 @@ export class StripeService {
 
           // Ledger: record this failed premium-subscription charge (no-op for non-premium invoices).
           await this.recordPremiumSubscriptionTransaction(invoice, sub, 'FAILED');
+          break;
+        }
+
+        case 'charge.refunded': {
+          // --- Part D: reflect refunds in the ledger (previously untracked) ---
+          const charge = event.data.object as any;
+          await this.paymentLedger.markRefunded(
+            {
+              stripeChargeId: charge.id,
+              stripePaymentIntentId:
+                typeof charge.payment_intent === 'string'
+                  ? charge.payment_intent
+                  : charge.payment_intent?.id || null,
+            },
+            charge.amount_refunded != null ? charge.amount_refunded / 100 : null,
+          );
           break;
         }
 
@@ -2073,7 +2388,11 @@ export class StripeService {
     // Get medications from appointment
     const medicationsData = (appointment as any).medications as Record<string, any[]> | null;
     
-    if (!medicationsData || Object.keys(medicationsData).length === 0) {
+    const prescribedCategories = medicationsData
+      ? Object.entries(medicationsData).filter(([, meds]) => Array.isArray(meds) && meds.length > 0)
+      : [];
+
+    if (!medicationsData || prescribedCategories.length === 0) {
       return {
         items: [],
         subtotal: 0,
@@ -2086,7 +2405,11 @@ export class StripeService {
 
     // Fetch medication details from database
     const medicationIds: string[] = [];
-    Object.values(medicationsData).forEach((meds: any[]) => {
+    // The medications JSON can carry a "__noMedications" marker alongside real
+    // therapy categories — it is a boolean, not an array, so every consumer here
+    // has to skip non-array values or it throws on .forEach.
+    Object.values(medicationsData).forEach((meds: any) => {
+      if (!Array.isArray(meds)) return;
       meds.forEach((med: any) => {
         if (typeof med === 'object' && med.id) {
           medicationIds.push(med.id);
@@ -2121,22 +2444,34 @@ export class StripeService {
       route?: string | null;
       standardPrice: number;
       membershipPrice: number | null;
+      priceOverride: number | null;
     }> = [];
 
-    Object.entries(medicationsData).forEach(([category, meds]) => {
+    Object.entries(medicationsData).forEach(([category, meds]: [string, any]) => {
+      if (!Array.isArray(meds)) return;
       meds.forEach((med: any) => {
         if (typeof med === 'object' && med.id) {
           const medication = medications.find(m => m.id === med.id);
           if (medication) {
             const standardPrice = Number(medication.standardPrice);
             const membershipPrice = medication.membershipPrice ? Number(medication.membershipPrice) : null;
-            
+            // The doctor can adjust the amount for this prescription (a different
+            // dose than the catalogue default, say). It is stored on the
+            // appointment's medications JSON, never written back to the catalogue,
+            // and it is what the patient is actually charged.
+            const rawOverride = Number(med.priceOverride);
+            const priceOverride =
+              med.priceOverride !== null &&
+              med.priceOverride !== undefined &&
+              med.priceOverride !== '' &&
+              Number.isFinite(rawOverride) &&
+              rawOverride >= 0
+                ? Math.round(rawOverride * 100) / 100
+                : null;
+            const effective = priceOverride ?? (membershipPrice ?? standardPrice);
+
             standardTotal += standardPrice;
-            if (membershipPrice !== null) {
-              memberTotal += membershipPrice;
-            } else {
-              memberTotal += standardPrice;
-            }
+            memberTotal += effective;
 
             tempItems.push({
               medicationId: medication.id,
@@ -2147,6 +2482,7 @@ export class StripeService {
               route: medication.route,
               standardPrice,
               membershipPrice,
+              priceOverride,
             });
           }
         }
@@ -2176,25 +2512,32 @@ export class StripeService {
       membershipPrice: number | null;
       price: number;
       discount: number;
+      priceOverride: number | null;
     }> = [];
 
     let subtotal = 0;
     let totalDiscount = 0;
 
     tempItems.forEach((tempItem) => {
-      // If payment is made, use the prices that were actually paid
-      // Otherwise, use current subscription status
-      const shouldUseMemberPrice = usePaidPrices 
-        ? paidAsSubscribed 
-        : (isSubscribed && tempItem.membershipPrice !== null);
-      
-      const price = shouldUseMemberPrice && tempItem.membershipPrice !== null 
-        ? tempItem.membershipPrice 
-        : tempItem.standardPrice;
-      
-      const discount = shouldUseMemberPrice && tempItem.membershipPrice !== null 
-        ? tempItem.standardPrice - tempItem.membershipPrice 
-        : 0;
+      // Member pricing is now the ONLY pricing — medications require a premium
+      // membership, so there is no non-member rate to fall back to. Where a
+      // medication has no membershipPrice recorded yet, its standardPrice still
+      // applies (left as-is pending the catalogue pricing rework).
+      // A doctor-set amount for this prescription overrides the catalogue price.
+      const price = tempItem.priceOverride !== null
+        ? tempItem.priceOverride
+        : tempItem.membershipPrice !== null
+          ? tempItem.membershipPrice
+          : tempItem.standardPrice;
+
+      // Kept so the UI can still show what the old non-member rate would have
+      // been; it is never added to or subtracted from the amount charged. An
+      // overridden line has no meaningful comparison, so it shows none.
+      const discount = tempItem.priceOverride !== null
+        ? 0
+        : tempItem.membershipPrice !== null
+          ? tempItem.standardPrice - tempItem.membershipPrice
+          : 0;
 
       items.push({
         medicationId: tempItem.medicationId,
@@ -2205,6 +2548,7 @@ export class StripeService {
         route: tempItem.route,
         standardPrice: tempItem.standardPrice,
         membershipPrice: tempItem.membershipPrice,
+        priceOverride: tempItem.priceOverride,
               price,
               discount,
             });
@@ -2212,6 +2556,19 @@ export class StripeService {
             subtotal += price;
             totalDiscount += discount;
     });
+
+    // Medications are member-only. A patient who isn't premium yet has to start
+    // that membership as part of paying this invoice, so the invoice shows both
+    // monthly charges up front rather than surprising them at checkout.
+    const requiresPremium = !isSubscribed && !usePaidPrices;
+    let premiumMonthly = 0;
+    if (requiresPremium) {
+      try {
+        premiumMonthly = await this.getPremiumMonthlyPrice();
+      } catch (err) {
+        console.error('Failed to read premium membership price for invoice:', err);
+      }
+    }
 
     return {
       items,
@@ -2221,7 +2578,20 @@ export class StripeService {
       discount: totalDiscount,
       currency: 'usd',
       isPaid: usePaidPrices, // Indicates if showing paid prices
+      // Premium membership, billed as its own monthly subscription alongside
+      // the medication one. Zero/false once the patient is already a member.
+      requiresPremium,
+      premiumMonthly,
+      grandTotal: subtotal + premiumMonthly,
     };
+  }
+
+  /** Monthly premium membership price, in dollars, straight from Stripe. */
+  private async getPremiumMonthlyPrice(): Promise<number> {
+    const priceId = this.configService.get('STRIPE_SUBSCRIPTION_PRICE_ID');
+    if (!priceId) throw new Error('STRIPE_SUBSCRIPTION_PRICE_ID is not configured');
+    const price = await this.stripe.prices.retrieve(priceId);
+    return (price.unit_amount ?? 0) / 100;
   }
 
   /**
@@ -2349,6 +2719,11 @@ export class StripeService {
       appointmentId,
     );
     if (existingActiveSub) {
+      // findActiveMedicationSubscriptionFromStripe treats past_due and unpaid as
+      // "live" too — those block a second subscription but must NOT read as paid,
+      // so only a genuinely billing subscription stamps SUCCEEDED.
+      const isBilling = ['active', 'trialing'].includes(existingActiveSub.status);
+
       await this.prisma.medicationPayment.upsert({
         where: { appointmentId },
         create: {
@@ -2357,13 +2732,18 @@ export class StripeService {
           stripeCustomerId: customerId,
           amount: invoice.total,
           currency: invoice.currency,
-          status: 'SUCCEEDED',
+          status: isBilling ? 'SUCCEEDED' : 'PENDING',
           subscriptionStatus: existingActiveSub.status as any,
         },
         update: {
           stripeSubscriptionId: existingActiveSub.id,
           stripeCustomerId: customerId,
           subscriptionStatus: existingActiveSub.status as any,
+          // Without this the row keeps whatever status it had from an earlier
+          // abandoned attempt (usually PENDING), and getMedicationPaymentStatus
+          // returns paid:false — so the portal kept offering "Pay invoice" for a
+          // subscription Stripe was already billing.
+          ...(isBilling ? { status: 'SUCCEEDED' as const } : {}),
         },
       });
       throw new BadRequestException(
@@ -2431,6 +2811,32 @@ export class StripeService {
     console.log(
       `✅ Prepared ${subscriptionItems.length} itemized medication line(s) for appointment ${appointmentId} (total $${invoice.total})`,
     );
+
+    // Partner platform credit — applies to this medication order's FIRST invoice only
+    // (never a recurring month), same mechanism as the premium subscription. Capped at
+    // this invoice's total so it never goes negative.
+    let medCreditApplied: { partnerId: string; appliedCents: number } | null = null;
+    const medCredit = await this.partnersService.findAvailableCreditByEmail(email);
+    if (medCredit && medCredit.availableCents > 0) {
+      const invoiceCents = Math.round(invoice.total * 100);
+      const applyCents = Math.min(medCredit.availableCents, invoiceCents);
+      if (applyCents > 0) {
+        try {
+          await this.stripe.invoiceItems.create(
+            {
+              customer: customerId,
+              amount: -applyCents,
+              currency: invoice.currency,
+              description: 'Partner platform credit',
+            },
+            { idempotencyKey: `${idemBase}-credit-item` },
+          );
+          medCreditApplied = { partnerId: medCredit.partnerId, appliedCents: applyCents };
+        } catch (err: any) {
+          console.error(`Failed to apply partner credit to medication order: ${err.message}`);
+        }
+      }
+    }
 
     // Create subscription with payment intent
     let subscription: Stripe.Subscription;
@@ -2583,6 +2989,11 @@ export class StripeService {
           currency: invoice.currency,
           status: 'PENDING',
           paymentIntent: paymentIntent.id,
+          ...(medCreditApplied && {
+            partnerCreditPartnerId: medCreditApplied.partnerId,
+            partnerCreditAppliedCents: medCreditApplied.appliedCents,
+            partnerCreditDeducted: false,
+          }),
         },
       });
     } else {
@@ -2596,8 +3007,26 @@ export class StripeService {
           currency: invoice.currency,
           status: 'PENDING',
           paymentIntent: paymentIntent.id,
+          ...(medCreditApplied && {
+            partnerCreditPartnerId: medCreditApplied.partnerId,
+            partnerCreditAppliedCents: medCreditApplied.appliedCents,
+          }),
         },
       });
+    }
+
+    // Medications are member-only. If this patient isn't premium yet, start that
+    // membership in the same checkout — as its own subscription, so cancelling
+    // medications later doesn't also cancel their membership. Two subscriptions,
+    // two secrets, confirmed back-to-back with the one card they enter.
+    let premium: { clientSecret: string; subscriptionId: string; amount: number } | null = null;
+    if (!invoice.isSubscribed) {
+      const premiumResult = await this.createSubscription(userId);
+      premium = {
+        clientSecret: (premiumResult as any).clientSecret,
+        subscriptionId: (premiumResult as any).subscriptionId,
+        amount: (premiumResult as any).amount ?? 0,
+      };
     }
 
     return {
@@ -2606,6 +3035,8 @@ export class StripeService {
       subscriptionId: subscription.id,
       amount: invoice.total,
       currency: invoice.currency,
+      // Present only when a premium membership had to be started alongside.
+      premium,
     };
   }
 
@@ -2759,6 +3190,20 @@ export class StripeService {
       },
     });
 
+    // Actually spend the reserved partner credit now that payment truly succeeded —
+    // guarded so a retried confirm-payment call never double-spends.
+    if (
+      payment.partnerCreditPartnerId &&
+      (payment.partnerCreditAppliedCents ?? 0) > 0 &&
+      !payment.partnerCreditDeducted
+    ) {
+      await this.partnersService.spendCredit(payment.partnerCreditPartnerId, payment.partnerCreditAppliedCents!);
+      await this.prisma.medicationPayment.update({
+        where: { id: payment.id },
+        data: { partnerCreditDeducted: true },
+      });
+    }
+
     // Calculate invoice to get item details for email
     const invoice = await this.calculateMedicationInvoice(payment.appointmentId, userId);
 
@@ -2783,6 +3228,56 @@ export class StripeService {
       // Log error but don't fail the payment confirmation
       console.error('Failed to send medication payment confirmation email:', emailError);
     }
+
+    // --- Dual-write into the unified payment ledger (additive; Part A + B) ---
+    // Existing medicationPayment logic above is untouched. Medication line items
+    // feed the set-based MedicationOrder lifecycle inside the ledger service.
+    const isMedSubscription = !!payment.stripeSubscriptionId;
+    // Without this, the live Stripe invoice for this same charge never gets matched
+    // against this ledger row (getPatientHistory dedupes by stripeInvoiceId) and shows
+    // up a second time in Billing History as its own "1 × ... (at $X/month)" row —
+    // same invoiceId this PI was tagged with at createMedicationPaymentIntent time.
+    const medInvoiceId = (paymentIntent.metadata?.invoiceId as string) || null;
+
+    // Same reason as the membership write: Billing History needs a URL to link
+    // to, otherwise the row has no invoice to open.
+    let medHostedInvoiceUrl: string | null = null;
+    if (medInvoiceId) {
+      try {
+        const medInv = (await this.stripe.invoices.retrieve(medInvoiceId)) as any;
+        medHostedInvoiceUrl = medInv.hosted_invoice_url || null;
+      } catch (err: any) {
+        console.error(`Could not read hosted invoice url for ${medInvoiceId}: ${err.message}`);
+      }
+    }
+    await this.paymentLedger.upsertFromStripe({
+      stripePaymentIntentId: paymentIntentId,
+      stripeInvoiceId: medInvoiceId,
+      stripeSubscriptionId: payment.stripeSubscriptionId,
+      stripeCustomerId: payment.stripeCustomerId,
+      userId,
+      appointmentId: payment.appointmentId,
+      medicationPaymentId: payment.id,
+      channel: 'PLATFORM',
+      category: 'MEDICATION',
+      billing: isMedSubscription ? 'SUBSCRIPTION' : 'ONE_TIME',
+      amount: Number(payment.amount),
+      currency: 'usd',
+      status: 'SUCCEEDED',
+      paidAt: new Date(),
+      note: 'Medication order',
+      receiptUrl: medHostedInvoiceUrl,
+      lineItems: (invoice.items || []).map((it: any) => ({
+        description: [it.name, it.strength, it.dose].filter(Boolean).join(' '),
+        medicationId: it.medicationId ?? null,
+        quantity: 1,
+        unitAmount: Number(it.price ?? 0),
+        isSubscription: isMedSubscription,
+        dosageSnapshot: [it.strength, it.dose, it.frequency, it.route]
+          .filter(Boolean)
+          .join(' ') || null,
+      })),
+    });
 
     return {
       success: true,
@@ -2879,15 +3374,28 @@ export class StripeService {
         // Use calculated period end or fallback to currentPeriodEnd
         const finalPeriodEnd = calculatedPeriodEnd || currentPeriodEnd;
 
-        // Note: These fields will be available after Prisma client regeneration
+        // Stripe is the source of truth. If it is actively billing this
+        // subscription, the local row must say SUCCEEDED — otherwise `paid`
+        // below stays false and the portal keeps offering "Pay invoice" for a
+        // subscription the patient is already being charged for. Self-heals rows
+        // left PENDING by an abandoned first attempt.
+        const stripeIsBilling = subscription.status === 'active' || subscription.status === 'trialing';
+        const reconciledStatus =
+          stripeIsBilling && payment.status !== 'SUCCEEDED' ? { status: 'SUCCEEDED' as const } : {};
+
         await this.prisma.medicationPayment.update({
           where: { appointmentId },
           data: {
             subscriptionStatus: dbSubscriptionStatus as any,
             subscriptionEndDate: finalPeriodEnd as any,
             subscriptionCanceledAt: (cancelAtPeriodEnd ? ((payment as any).subscriptionCanceledAt || new Date()) : null) as any,
+            ...reconciledStatus,
           },
         });
+        if (Object.keys(reconciledStatus).length) {
+          payment.status = 'SUCCEEDED' as any;
+          console.log(`✅ Reconciled medication payment ${appointmentId} to SUCCEEDED from live Stripe subscription`);
+        }
       } catch (error: any) {
         console.error('Error retrieving subscription status:', error);
         // If subscription doesn't exist in Stripe, clean up stale data
@@ -2932,6 +3440,23 @@ export class StripeService {
    * Cancel medication subscription for an appointment
    * This cancels the Stripe subscription and updates the payment record
    */
+  // Flip a subscription's ACTIVE medication order to PAST when it's cancelled, so
+  // the set-based active-medication model matches the legacy/care-plan view.
+  private async flipMedicationOrderToPast(
+    stripeSubscriptionId: string | null,
+    endedAt: Date | null,
+  ): Promise<void> {
+    if (!stripeSubscriptionId) return;
+    try {
+      await this.prisma.medicationOrder.updateMany({
+        where: { stripeSubscriptionId, status: 'ACTIVE' as any },
+        data: { status: 'PAST' as any, endedAt: endedAt ?? new Date() },
+      });
+    } catch (err: any) {
+      console.error(`[medication] flip order to PAST failed: ${err?.message}`);
+    }
+  }
+
   async cancelMedicationSubscription(appointmentId: string, userId: string, userType?: string) {
     // Get appointment to verify authorization
     const appointment = await this.prisma.appointment.findUnique({
@@ -2993,6 +3518,7 @@ export class StripeService {
             subscriptionStatus: 'canceled' as any,
           },
         });
+        await this.flipMedicationOrderToPast(payment.stripeSubscriptionId, new Date());
         return {
           success: true,
           message: 'Medication subscription was already canceled',
@@ -3074,6 +3600,11 @@ export class StripeService {
           where: { appointmentId },
           data: updateData,
         });
+
+        // Reflect the cancellation in the unified active-medication model so the
+        // set-based orders match the care plan / legacy view (which flips to PAST
+        // on cancellation). The paid charge in the ledger stays SUCCEEDED.
+        await this.flipMedicationOrderToPast(payment.stripeSubscriptionId, subscriptionEndDate);
 
         // Verify the update
         const verifyUpdated = await this.prisma.medicationPayment.findUnique({
@@ -3265,6 +3796,27 @@ export class StripeService {
     } catch (error: any) {
       console.error(`❌ Error reactivating medication subscription: ${error.message}`);
       throw new BadRequestException(`Failed to reactivate medication subscription: ${error.message}`);
+    }
+  }
+
+  /**
+   * Stripe's own hosted receipt URL for a succeeded PaymentIntent's charge — lets a
+   * ledger row that has no line items (signup, appointment) still offer something
+   * concrete to view on expand instead of nothing. Best-effort: never throws, just
+   * returns null if the charge/receipt isn't available for any reason.
+   */
+  async getReceiptUrl(paymentIntentId: string): Promise<string | null> {
+    try {
+      const pi = await this.stripe.paymentIntents.retrieve(paymentIntentId, {
+        expand: ['latest_charge'],
+      });
+      const charge = pi.latest_charge;
+      if (charge && typeof charge !== 'string') {
+        return (charge as Stripe.Charge).receipt_url ?? null;
+      }
+      return null;
+    } catch {
+      return null;
     }
   }
 }

@@ -152,4 +152,47 @@ export class AdminManagementController {
     const result = await this.adminManagementService.deleteAssistant(id);
     return { success: true, message: result.message };
   }
+
+  // --- Payment-portal user management (super-admin only) ---
+  // NOTE: managing these accounts does NOT grant portal access.
+  @Get('payment-users')
+  @ApiOperation({ summary: 'List payment-portal users' })
+  async listPaymentUsers() {
+    const data = await this.adminManagementService.listPaymentUsers();
+    return { success: true, data };
+  }
+
+  @Post('payment-users')
+  @HttpCode(HttpStatus.CREATED)
+  @ApiOperation({ summary: 'Create a payment-portal user' })
+  async createPaymentUser(
+    @Body()
+    body: { email: string; password: string; firstName?: string; lastName?: string; role?: string },
+  ) {
+    const data = await this.adminManagementService.createPaymentUser(body);
+    return { success: true, message: 'Payment user created successfully', data };
+  }
+
+  @Put('payment-users/:id')
+  @ApiOperation({ summary: 'Update a payment-portal user (details / role / status)' })
+  async updatePaymentUser(@Param('id') id: string, @Body() body: any) {
+    const data = await this.adminManagementService.updatePaymentUser(id, body);
+    return { success: true, message: 'Payment user updated successfully', data };
+  }
+
+  @Put('payment-users/:id/reset-password')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Reset a payment-portal user password' })
+  async resetPaymentUserPassword(@Param('id') id: string, @Body() body: { newPassword: string }) {
+    const result = await this.adminManagementService.resetPaymentUserPassword(id, body.newPassword);
+    return { success: true, message: result.message };
+  }
+
+  @Delete('payment-users/:id')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Delete a payment-portal user' })
+  async deletePaymentUser(@Param('id') id: string) {
+    const result = await this.adminManagementService.deletePaymentUser(id);
+    return { success: true, message: result.message };
+  }
 }

@@ -42,6 +42,9 @@ type LabTrendAnalysisResult = {
     }>;
   }>;
   limitations: string[];
+  // Which prompt version produced this note. Stored inside the note itself so a
+  // prompt change can invalidate cached analyses without a schema change.
+  analysisVersion?: string;
 };
 
 @Injectable()
@@ -59,12 +62,14 @@ export class AiService {
     [
       'https://formamd-production-cpbfg3cdewf9grat.canadacentral-01.azurewebsites.net/api',
       'https://optimaleproduction-ckfmbfgyccfjg3dc.canadacentral-01.azurewebsites.net/api',
+      // Staging, so labs uploaded there are analysable too.
+      'https://staging-formamd-dzfzabbjc0gyfed4.westus3-01.azurewebsites.net/api',
     ].join(',')
   )
     .split(',')
     .map((s) => s.trim().replace(/\/+$/, ''))
     .filter(Boolean);
-  private readonly labTrendAnalysisVersion = 'lab-trends-v3-structured-json-ui';
+  private readonly labTrendAnalysisVersion = 'lab-trends-v4-psa';
 
   constructor(
     private readonly configService: ConfigService,
@@ -270,6 +275,9 @@ export class AiService {
       .find((analysis) => {
         if (!analysis.trendData) return false;
         if (this.isUnreadableLabTrendNote(analysis.labTrendAnalysisNote)) return false;
+        // An analysis from an older prompt is missing whatever that prompt didn't
+        // ask for (PSA, before v4), so it cannot stand in for a current one.
+        if (!this.isCurrentAnalysisVersion(analysis.trendData)) return false;
 
         return analysis.labTrendAnalysisHash === sourceHash ||
           this.cachedTrendCoversFiles(analysis.trendData, files);
@@ -280,6 +288,7 @@ export class AiService {
       const trendData = {
         ...reusablePatientAnalysis.trendData,
         generatedAt: analyzedAt.toISOString(),
+        analysisVersion: this.labTrendAnalysisVersion,
       };
       await this.prisma.appointment.updateMany({
         where: { patientId },
@@ -299,11 +308,17 @@ export class AiService {
       };
     }
 
-    if (!force && canonicalCachedTrendData && !hasUnreadableCachedNote) {
+    if (
+      !force &&
+      canonicalCachedTrendData &&
+      !hasUnreadableCachedNote &&
+      this.isCurrentAnalysisVersion(canonicalCachedTrendData)
+    ) {
       const analyzedAt = appointment.labTrendAnalysisAt || new Date();
       const trendData = {
         ...canonicalCachedTrendData,
         generatedAt: analyzedAt.toISOString(),
+        analysisVersion: this.labTrendAnalysisVersion,
       };
       await this.prisma.appointment.updateMany({
         where: { patientId },
@@ -331,14 +346,18 @@ export class AiService {
     });
     const freshTrendData =
       this.canonicalizeLabTrendDates(rawFreshTrendData, files) || rawFreshTrendData;
-    const mergedTrendData = !force && canonicalCachedTrendData
-      ? this.mergeLabTrendAnalysis(canonicalCachedTrendData, freshTrendData)
-      : freshTrendData;
+    const mergedTrendData =
+      !force &&
+      canonicalCachedTrendData &&
+      this.isCurrentAnalysisVersion(canonicalCachedTrendData)
+        ? this.mergeLabTrendAnalysis(canonicalCachedTrendData, freshTrendData)
+        : freshTrendData;
 
     const analyzedAt = new Date();
     const trendData = {
       ...mergedTrendData,
       generatedAt: analyzedAt.toISOString(),
+      analysisVersion: this.labTrendAnalysisVersion,
     };
     await this.prisma.appointment.updateMany({
       where: { patientId },
@@ -462,14 +481,30 @@ ${JSON.stringify(labTimeline, null, 2)}
 
 Task:
 1. Read all attached lab result files, including scanned/visual PDF pages and table images.
-2. Pull historical values and dates for these groups only:
-   - Testosterone
-   - Estradiol
-   - Lipids
-   - A1c
-   - Thyroid labs
-   - CBC
-   - CMP
+2. Extract EVERY lab result visible in the files. Nothing is skipped. Group the
+   results as follows — each group's members are listed explicitly, so assign every
+   matching result to the group named here and do not move a test between groups or
+   drop it because it is not literally the group's namesake.
+   - Testosterone: Testosterone Total / Free / Bioavailable (any assay suffix),
+     Sex Hormone Binding Globulin (SHBG), LH, FSH
+   - Estradiol: Estradiol, Estrone
+   - Lipids: total cholesterol, HDL, LDL, triglycerides, non-HDL, and the
+     cholesterol ratios
+   - A1c: Hemoglobin A1c, estimated average glucose
+   - Thyroid labs: TSH, Free/Total T4, Free/Total T3, thyroid antibodies
+   - CBC: hemoglobin, hematocrit, RBC, WBC, platelets, and the differential
+   - CMP: glucose, BUN, creatinine, eGFR, electrolytes, calcium, total protein,
+     albumin, globulin, A/G ratio, bilirubin, alkaline phosphatase, AST, ALT
+   - PSA: total PSA, free PSA, % free PSA, PSA free:total ratio
+   These member lists name the common tests, they are not limits. Any other result
+   that belongs to one of these panels belongs in that group too — e.g. reverse T3
+   and thyroglobulin are thyroid, RDW and MPV are CBC, anion gap is CMP.
+   Any result that fits none of the groups above still has to be reported: put it in
+   an additional group of your own naming (for example vitamin D, iron studies,
+   insulin, IGF-1, cortisol, inflammatory markers), with a short lowercase key and a
+   readable title. Never discard a result because no listed group fits it.
+   Report each result once. If the same test, same date and same value is printed on
+   more than one page or panel, report it a single time in the most appropriate group.
 3. Display trends chronologically.
 4. Include exact values and units when visible.
 5. If a value is not present, omit that item.
@@ -477,17 +512,27 @@ Task:
 7. Important: Quest PDFs often show result tables across multiple pages. Inspect every page. If one page is a requisition/order page, continue to later pages for actual result tables.
 8. Treat rows like "CHOLESTEROL, TOTAL 215 H <200 mg/dL", "GLUCOSE 90 65-99 mg/dL", and "TESTOSTERONE, TOTAL 716 250-827 ng/dL" as readable lab result data.
 9. Return ONLY valid JSON. No markdown, no code fences, no comments.
-10. Every category must have a stable key from this set only:
-    testosterone, estradiol, lipids, a1c, thyroid, cbc, cmp
+10. Use these stable keys for the listed groups:
+    testosterone, estradiol, lipids, a1c, thyroid, cbc, cmp, psa
+    For a group of your own naming, use a short lowercase key (letters, digits and
+    hyphens only), e.g. "vitamin-d", "iron", "cortisol".
 11. For flags use only: normal, high, low, critical, unknown.
 12. If there are no visible values for a category, omit that category entirely.
 13. Extract every visible matching result, not just one representative value.
 14. For repeated tests across multiple files or dates, include one point per test/date/source file. For example, Total Testosterone and Free Testosterone are separate tests and both must be included for every date where visible.
-15. Use the lab result collection/specimen/result date shown in the file when visible. If only the lab order scheduled date is known, use that scheduled date.
+15. PSA is reported under several names. Treat all of these as the "psa" category and
+    extract every one that is visible: "PSA", "PSA, Total", "Prostate Specific Antigen",
+    "PSA, Free", "Free PSA", "% Free PSA", "PSA, Free:Total Ratio". PSA is frequently
+    printed on its own page or in a separate panel from the CMP/CBC tables — check every
+    page before concluding it is absent.
+16. testName must be the test's name only. Strip any order or LOINC code the lab
+    prints alongside it, so "PSA, Total (2857-1)" is reported as "PSA, Total".
+    The same test must carry the same testName across every file and date.
+17. Use the lab result collection/specimen/result date shown in the file when visible. If only the lab order scheduled date is known, use that scheduled date.
 
 Required JSON shape:
 {
-  "title": "AI Lab Trend Summary",
+  "title": "Lab Analysis",
   "generatedAt": "ISO-8601 timestamp",
   "overallImpression": "brief clinician-facing trend impression",
   "categories": [
@@ -554,6 +599,26 @@ Required JSON shape:
         `Lab trend analysis failed. ${message}`,
       );
     }
+  }
+
+  /**
+   * Labs print the same test under slightly different labels from one report to
+   * the next — most often by appending an order/LOINC code, e.g. "PSA, Total"
+   * on one panel and "PSA, Total (2857-1)" on another. Grouping is by test name
+   * everywhere downstream, so an unstripped code splits one test into two rows
+   * that can never show a trend. Only a purely numeric parenthetical is removed,
+   * so meaningful ones like "(BUN)", "(calc)" or "(Adult)" survive.
+   */
+  private canonicalizeTestName(testName: string) {
+    return testName
+      .replace(/\s*\(\s*\d{2,6}(?:-\d)?\s*\)\s*$/, '')
+      .replace(/\s+/g, ' ')
+      .replace(/[\s,]+$/, '')
+      .trim();
+  }
+
+  private isCurrentAnalysisVersion(trendData: LabTrendAnalysisResult | null) {
+    return trendData?.analysisVersion === this.labTrendAnalysisVersion;
   }
 
   private createLabSourceHash(files: LabTrendSourceFile[]) {
@@ -642,6 +707,42 @@ Required JSON shape:
     return trends;
   }
 
+  /**
+   * Analysis is otherwise clinician-triggered only (analyzeLabTrendsForAppointment
+   * is gated to non-patient users at the controller). A patient whose results are
+   * uploaded but whose doctor hasn't run the analysis yet would otherwise see an
+   * indefinite "preparing" state with nothing actually running to finish it. This
+   * runs the same pipeline on the patient's own behalf, once, best-effort — still
+   * Gemini-backed, still cached by content hash so repeat loads don't re-analyze.
+   * Never throws: a failure here should never break the patient's dashboard load.
+   */
+  async ensureLabTrendsAnalyzedForPatient(patientId: string, authorization?: string, force = false) {
+    try {
+      const hasUploadedResults = await this.prisma.labOrder.findFirst({
+        where: {
+          patientId,
+          OR: [{ resultsPath: { not: null } }, { resultFiles: { some: {} } }],
+        },
+        select: { id: true },
+      });
+      if (!hasUploadedResults) return null;
+
+      // Any appointment belonging to this patient works as the anchor — the
+      // analysis result is written across all of the patient's appointments.
+      const anchorAppointment = await this.prisma.appointment.findFirst({
+        where: { patientId },
+        orderBy: { appointmentDate: 'desc' },
+        select: { id: true },
+      });
+      if (!anchorAppointment) return null;
+
+      return await this.analyzeLabTrendsForAppointment(patientId, anchorAppointment.id, authorization, force);
+    } catch (err) {
+      console.error('[AI lab trends] Patient auto-trigger failed:', err);
+      return null;
+    }
+  }
+
   private tryParseLabTrendAnalysis(rawText: string): LabTrendAnalysisResult | null {
     try {
       return this.parseLabTrendAnalysis(rawText);
@@ -699,13 +800,28 @@ Required JSON shape:
       date: file.scheduledDate.toISOString().split('T')[0],
     }));
 
+    // The lab order's scheduledDate is the authoritative ordering for a
+    // patient's labs, so it's preferred over whatever date the model read out
+    // of the file. When the model's sourceFile can't be matched back to a
+    // known file, fall back in this order:
+    //   1. the model's own date, if it's a usable ISO date
+    //   2. the only source file's date, when there IS just one file — then
+    //      every point provably came from it, so it can't be ambiguous
+    // Only when neither applies does a point stay undated.
+    const soleFileDate = fileDates.length === 1 ? fileDates[0].date : null;
+    const isIsoDate = (value: unknown) => /^\d{4}-\d{2}-\d{2}/.test(String(value ?? '').trim());
+
     return this.normalizeLabTrendAnalysis({
       ...trendData,
       categories: trendData.categories.map((category) => ({
         ...category,
         points: category.points.map((point) => ({
           ...point,
-          date: this.getCanonicalLabDate(point.sourceFile, fileDates) || point.date,
+          date:
+            this.getCanonicalLabDate(point.sourceFile, fileDates) ||
+            (isIsoDate(point.date) ? point.date : null) ||
+            soleFileDate ||
+            point.date,
         })),
       })),
     });
@@ -788,7 +904,11 @@ Required JSON shape:
   private normalizeLabTrendAnalysis(
     input: Partial<LabTrendAnalysisResult>,
   ): LabTrendAnalysisResult {
-    const allowedKeys = new Set([
+    // The eight groups the prompt defines explicitly. These are NOT an allowlist —
+    // a lab result that fits none of them still has to reach the patient, so any
+    // other key the model returns is kept (sanitised) rather than discarded. They
+    // only fix the display order, so the familiar panels lead.
+    const knownKeys = [
       'testosterone',
       'estradiol',
       'lipids',
@@ -796,18 +916,22 @@ Required JSON shape:
       'thyroid',
       'cbc',
       'cmp',
-    ]);
+      'psa',
+    ];
     const allowedFlags = new Set(['normal', 'high', 'low', 'critical', 'unknown']);
+    // A test printed on two panels of the same report (albumin appears in both the
+    // CMP and the endocrinology panel, for instance) is one result, not two.
+    const seenAcrossCategories = new Set<string>();
 
     return {
-      title: input.title || 'AI Lab Trend Summary',
+      title: input.title || 'Lab Analysis',
       generatedAt: new Date().toISOString(),
       overallImpression: input.overallImpression || 'No trend impression provided.',
       categories: Array.isArray(input.categories)
         ? input.categories
-            .filter((category) => allowedKeys.has(category?.key))
+            .filter((category) => Boolean(this.sanitizeCategoryKey(category?.key)))
             .map((category) => ({
-              key: category.key,
+              key: this.sanitizeCategoryKey(category.key),
               title: category.title || this.toTitleCase(category.key),
               summary: category.summary || '',
               points: Array.isArray(category.points)
@@ -815,7 +939,9 @@ Required JSON shape:
                     new Map(category.points.map((point) => {
                       const normalizedPoint = {
                         date: point.date || 'Unknown date',
-                        testName: point.testName || 'Unknown test',
+                        testName:
+                          this.canonicalizeTestName(point.testName || '') ||
+                          'Unknown test',
                         value: String(point.value ?? ''),
                         unit: point.unit ?? null,
                         flag: allowedFlags.has(point.flag) ? point.flag : 'unknown',
@@ -830,15 +956,46 @@ Required JSON shape:
 
                       return [pointKey, normalizedPoint];
                     })).values(),
-                  ).sort((a, b) =>
-                    `${a.date}|${a.testName}`.localeCompare(`${b.date}|${b.testName}`),
                   )
+                    .filter((point) => {
+                      const globalKey = [
+                        point.date,
+                        point.testName.toLowerCase(),
+                        String(point.value).trim().toLowerCase(),
+                      ].join('|');
+                      if (seenAcrossCategories.has(globalKey)) return false;
+                      seenAcrossCategories.add(globalKey);
+                      return true;
+                    })
+                    .sort((a, b) =>
+                      `${a.date}|${a.testName}`.localeCompare(`${b.date}|${b.testName}`),
+                    )
                 : [],
             }))
             .filter((category) => category.points.length > 0)
+            .sort((a, b) => {
+              const ra = knownKeys.indexOf(a.key);
+              const rb = knownKeys.indexOf(b.key);
+              return (ra === -1 ? knownKeys.length : ra) - (rb === -1 ? knownKeys.length : rb);
+            })
         : [],
       limitations: Array.isArray(input.limitations) ? input.limitations : [],
+      analysisVersion: input.analysisVersion,
     };
+  }
+
+  /**
+   * Keep whatever grouping the model returned, but make the key safe to use as a
+   * lookup key in the UIs. Returns '' for anything unusable, which drops only the
+   * malformed category — never a well-formed one we simply didn't anticipate.
+   */
+  private sanitizeCategoryKey(key: unknown) {
+    return String(key ?? '')
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 40);
   }
 
   private toTitleCase(value: string) {
@@ -872,15 +1029,23 @@ Required JSON shape:
       return buffer.toString('base64');
     }
 
-    if (!file.remotePath || this.remoteApiBaseUrls.length === 0) {
+    if (!file.remotePath) {
       throw new Error(`Lab result file is missing locally: ${file.fileName}`);
     }
 
     // The file may live on either backend (new or old). Try each in order and
     // accept the first that returns a real file (a valid status AND not the SPA's
     // HTML page — formamd.com/api/* returns text/html which must be rejected).
+    // Local dev's own backend is appended as a LAST-resort fallback only — a
+    // record created against a locally-running backend can have a filePath that
+    // only exists on this machine's disk under a different working directory
+    // (or a DB shared with production, where the file simply isn't on either
+    // configured production host at all). This never runs before the real
+    // production URLs above it, and in production a request to localhost:3000
+    // just fails fast and falls through to the same error as before.
+    const baseUrlsToTry = [...this.remoteApiBaseUrls, 'http://localhost:3000/api'];
     const failures: string[] = [];
-    for (const baseUrl of this.remoteApiBaseUrls) {
+    for (const baseUrl of baseUrlsToTry) {
       const remoteUrl = `${baseUrl}${file.remotePath}`;
       try {
         console.log('[AI lab trends] Fetching remote lab file:', {

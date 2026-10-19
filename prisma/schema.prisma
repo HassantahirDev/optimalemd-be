@@ -11,6 +11,10 @@ datasource db {
 } 
 
 model User {
+  // Texas medical-marijuana intake: set when the patient answers yes to the
+  // prompt on the state step at signup. Carries a $150 welcome fee instead of
+  // $65, and exempts them from the lab-results requirement for booking.
+  isMedicalMarijuana Boolean @default(false)
   id        String   @id @default(uuid())
   patientId String?  @unique // Sequential patient ID (OPT-0001, OPT-0002, etc.)
   
@@ -104,6 +108,13 @@ model User {
   drivingLicensePath String? // Path to uploaded driving license
   photoPath String? // Path to uploaded photo
 
+  // Admin-granted one-time override: while true, this patient's OWN booking page gets the
+  // exact same booking powers as admin's "Create Appointment" flow — pick any doctor, a
+  // custom out-of-slot time, and skip payment entirely (appointment is created CONFIRMED,
+  // isPaid=false). Auto-flips back to false the moment that appointment is created, so it's
+  // a one-time grant, not a standing permission.
+  adminBookingOverrideEnabled Boolean @default(false)
+
   // Patient documents (multiple paperwork/files)
   patientDocuments   PatientDocument[]
 
@@ -129,6 +140,10 @@ model User {
   blogComments       BlogComment[]
   blogReactions      BlogReaction[]
   subscriptionTransactions SubscriptionTransaction[]
+
+  // Unified payments ledger (additive; existing payment relations untouched)
+  paymentRecords     PaymentRecord[]
+  medicationOrders   MedicationOrder[]
 
   @@map("users")
 }
@@ -529,10 +544,17 @@ model Payment {
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
   paidAt            DateTime?
-  
+
+  // Partner platform-credit applied to this payment — same pattern as WelcomeOrder's
+  // equivalent fields. partnerCreditDeducted guards against double-deducting the
+  // partner's balance on a retried/re-confirmed payment.
+  partnerCreditPartnerId    String?
+  partnerCreditAppliedCents Int?     @default(0)
+  partnerCreditDeducted     Boolean  @default(false)
+
   // Relations
   appointment       Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
-  
+
   @@map("payments")
 }
 
@@ -550,11 +572,17 @@ model MedicationPayment {
   subscriptionStatus String? // active, canceling, canceled, etc.
   subscriptionCanceledAt DateTime? // When cancellation was requested
   subscriptionEndDate DateTime? // When subscription will end (current_period_end)
-  
+
+  // Partner platform-credit applied to this medication order's FIRST invoice only
+  // (never recurring months) — same pattern as Payment/WelcomeOrder.
+  partnerCreditPartnerId    String?
+  partnerCreditAppliedCents Int?     @default(0)
+  partnerCreditDeducted     Boolean  @default(false)
+
   // Timestamps
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
-  
+
   // Relations
   appointment       Appointment @relation("MedicationPayments", fields: [appointmentId], references: [id], onDelete: Restrict)
 
@@ -602,6 +630,159 @@ model ProcessedStripeEvent {
   createdAt DateTime @default(now())
 
   @@map("processed_stripe_events")
+}
+
+// =============================================================================
+// UNIFIED PAYMENT LEDGER (additive — DERIVED/MIRROR layer)
+// -----------------------------------------------------------------------------
+// One row per payment event across every channel (platform checkout, in-person
+// POS, emailed invoice). Stripe stays the source of truth for money; the
+// existing tables (Payment, MedicationPayment, SubscriptionTransaction,
+// WelcomeOrder) remain the source of truth for their current screens. These
+// tables are DUAL-WRITTEN (never migrated) and BACKFILLED (never mutate origin).
+// =============================================================================
+model PaymentRecord {
+  id String @id @default(uuid())
+
+  // Soft links back to origin rows for reconciliation (all optional)
+  userId                    String?
+  appointmentId             String?
+  medicationPaymentId       String?
+  welcomeOrderId            String?
+  subscriptionTransactionId String?
+
+  // Classification (the "track the difference" requirement)
+  channel  PaymentChannel
+  category PaymentCategory
+  billing  PaymentBilling @default(ONE_TIME)
+
+  // Money
+  amount         Decimal       @db.Decimal(10, 2)
+  currency       String        @default("usd")
+  status         PaymentStatus @default(PENDING)
+  refundedAmount Decimal?      @db.Decimal(10, 2)
+
+  // Stripe references (nullable; unique where 1:1 so upserts are idempotent)
+  stripePaymentIntentId String? @unique
+  stripeInvoiceId       String? @unique
+  stripeChargeId        String? @unique
+  stripeSubscriptionId  String? // NOT unique — many invoices share one subscription
+  stripeCustomerId      String?
+  receiptUrl            String?
+  hostedInvoiceUrl      String?
+
+  // Card / method
+  cardBrand         String?
+  cardLast4         String?
+  paymentMethodType String? // card | link | us_bank_account | ...
+
+  // Presentation (mirrored from Stripe for DB-served reads)
+  description  String? // Stripe charge/PI description ("Subscription update", …)
+  billingEmail String? // payer email from Stripe (for guests with no account)
+
+  // Audit
+  createdByType String? // patient | admin | payment_user | system
+  createdById   String?
+  note          String?
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  paidAt        DateTime?
+  stripeCreated DateTime? // the Stripe object's created time (for dashboard-order)
+
+  // Relations
+  user             User?             @relation(fields: [userId], references: [id], onDelete: SetNull)
+  lineItems        PaymentLineItem[]
+  medicationOrders MedicationOrder[] // med orders this record paid for
+
+  @@index([userId])
+  @@index([category, status])
+  @@index([channel])
+  @@index([stripeSubscriptionId])
+  @@index([stripeCreated])
+  @@index([billingEmail])
+  @@map("payment_records")
+}
+
+// Cart line items (supports POS multi-item carts and invoices)
+model PaymentLineItem {
+  id              String  @id @default(uuid())
+  paymentRecordId String
+  description     String
+  stripePriceId   String?
+  medicationId    String?
+  quantity        Int     @default(1)
+  unitAmount      Decimal @db.Decimal(10, 2)
+  isSubscription  Boolean @default(false)
+  // Staff-assigned classification of THIS line (Monthly subscription / Medication
+  // / Other), captured when the invoice is built so each line tracks 100%.
+  category        PaymentCategory @default(OTHER)
+
+  paymentRecord PaymentRecord @relation(fields: [paymentRecordId], references: [id], onDelete: Cascade)
+
+  @@index([paymentRecordId])
+  @@map("payment_line_items")
+}
+
+// =============================================================================
+// ACTIVE MEDICATIONS (SET/ORDER based)
+// -----------------------------------------------------------------------------
+// Medications are bought as a set. The most recent paid order defines the
+// patient's current ACTIVE set; when a new order is paid, the whole previous
+// set flips to PAST (kept with its date range). At most one ACTIVE order/user.
+// =============================================================================
+model MedicationOrder {
+  id                    String                @id @default(uuid())
+  userId                String
+  status                MedicationOrderStatus @default(ACTIVE)
+  startedAt             DateTime              @default(now()) // paid date — the "since" anchor
+  endedAt               DateTime? // set when superseded
+  billing               PaymentBilling        @default(ONE_TIME)
+  sourcePaymentRecordId String? // the paying PaymentRecord
+  stripeSubscriptionId  String? // if the set is billed as a subscription
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user                User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sourcePaymentRecord PaymentRecord?        @relation(fields: [sourcePaymentRecordId], references: [id], onDelete: SetNull)
+  items               MedicationOrderItem[]
+
+  @@index([userId, status])
+  @@map("medication_orders")
+}
+
+model MedicationOrderItem {
+  id                String  @id @default(uuid())
+  medicationOrderId String
+  medicationId      String?
+  medicationName    String
+  quantity          Int     @default(1)
+  dosageSnapshot    String?
+
+  medicationOrder MedicationOrder @relation(fields: [medicationOrderId], references: [id], onDelete: Cascade)
+
+  @@index([medicationOrderId])
+  @@map("medication_order_items")
+}
+
+// =============================================================================
+// PAYMENT-AUTHORIZED USERS (payments.formamd.com portal — mirrors DoctorAssistant)
+// =============================================================================
+model PaymentUser {
+  id                 String   @id @default(uuid())
+  email              String   @unique
+  password           String
+  firstName          String?
+  lastName           String?
+  isActive           Boolean  @default(true)
+  mustChangePassword Boolean  @default(true)
+  role               String   @default("payment_staff") // payment_admin | payment_staff
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("payment_users")
 }
 
 model PrimaryService {
@@ -666,6 +847,11 @@ model Appointment {
   slotId            String?  // Made optional - slots are tied to doctor schedules
   appointmentDate   DateTime @db.Date
   appointmentTime   String   // Format: "HH:MM"
+  // Set the moment a reminder is claimed, never cleared. Doubles as the
+  // cross-instance lock: two servers running the cron both try to claim, and the
+  // conditional update means only one wins.
+  reminder24hSentAt DateTime?
+  reminder30mSentAt DateTime?
   selectedSlotTime  String?  // Store the slot time user selected (for later doctor assignment)
   duration          Int      // Duration in minutes
   
@@ -834,6 +1020,35 @@ enum PaymentStatus {
   FAILED
   CANCELLED
   REFUNDED
+  DISPUTED
+  INCOMPLETE
+  UNCAPTURED
+}
+
+// --- Unified payment ledger classification (additive) ---
+enum PaymentChannel {
+  PLATFORM // website checkout
+  POS      // in-person Stripe Terminal
+  INVOICE  // emailed Stripe invoice
+  IMPORTED // pulled from Stripe by the sync; never originated in our app
+}
+
+enum PaymentCategory {
+  MEDICATION
+  MEMBERSHIP
+  APPOINTMENT
+  SIGNUP
+  OTHER
+}
+
+enum PaymentBilling {
+  ONE_TIME
+  SUBSCRIPTION
+}
+
+enum MedicationOrderStatus {
+  ACTIVE
+  PAST
 }
 
 enum AppointmentStatus {
@@ -1045,6 +1260,11 @@ model WelcomeOrder {
   orderNumber       String   @unique // Generated order number
   status            WelcomeOrderStatus @default(PENDING)
   
+  // Set when this order is a Texas medical-marijuana intake, which is why the
+  // amount is 150 rather than 65. Recorded on the order so the charge can be
+  // explained later without inferring it from the user row.
+  isMedicalMarijuana Boolean @default(false)
+
   // Order details
   totalAmount       Decimal  @db.Decimal(10, 2)
   discountAmount    Decimal  @db.Decimal(10, 2) @default(0)
@@ -1054,7 +1274,14 @@ model WelcomeOrder {
   paymentIntentId   String?
   paymentStatus     PaymentStatus @default(PENDING)
   paidAt            DateTime?
-  
+
+  // Partner platform-credit applied to this order (soft link — no FK, same pattern as
+  // PaymentRecord's other soft links). partnerCreditDeducted guards against double-
+  // deducting the partner's balance on a retried/re-confirmed payment.
+  partnerCreditPartnerId    String?
+  partnerCreditAppliedCents Int?     @default(0)
+  partnerCreditDeducted     Boolean  @default(false)
+
   // Progress tracking
   currentStep       Int      @default(0) // 0-4 (Gender, Basic Info, Checkout, Password, Details)
   currentSubStep    Int      @default(0) // For internal navigation within steps
@@ -1136,6 +1363,11 @@ model Medication {
   membershipPrice Decimal? @db.Decimal(10, 2) // Discounted price for members (optional)
   pricingNotes    String?   // Additional pricing information or notes
   prescription    String?   // Full prescription text
+  // Explicit link to the Stripe price this medicine is billed from. Set once from a
+  // reviewed mapping — automatic name matching resolves only 6 of 28 correctly, so
+  // this column is the authoritative source and is never inferred at runtime.
+  // Null = no Stripe price; the doctor types the amount by hand.
+  stripePriceId   String?
   isActive        Boolean  @default(true)
   
   // Legacy fields for backward compatibility
@@ -1324,4 +1556,239 @@ model PatientDocument {
   createdAt    DateTime @default(now())
 
   @@index([labOrderId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Referral Partner (business affiliate) program — partners.formamd.com
+// Deliberately self-contained: no FK relations onto User/PaymentRecord, only
+// plain id-string links. Kept fully separate from the patient-to-patient
+// Referral/CreditEvent system above.
+// ─────────────────────────────────────────────────────────────────────────
+
+model ReferralPartner {
+  id                 String   @id @default(uuid())
+  name               String
+  email              String   @unique
+  password           String
+  phone              String?
+  companyName        String?
+  referralCode       String   @unique // e.g. PARTNER-A1B2C3, used in ?ref= links
+  isActive           Boolean  @default(true)
+  mustChangePassword Boolean  @default(true)
+
+  // Payout is manual for launch — no Stripe Connect yet.
+  payoutMethod String? // e.g. "Check", "ACH", "PayPal" — free text, admin-recorded
+  payoutNotes  String? // free-text admin notes (separate from the structured bank fields below)
+
+  // US bank details (ACH), entered by the partner themselves so admin has what's needed
+  // to wire a manual payout. Not encrypted at the field level — matches this project's
+  // existing pattern of no field-level encryption for stored PII, but flagged as a known
+  // hardening item (consider column-level encryption or moving to a vault before scaling
+  // partner volume beyond a manually-managed handful).
+  bankAccountHolderName String?
+  bankName              String?
+  bankAccountType       String? // "checking" | "savings"
+  bankRoutingNumber     String? // 9-digit ABA routing number
+  bankAccountNumber     String?
+  bankDetailsUpdatedAt  DateTime?
+
+  // Platform credit — every commission converts to spendable credit automatically
+  // (see Commission.status CREDITED) instead of sitting as a manual-payout-only OWED
+  // balance. 1 cent of credit = 1 cent off at signup (welcome order) and, if any is
+  // left over, off the first premium-subscription invoice. Manual payout (PayoutBatch/
+  // PayoutRequest) still exists for whatever was OWED before this shipped.
+  creditBalanceCents Int @default(0)
+
+  // The ONE email allowed to redeem creditBalanceCents at signup — defaults to `email`
+  // (this partner's own account email) until they verify a different one via
+  // PartnerCreditEmailVerification. Only ever one active email at a time: setting a new
+  // one replaces this value outright, so the old email stops working immediately.
+  creditActiveEmail String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  referrals PartnerReferral[]
+  commissions Commission[]
+  payoutBatches PayoutBatch[]
+  commissionRules CommissionRule[]
+  payoutRequests PayoutRequest[]
+  creditEmailVerifications PartnerCreditEmailVerification[]
+
+  @@map("referral_partners")
+}
+
+// A pending "I want to redeem my credit under a different email" request. The new
+// email only becomes ReferralPartner.creditActiveEmail once verified — never before —
+// so credit can't be redirected to an email the partner doesn't actually control.
+model PartnerCreditEmailVerification {
+  id         String          @id @default(uuid())
+  partnerId  String
+  partner    ReferralPartner @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  newEmail   String
+  code       String // 6-digit
+  expiresAt  DateTime
+  verifiedAt DateTime?
+  createdAt  DateTime        @default(now())
+
+  @@index([partnerId])
+  @@map("partner_credit_email_verifications")
+}
+
+// One row per attributed visitor/signup. Attribution is LAST-TOUCH: the code
+// they actually signed up under is what's recorded, so a new track-visit for
+// the same visitorId simply overwrites landingUrl/utm/partner until signup
+// locks the row (status moves past PENDING).
+model PartnerReferral {
+  id        String @id @default(uuid())
+  partnerId String
+  partner   ReferralPartner @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+
+  visitorId String // anonymous id set by the tracking snippet (cookie/localStorage)
+  userId    String? // set once the visitor signs up — permanent from that point on
+
+  landingUrl String?
+  utmSource  String?
+  utmMedium  String?
+  utmCampaign String?
+
+  status PartnerReferralStatus @default(PENDING) // PENDING (clicked) -> SIGNED_UP -> QUALIFIED
+  firstClickAt DateTime @default(now())
+  signedUpAt   DateTime?
+  qualifiedAt  DateTime? // when it hit the qualifying event (signup complete OR welcome order)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  commissions Commission[]
+
+  // One open (pre-signup) attribution row per visitor+partner; signed-up rows are locked by userId uniqueness below.
+  @@unique([userId], map: "partner_referral_user_unique")
+  @@index([partnerId])
+  @@index([visitorId])
+  @@index([status])
+  @@map("partner_referrals")
+}
+
+enum PartnerReferralStatus {
+  PENDING
+  SIGNED_UP
+  QUALIFIED
+  VOIDED // refunded / fraud / duplicate — commission clawed back
+}
+
+// Admin-defined commission rule. Both flat-amount and percentage rules are
+// supported side by side; a partner can have several active rules (e.g. one
+// per service). The engine picks the best-matching active rule at qualify time.
+model CommissionRule {
+  id        String @id @default(uuid())
+  partnerId String? // null = applies to ALL partners (a global default rule)
+  partner   ReferralPartner? @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+
+  name String // admin label, e.g. "Standard flat $50" or "TRT 10%"
+  type CommissionType // FLAT | PERCENTAGE
+  flatAmountCents   Int? // used when type = FLAT
+  percentBasisPoints Int? // used when type = PERCENTAGE, e.g. 1000 = 10.00%
+  serviceKeyword    String? // optional filter — only applies to matching services
+
+  isActive  Boolean @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  commissions Commission[]
+
+  @@index([partnerId])
+  @@map("commission_rules")
+}
+
+enum CommissionType {
+  FLAT
+  PERCENTAGE
+}
+
+// An earned (or voided) commission amount, one row per qualifying event.
+model Commission {
+  id                String @id @default(uuid())
+  partnerId         String
+  partner           ReferralPartner @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  partnerReferralId String
+  partnerReferral   PartnerReferral @relation(fields: [partnerReferralId], references: [id], onDelete: Cascade)
+  ruleId            String?
+  rule              CommissionRule? @relation(fields: [ruleId], references: [id], onDelete: SetNull)
+
+  sourcePaymentRecordId String? // links to PaymentRecord.id when known (soft link, no FK)
+  amountCents           Int
+  status                CommissionStatus @default(OWED)
+
+  payoutBatchId String?
+  payoutBatch   PayoutBatch? @relation(fields: [payoutBatchId], references: [id], onDelete: SetNull)
+
+  eligibleAt DateTime @default(now())
+  paidAt     DateTime?
+  voidReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([partnerId])
+  @@index([status])
+  @@map("commissions")
+}
+
+enum CommissionStatus {
+  OWED // legacy: earned before platform-credit auto-conversion shipped; still payable manually
+  CREDITED // converted automatically to ReferralPartner.creditBalanceCents at creation time
+  PAID
+  VOIDED
+}
+
+// A manual payout run — admin marks a batch of commissions as paid.
+model PayoutBatch {
+  id            String @id @default(uuid())
+  partnerId     String
+  partner       ReferralPartner @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  totalCents    Int
+  method        String? // "Check", "ACH", "PayPal" etc.
+  reference     String? // check #, transaction id, etc.
+  note          String?
+  paidAt        DateTime @default(now())
+  createdAt     DateTime @default(now())
+
+  commissions Commission[]
+  payoutRequest PayoutRequest?
+
+  @@index([partnerId])
+  @@map("payout_batches")
+}
+
+// A partner's ask to be paid out. Created by the partner (snapshotting what's owed at
+// that moment); fulfilled by admin, which creates the actual PayoutBatch against their
+// then-current OWED commissions and links it back here. Keeps "partner asked to be paid"
+// visibly separate from "admin recorded a payout" (which can still happen without a
+// request, e.g. a scheduled monthly run).
+model PayoutRequest {
+  id        String @id @default(uuid())
+  partnerId String
+  partner   ReferralPartner @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+
+  amountCents Int // snapshot of totalOwedCents at request time (informational — the actual
+                  // payout amount is whatever is OWED when admin fulfills it)
+  status      PayoutRequestStatus @default(PENDING)
+  note        String? // optional note from the partner when requesting
+
+  payoutBatchId String?      @unique
+  payoutBatch   PayoutBatch? @relation(fields: [payoutBatchId], references: [id], onDelete: SetNull)
+
+  requestedAt DateTime  @default(now())
+  completedAt DateTime?
+
+  @@index([partnerId])
+  @@index([status])
+  @@map("payout_requests")
+}
+
+enum PayoutRequestStatus {
+  PENDING
+  COMPLETED
+  REJECTED
 }

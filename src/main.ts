@@ -48,12 +48,15 @@ async function bootstrap() {
         'http://localhost:3000',  
         'https://www.formamd.com',
         'https://formamd.com',
+        'https://staging.formamd.com',
+        'https://payments.formamd.com',
+        'https://partners.formamd.com',
         'http://localhost:5173',
         'http://localhost:5174',
         'http://localhost:8080'
       ],
       methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-      allowedHeaders: ['Content-Type', 'Authorization'],
+      allowedHeaders: ['Content-Type', 'Authorization', 'x-checker-key'],
       credentials: true,
     },
   );

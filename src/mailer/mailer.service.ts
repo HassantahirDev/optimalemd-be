@@ -10,6 +10,10 @@ export class MailerService implements OnModuleInit {
   private appointmentTransporter: nodemailer.Transporter;
   private isNoopTransport = false;
   private isAppointmentNoopTransport = false;
+  // True whenever the dedicated appointment account isn't actually being used — either no
+  // APPOINTMENT_SMTP_* creds were set, or they failed to authenticate — and everything
+  // "sent via appointment" is silently going out through the default account instead.
+  private appointmentUsingFallback = false;
 
   constructor(private configService: ConfigService) {}
 
@@ -72,6 +76,7 @@ export class MailerService implements OnModuleInit {
       console.log('Appointment email config not found, using default transporter');
       this.appointmentTransporter = this.transporter;
       this.isAppointmentNoopTransport = this.isNoopTransport;
+      this.appointmentUsingFallback = true;
       return;
     }
 
@@ -91,6 +96,7 @@ export class MailerService implements OnModuleInit {
       console.error('Failed to initialize appointment SMTP transport, falling back to default:', error);
       this.appointmentTransporter = this.transporter;
       this.isAppointmentNoopTransport = this.isNoopTransport;
+      this.appointmentUsingFallback = true;
     }
   }
 
@@ -136,6 +142,82 @@ export class MailerService implements OnModuleInit {
       console.error('Failed to send email with attachment:', error);
       throw error;
     }
+  }
+
+  /** The mail accounts configured in env, for the /email-checker tool's account switcher. */
+  getEmailAccountsInfo(): Array<{
+    key: 'default' | 'appointment';
+    label: string;
+    fromAddress: string | null;
+    configured: boolean;
+    note?: string;
+  }> {
+    return [
+      {
+        key: 'default',
+        label: 'Default (SMTP_*)',
+        fromAddress: this.configService.get<string>('SMTP_FROM') || null,
+        configured: !this.isNoopTransport,
+      },
+      {
+        key: 'appointment',
+        label: 'Appointment (APPOINTMENT_SMTP_*)',
+        // While falling back, emails sent as "appointment" actually go out via the
+        // default account's from-address — show that, not the unused APPOINTMENT_SMTP_FROM,
+        // so this matches what the recipient will really see.
+        fromAddress: this.appointmentUsingFallback
+          ? this.configService.get<string>('SMTP_FROM') || null
+          : this.configService.get<string>('APPOINTMENT_SMTP_FROM') || null,
+        configured: !this.isAppointmentNoopTransport && !this.appointmentUsingFallback,
+        note: this.appointmentUsingFallback
+          ? 'APPOINTMENT_SMTP_* login failed or is unset — silently falling back to the default account.'
+          : undefined,
+      },
+    ];
+  }
+
+  /**
+   * Sends a fixed diagnostic email via whichever configured account is chosen, for the
+   * standalone /email-checker tool. Returns whether the transport is actually live
+   * (vs. silently running in no-op mode because SMTP creds are missing/invalid), and
+   * whether the requested account silently fell back to the default one — so the caller
+   * can tell "sent, exactly as requested" apart from "sent, but not through the account
+   * you picked".
+   */
+  async sendTestEmail(
+    to: string,
+    account: 'default' | 'appointment' = 'default',
+  ): Promise<{ noop: boolean; fromAddress: string; usedFallback: boolean }> {
+    const useAppointment = account === 'appointment';
+    const usedFallback = useAppointment && this.appointmentUsingFallback;
+    const transporter = useAppointment ? this.appointmentTransporter : this.transporter;
+    const isNoop = useAppointment ? this.isAppointmentNoopTransport : this.isNoopTransport;
+    // If the appointment account is falling back, the real from-address that will go out
+    // (and that the authenticated Gmail login will actually accept) is the default one —
+    // sending with the appointment address here would just get silently rewritten by
+    // Gmail, which is exactly the confusing behavior this is meant to catch.
+    const fromAddress =
+      useAppointment && !usedFallback
+        ? this.configService.get<string>('APPOINTMENT_SMTP_FROM') || ''
+        : this.configService.get<string>('SMTP_FROM') || '';
+
+    const sentAt = new Date().toLocaleString();
+    await transporter.sendMail({
+      from: `"FormaMD Email Checker" <${fromAddress}>`,
+      to,
+      subject: 'FormaMD Email Checker — Test Email',
+      text: `This is a test email from the FormaMD email checker tool, sent via the "${account}" mail account. If you received this, email delivery is working.\n\nSent at: ${sentAt}`,
+      html: `
+        <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:28px;color:#111;border:1px solid #eee;border-radius:12px;">
+          <h2 style="margin:0 0 12px;color:#dc2626;">✅ Email Checker — Test Successful</h2>
+          <p style="margin:0 0 8px;">This is a test email from the FormaMD email checker tool, sent via the <strong>${account}</strong> mail account.</p>
+          <p style="margin:16px 0 0;color:#888;font-size:12px;">Sent at ${sentAt}</p>
+        </div>
+      `,
+    });
+
+    console.log(`[email-checker] Test email sent to ${to} via "${account}" account ${isNoop ? '(no-op transport — not actually delivered)' : ''}${usedFallback ? ' (fell back to default account)' : ''}`);
+    return { noop: isNoop, fromAddress, usedFallback };
   }
 
   async sendEmailVerificationEmail(to: string, name: string, verificationLink: string): Promise<void> {
@@ -456,6 +538,174 @@ export class MailerService implements OnModuleInit {
       console.log(`Password reset email sent successfully to ${to}`);
     } catch (error) {
       console.error('Failed to send password reset email:', error);
+      throw error;
+    }
+  }
+
+  async sendSignupResumeEmail(to: string, resumeLink: string): Promise<void> {
+    const html = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+          body {
+            font-family: Arial, sans-serif;
+            line-height: 1.6;
+            margin: 0;
+            padding: 20px;
+            background-color: #f4f4f4;
+            color: #333333;
+          }
+          .container {
+            max-width: 600px;
+            margin: 0 auto;
+            background-color: #ffffff;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            overflow: hidden;
+          }
+          .header {
+            background-color: #000000;
+            padding: 25px;
+            text-align: center;
+          }
+          .logo-container {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 15px;
+            margin: 0 auto;
+            width: fit-content;
+          }
+          .logo-img {
+            width: 40px;
+            height: 40px;
+            object-fit: contain;
+          }
+          .logo {
+            color: #ffffff;
+            font-size: 24px;
+            font-weight: bold;
+            text-transform: uppercase;
+            margin: 0;
+          }
+          .content {
+            padding: 30px;
+            text-align: center;
+          }
+          .title {
+            color: #333333;
+            font-size: 24px;
+            font-weight: bold;
+            margin-bottom: 20px;
+          }
+          .description {
+            color: #666666;
+            font-size: 16px;
+            margin-bottom: 25px;
+            line-height: 1.6;
+          }
+          .resume-button {
+            display: inline-block;
+            background-color: #000000;
+            color: #ffffff !important;
+            padding: 15px 30px;
+            text-decoration: none;
+            border-radius: 5px;
+            font-weight: bold;
+            font-size: 16px;
+            margin: 20px 0;
+          }
+          .info-box {
+            background-color: #f8f9fa;
+            padding: 20px;
+            border-radius: 5px;
+            margin: 20px 0;
+            border-left: 4px solid #000000;
+          }
+          .warning-box {
+            background-color: #fff3cd;
+            padding: 20px;
+            border-radius: 5px;
+            margin: 20px 0;
+            border-left: 4px solid #ffc107;
+            color: #856404;
+            font-size: 14px;
+          }
+          .footer {
+            background-color: #f8f9fa;
+            text-align: center;
+            padding: 20px;
+            color: #666666;
+            font-size: 14px;
+            border-top: 1px solid #e9ecef;
+          }
+          .link-fallback {
+            background-color: #f8f9fa;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 20px 0;
+            border: 1px solid #e9ecef;
+            color: #666666;
+            font-size: 14px;
+          }
+          .link-fallback a {
+            color: #000000;
+            word-break: break-all;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">
+            <div class="logo-container">
+              <img src="https://formamd.com/logo.png" alt="FormaMD Logo" class="logo-img" />
+              <div class="logo">FormaMD</div>
+            </div>
+          </div>
+          <div class="content">
+            <h2 class="title">Finish Setting Up Your Account</h2>
+            <p class="description">Hi,</p>
+            <p class="description">You already paid for your consultation — there's nothing more to pay. Click below to pick up right where you left off.</p>
+            
+            <a href="${resumeLink}" class="resume-button">Continue Setting Up My Account</a>
+            
+            <div class="info-box">
+              <p style="margin: 0; color: #000000; font-weight: bold;">⏰ This link expires in 2 hours</p>
+            </div>
+            
+            <div class="warning-box">
+              <p style="margin: 0;"><strong>⚠️ Security Notice:</strong></p>
+              <p style="margin: 5px 0 0 0;">If you didn't request this, please ignore this email. This link is the only way to resume your paid signup, so don't forward it.</p>
+            </div>
+            
+            <div class="link-fallback">
+              <p style="margin: 0 0 10px 0;"><strong>Manual Link:</strong></p>
+              <p style="margin: 0;">If the button doesn't work, copy this link:</p>
+              <a href="${resumeLink}">${resumeLink}</a>
+            </div>
+          </div>
+          <div class="footer">
+            <p>This is an automated email, please do not reply.</p>
+            <p>&copy; ${new Date().getFullYear()} FormaMD</p>
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+
+    try {
+      await this.transporter.sendMail({
+        from: `"FormaMD" <${this.configService.get<string>('SMTP_FROM')}>`,
+        to,
+        subject: 'Finish Setting Up Your FormaMD Account',
+        html,
+      });
+      console.log(`Signup resume email sent successfully to ${to}`);
+    } catch (error) {
+      console.error('Failed to send signup resume email:', error);
       throw error;
     }
   }
@@ -1265,6 +1515,306 @@ export class MailerService implements OnModuleInit {
       console.log(`Cancellation email sent successfully to ${patientEmail}`);
     } catch (error) {
       console.error('Failed to send cancellation email:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Sent when a doctor/staff marks a visit as NO_SHOW. Same auto-login booking-link
+   * pattern as sendLabResultsEmail — the CTA takes the patient straight to booking
+   * without needing to log in again.
+   */
+  async sendNoShowEmail(
+    patientEmail: string,
+    patientName: string,
+    doctorName: string,
+    appointmentDate: string,
+    appointmentTime: string,
+    bookingLink?: string,
+  ): Promise<void> {
+    const [year, month, day] = appointmentDate.split('-').map(Number);
+    const dateFormatter = new Intl.DateTimeFormat('en-US', {
+      weekday: 'long',
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+    });
+    const formattedDate = dateFormatter.format(new Date(year, month - 1, day));
+
+    const [hours, minutes] = appointmentTime.split(':').map(Number);
+    const utcDate = new Date(Date.UTC(year, month - 1, day, hours, minutes, 0));
+    const targetTimezone = 'America/Chicago';
+    const timeFormatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: targetTimezone,
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: true,
+    });
+    const formattedTime = timeFormatter.format(utcDate);
+    const timeMatch = formattedTime.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+    const displayTime = timeMatch ? `${timeMatch[1]}:${timeMatch[2]} ${timeMatch[3]}` : formattedTime;
+    const timezoneAbbr = this.getTimezoneAbbreviation(targetTimezone, utcDate);
+    const formattedTimeWithTz = `${displayTime} ${timezoneAbbr ? `(${timezoneAbbr})` : '(UTC)'}`;
+
+    const html = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+          body { font-family: Arial, sans-serif; line-height: 1.6; margin: 0; padding: 20px; background-color: #f4f4f4; color: #333333; }
+          .container { max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); overflow: hidden; }
+          .header { background-color: #000000; padding: 25px; text-align: center; }
+          .logo { color: #ffffff; font-size: 24px; font-weight: bold; text-transform: uppercase; margin: 0; }
+          .content { padding: 30px; text-align: center; }
+          .title { color: #dc2626; font-size: 24px; font-weight: bold; margin-bottom: 20px; }
+          .info-box { background-color: #f9f9f9; border-left: 4px solid #dc2626; padding: 20px; margin: 20px 0; text-align: left; }
+          .info-item { margin: 10px 0; }
+          .info-label { font-weight: bold; color: #333333; }
+          .footer { background-color: #000000; color: #ffffff; padding: 20px; text-align: center; font-size: 12px; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">
+            <h1 class="logo">FormaMD</h1>
+          </div>
+          <div class="content">
+            <h2 class="title">Sorry We Didn't See You Today</h2>
+            <p>Dear ${patientName},</p>
+            <p>We noticed you weren't able to make your appointment today, and wanted to check in. We understand things come up.</p>
+
+            <div class="info-box">
+              <div class="info-item"><span class="info-label">Provider:</span> ${doctorName}</div>
+              <div class="info-item"><span class="info-label">Scheduled:</span> ${formattedDate} at ${formattedTimeWithTz}</div>
+            </div>
+
+            <p>Whenever you're ready, please reschedule at your earliest convenience so we can continue your care.</p>
+
+            ${bookingLink ? `
+            <div style="text-align: center; margin: 30px 0;">
+              <a href="${bookingLink}" target="_blank" style="display: inline-block; background-color: #dc2626; color: #ffffff; text-decoration: none; font-weight: bold; font-size: 16px; padding: 14px 32px; border-radius: 8px;">Reschedule Your Appointment</a>
+              <p style="margin: 12px 0 0 0; font-size: 12px; color: #6b7280;">This secure link takes you straight to booking — no need to log in again.</p>
+            </div>` : ''}
+
+            <p style="margin-top: 30px;">Best regards,<br><strong>The FormaMD Team</strong></p>
+          </div>
+          <div class="footer">
+            <p>This is an automated email, please do not reply.</p>
+            <p>&copy; ${new Date().getFullYear()} FormaMD</p>
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+
+    try {
+      const fromEmail = this.configService.get<string>('APPOINTMENT_SMTP_FROM') || this.configService.get<string>('SMTP_FROM');
+      await this.appointmentTransporter.sendMail({
+        from: `"FormaMD" <${fromEmail}>`,
+        to: patientEmail,
+        subject: "Sorry We Missed You Today — Reschedule | FormaMD",
+        html,
+      });
+      console.log(`No-show email sent successfully to ${patientEmail}`);
+    } catch (error) {
+      console.error('Failed to send no-show email:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Sent once the visit is closed out — the doctor signs the note, or records the
+   * visit as completed, whichever happens first. Tells the patient their care plan
+   * is viewable and that they can authorise payment for the treatment plan.
+   */
+  async sendCarePlanReadyEmail(
+    patientEmail: string,
+    patientName: string,
+    carePlanLink?: string,
+    /** False when the visit was closed with no medication — the email must not
+     *  then invite payment for a treatment plan that doesn't exist. */
+    hasMedications = true,
+  ): Promise<void> {
+    const html = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+          body { font-family: Arial, sans-serif; line-height: 1.6; margin: 0; padding: 20px; background-color: #f4f4f4; color: #333333; }
+          .container { max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); overflow: hidden; }
+          .header { background-color: #000000; padding: 25px; text-align: center; }
+          .logo { color: #ffffff; font-size: 24px; font-weight: bold; text-transform: uppercase; margin: 0; }
+          .content { padding: 30px; text-align: center; }
+          .title { color: #dc2626; font-size: 24px; font-weight: bold; margin-bottom: 20px; }
+          .info-box { background-color: #f9f9f9; border-left: 4px solid #dc2626; padding: 20px; margin: 20px 0; text-align: left; }
+          .footer { background-color: #000000; color: #ffffff; padding: 20px; text-align: center; font-size: 12px; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">
+            <h1 class="logo">FormaMD</h1>
+          </div>
+          <div class="content">
+            <h2 class="title">Your Care Plan Is Ready</h2>
+            <p>Dear ${patientName},</p>
+            <p>${hasMedications
+              ? 'Your care plan is ready to view. You can also authorize payment for your current treatment plan on the portal.'
+              : 'Your care plan is ready to view.'}</p>
+
+            ${carePlanLink ? `
+            <div style="text-align: center; margin: 30px 0;">
+              <a href="${carePlanLink}" target="_blank" style="display: inline-block; background-color: #dc2626; color: #ffffff; text-decoration: none; font-weight: bold; font-size: 16px; padding: 14px 32px; border-radius: 8px;">View Your Care Plan</a>
+              <p style="margin: 12px 0 0 0; font-size: 12px; color: #6b7280;">This secure link takes you straight to your care plan — no need to log in again.</p>
+            </div>` : ''}
+
+            ${hasMedications ? `
+            <div class="info-box">
+              <p style="margin: 0;">Once payment is made, your order will be processed and shipped within 5 business days.</p>
+            </div>` : ''}
+
+            <p style="margin-top: 30px;">Best regards,<br><strong>The FormaMD Team</strong></p>
+          </div>
+          <div class="footer">
+            <p>This is an automated email, please do not reply.</p>
+            <p>&copy; ${new Date().getFullYear()} FormaMD</p>
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+
+    try {
+      const fromEmail = this.configService.get<string>('APPOINTMENT_SMTP_FROM') || this.configService.get<string>('SMTP_FROM');
+      await this.appointmentTransporter.sendMail({
+        from: `"FormaMD" <${fromEmail}>`,
+        to: patientEmail,
+        subject: 'Your Care Plan Is Ready to View | FormaMD',
+        html,
+      });
+      console.log(`Care plan ready email sent successfully to ${patientEmail}`);
+    } catch (error) {
+      console.error('Failed to send care plan ready email:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Appointment reminder, 24 hours and 30 minutes before the visit.
+   * Formats the time exactly like the other appointment emails: build the UTC
+   * instant from the date + "HH:MM", then render it in the clinic timezone with
+   * its abbreviation.
+   */
+  async sendAppointmentReminderEmail(
+    patientEmail: string,
+    patientName: string,
+    doctorName: string,
+    appointmentDate: string,
+    appointmentTime: string,
+    kind: '24h' | '30m',
+    googleMeetLink?: string,
+    timezone?: string,
+  ): Promise<void> {
+    const targetTimezone = timezone || 'America/Chicago';
+    const [year, month, day] = appointmentDate.split('-').map(Number);
+    const [hours, minutes] = appointmentTime.split(':').map(Number);
+    const utcDate = new Date(Date.UTC(year, month - 1, day, hours, minutes, 0));
+
+    const formattedDate = new Intl.DateTimeFormat('en-US', {
+      timeZone: targetTimezone,
+      weekday: 'long',
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+    }).format(utcDate);
+
+    const formattedTime = new Intl.DateTimeFormat('en-US', {
+      timeZone: targetTimezone,
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: true,
+    }).format(utcDate);
+    const timeMatch = formattedTime.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+    const displayTime = timeMatch ? `${timeMatch[1]}:${timeMatch[2]} ${timeMatch[3]}` : formattedTime;
+    const timezoneAbbr = this.getTimezoneAbbreviation(targetTimezone, utcDate);
+    const formattedTimeWithTz = `${displayTime} ${timezoneAbbr ? `(${timezoneAbbr})` : '(UTC)'}`;
+
+    const isSoon = kind === '30m';
+    const heading = isSoon ? 'Your Appointment Starts Soon' : 'Your Appointment Is Tomorrow';
+    const lead = isSoon
+      ? 'This is a reminder that your appointment begins in about 30 minutes.'
+      : 'This is a reminder that your appointment is coming up in 24 hours.';
+    const subject = isSoon
+      ? 'Starting soon: your appointment | FormaMD'
+      : 'Reminder: your appointment is tomorrow | FormaMD';
+
+    const html = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+          body { font-family: Arial, sans-serif; line-height: 1.6; margin: 0; padding: 20px; background-color: #f4f4f4; color: #333333; }
+          .container { max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); overflow: hidden; }
+          .header { background-color: #000000; padding: 25px; text-align: center; }
+          .logo { color: #ffffff; font-size: 24px; font-weight: bold; text-transform: uppercase; margin: 0; }
+          .content { padding: 30px; text-align: center; }
+          .title { color: #dc2626; font-size: 24px; font-weight: bold; margin-bottom: 20px; }
+          .info-box { background-color: #f9f9f9; border-left: 4px solid #dc2626; padding: 20px; margin: 20px 0; text-align: left; }
+          .info-item { margin: 10px 0; }
+          .info-label { font-weight: bold; color: #333333; }
+          .footer { background-color: #000000; color: #ffffff; padding: 20px; text-align: center; font-size: 12px; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">
+            <h1 class="logo">FormaMD</h1>
+          </div>
+          <div class="content">
+            <h2 class="title">${heading}</h2>
+            <p>Dear ${patientName},</p>
+            <p>${lead}</p>
+
+            <div class="info-box">
+              <div class="info-item"><span class="info-label">Provider:</span> ${doctorName}</div>
+              <div class="info-item"><span class="info-label">Date:</span> ${formattedDate}</div>
+              <div class="info-item"><span class="info-label">Time:</span> ${formattedTimeWithTz}</div>
+            </div>
+
+            ${googleMeetLink ? `
+            <div style="text-align: center; margin: 30px 0;">
+              <a href="${googleMeetLink}" target="_blank" style="display: inline-block; background-color: #dc2626; color: #ffffff; text-decoration: none; font-weight: bold; font-size: 16px; padding: 14px 32px; border-radius: 8px;">Join Now</a>
+              <p style="margin: 12px 0 0 0; font-size: 12px; color: #6b7280;">Or copy this link: <span style="word-break: break-all;">${googleMeetLink}</span></p>
+            </div>` : ''}
+
+            <p style="margin-top: 30px;">Best regards,<br><strong>The FormaMD Team</strong></p>
+          </div>
+          <div class="footer">
+            <p>This is an automated email, please do not reply.</p>
+            <p>&copy; ${new Date().getFullYear()} FormaMD</p>
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+
+    try {
+      const fromEmail = this.configService.get<string>('APPOINTMENT_SMTP_FROM') || this.configService.get<string>('SMTP_FROM');
+      await this.appointmentTransporter.sendMail({
+        from: `"FormaMD" <${fromEmail}>`,
+        to: patientEmail,
+        subject,
+        html,
+      });
+      console.log(`${kind} appointment reminder sent to ${patientEmail}`);
+    } catch (error) {
+      console.error(`Failed to send ${kind} appointment reminder:`, error);
       throw error;
     }
   }
@@ -2199,6 +2749,59 @@ Select the "Assistant Doctor" tab on the login page.
     await this.sendEmail(to, 'Your FormaMD Assistant Doctor Account', text, html);
   }
 
+  async sendPaymentUserCreatedEmail(
+    to: string,
+    name: string,
+    password: string,
+    loginUrl: string,
+  ): Promise<void> {
+    const text = `Hi ${name},
+
+A Payments Portal account has been created for you at FormaMD.
+
+Login URL: ${loginUrl}
+Email: ${to}
+Temporary Password: ${password}
+
+For your security, you will be asked to set a new password the first time you log in.
+
+— FormaMD`;
+
+    const html = `
+      <!DOCTYPE html>
+      <html>
+      <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+      <body style="font-family: Arial, sans-serif; line-height:1.6; margin:0; padding:20px; background-color:#f4f4f4; color:#333;">
+        <div style="max-width:600px; margin:0 auto; background:#fff; border-radius:10px; overflow:hidden; box-shadow:0 4px 6px rgba(0,0,0,.1);">
+          <div style="background:#000; color:#fff; padding:30px 20px; text-align:center;">
+            <img src="https://formamd.com/logo.png" alt="FormaMD Logo" style="width:40px; height:40px; object-fit:contain; vertical-align:middle;" />
+            <h1 style="margin:8px 0 0; font-size:26px;">FormaMD</h1>
+            <p style="margin:8px 0 0; opacity:.9;">Payments Portal Access</p>
+          </div>
+          <div style="padding:36px 30px;">
+            <h2 style="color:#000; font-size:22px; margin:0 0 16px;">Your account is ready</h2>
+            <p style="color:#555;">Hi ${name},</p>
+            <p style="color:#555;">A Payments Portal account has been created for you. Use the credentials below to sign in.</p>
+            <div style="background:#f8f9fa; border:2px solid #e9ecef; border-radius:8px; padding:20px; margin:24px 0;">
+              <p style="margin:0 0 8px;"><strong>Email:</strong> ${to}</p>
+              <p style="margin:0;"><strong>Temporary Password:</strong> ${password}</p>
+            </div>
+            <div style="text-align:center; margin:28px 0;">
+              <a href="${loginUrl}" style="background:#e53935; color:#fff; text-decoration:none; padding:14px 28px; border-radius:8px; font-weight:600; display:inline-block;">Go to Payments Login</a>
+            </div>
+            <p style="color:#555;">For your security, you'll be asked to set a new password the first time you sign in.</p>
+          </div>
+          <div style="padding:20px 30px; text-align:center; color:#999; font-size:13px; border-top:1px solid #eee;">
+            <p style="margin:0;">This is an automated email, please do not reply.</p>
+            <p style="margin:6px 0 0;">&copy; ${new Date().getFullYear()} FormaMD</p>
+          </div>
+        </div>
+      </body>
+      </html>`;
+
+    await this.sendEmail(to, 'Your FormaMD Payments Portal Account', text, html);
+  }
+
   async sendAdminCreatedPatientEmail(to: string, name: string, password: string, verificationLink: string): Promise<void> {
     const html = `
       <!DOCTYPE html>
@@ -2597,7 +3200,7 @@ Select the "Assistant Doctor" tab on the login page.
               </ul>
             </div>
             
-            <p class="description">You now have access to all premium features and benefits. We're excited to help you on your health journey!</p>
+            <p class="description">You now have access to all Performance features and benefits. We're excited to help you on your health journey!</p>
           </div>
           <div class="footer">
             <p>This is an automated email, please do not reply.</p>

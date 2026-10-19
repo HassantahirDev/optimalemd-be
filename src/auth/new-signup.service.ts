@@ -3,9 +3,32 @@ import { PrismaService } from '../prisma/prisma.service';
 import { JwtService } from '@nestjs/jwt';
 import { MailerService } from '../mailer/mailer.service';
 import { ReferralService } from '../referral/referral.service';
+import { PaymentLedgerService } from '../payments/payment-ledger.service';
+import { PartnersService } from '../partners/partners.service';
+import { StripeService } from '../stripe/stripe.service';
 import * as bcrypt from 'bcrypt';
 import * as crypto from 'crypto';
 import { generateNextPatientId } from '../common/utils/patient-id.utils';
+
+/**
+ * Resuming a PAID but abandoned signup.
+ *
+ * Ownership of the email is proven by a signed, short-lived token carried in an
+ * emailed link. Nothing is persisted — no schema change, and unlike an
+ * in-memory code it survives backend restarts and works across multiple
+ * instances.
+ */
+const RESUME_TOKEN_PURPOSE = 'signup-resume';
+
+/**
+ * A secret distinct from the auth JWT secret, so a resume token can never be
+ * presented as a login token (and vice versa) even if payload shapes change.
+ */
+function resumeTokenSecret() {
+  const base = process.env.JWT_SECRET;
+  if (!base) throw new Error('JWT_SECRET is not configured');
+  return `${base}::${RESUME_TOKEN_PURPOSE}`;
+}
 import {
   CreateWelcomeOrderDto,
   UpdateSignupStepDto,
@@ -22,6 +45,9 @@ export class NewSignupService {
     private jwtService: JwtService,
     private mailerService: MailerService,
     private referralService: ReferralService,
+    private paymentLedger: PaymentLedgerService,
+    private partnersService: PartnersService,
+    private stripeService: StripeService,
   ) {}
 
   // Generate unique order number
@@ -141,21 +167,52 @@ export class NewSignupService {
     };
   }
 
+  /** Welcome fee, decided server-side. The client may ask for the intake type; it may not name its own price. */
+  static readonly WELCOME_FEE_STANDARD = 65;
+  static readonly WELCOME_FEE_MEDICAL_MARIJUANA = 150;
+
   // Create a new welcome order
   async createWelcomeOrder(createDto: CreateWelcomeOrderDto) {
     const orderNumber = this.generateOrderNumber();
-    
+
+    // The price is derived from the intake type here, never taken from the
+    // request. The client used to send finalAmount and it was trusted verbatim,
+    // so anything could be posted as the welcome fee.
+    const isMedicalMarijuana = Boolean((createDto as any).isMedicalMarijuana);
+    const expectedAmount = isMedicalMarijuana
+      ? NewSignupService.WELCOME_FEE_MEDICAL_MARIJUANA
+      : NewSignupService.WELCOME_FEE_STANDARD;
+
+    // Partner platform credit, applied server-side (never trust a client-sent discount
+    // for this) — 1 cent of credit = 1 cent off. Reserved here, not yet spent from the
+    // partner's balance; that happens in updatePaymentStatus once payment truly succeeds,
+    // so a never-completed signup never burns real credit.
+    const credit = await this.partnersService.findAvailableCreditByEmail(createDto.email);
+    const clientFinalCents = Math.round(expectedAmount * 100);
+    const creditAppliedCents = credit ? Math.min(credit.availableCents, clientFinalCents) : 0;
+    const finalAmount = creditAppliedCents > 0
+      ? Math.round((expectedAmount - creditAppliedCents / 100) * 100) / 100
+      : expectedAmount;
+    const discountAmount = creditAppliedCents > 0
+      ? Math.round(creditAppliedCents / 100 * 100) / 100
+      : 0;
+
     const welcomeOrder = await this.prisma.welcomeOrder.create({
       data: {
         email: createDto.email,
         orderNumber,
-        totalAmount: createDto.totalAmount,
-        discountAmount: createDto.discountAmount,
-        finalAmount: createDto.finalAmount,
+        totalAmount: expectedAmount,
+        discountAmount,
+        finalAmount,
+        isMedicalMarijuana,
         status: WelcomeOrderStatus.PENDING,
         currentStep: 0,
         currentSubStep: 0,
         ...(createDto.userId && { userId: createDto.userId }),
+        ...(creditAppliedCents > 0 && {
+          partnerCreditPartnerId: credit!.partnerId,
+          partnerCreditAppliedCents: creditAppliedCents,
+        }),
       },
       include: {
         signupSteps: true,
@@ -329,6 +386,111 @@ export class NewSignupService {
     };
   }
 
+  // ── Resuming a PAID but abandoned signup ─────────────────────────────────
+  //
+  // Someone who paid and then closed the tab shouldn't have to pay again. But
+  // this whole controller is public, so "email matches → skip checkout" would
+  // let anyone who knows that email claim a stranger's paid registration and
+  // set their own password on it. So resuming is gated two ways:
+  //   1. first name + last name + email must all match the abandoned order
+  //   2. a one-time code emailed to that address must be entered
+  // Step 1 keeps this from being an oracle for "who paid"; step 2 is what
+  // actually proves ownership.
+
+  /** The paid, unfinished order for an email — or null. */
+  private async findResumablePaidOrder(email: string) {
+    const normalizedEmail = email.toLowerCase().trim();
+
+    return this.prisma.welcomeOrder.findFirst({
+      where: {
+        email: normalizedEmail,
+        isCompleted: false,
+        paymentStatus: PaymentStatus.SUCCEEDED,
+      },
+      include: {
+        signupSteps: { orderBy: [{ stepNumber: 'asc' }, { subStepNumber: 'asc' }] },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  async requestResumeLink(email: string) {
+    if (!email?.trim()) throw new BadRequestException('Email is required');
+
+    const order = await this.findResumablePaidOrder(email);
+
+    const noMatch = { linkSent: false };
+    if (!order) {
+      console.log(`[signup resume] No paid, unfinished order for ${email.toLowerCase().trim()}`);
+      return noMatch;
+    }
+
+    // Matching on email alone is deliberate. The welcome order isn't created
+    // until checkout, so a name typed at step 1 often isn't recorded against it
+    // yet — requiring a name match meant a link was never sent. It costs
+    // nothing in security either: the link is the real gate, and it only ever
+    // goes to the address on the order. Typing someone else's email just emails
+    // them. (check-email already exposes "has an unfinished signup" publicly,
+    // so this reveals nothing new.)
+
+    // Stateless proof of ownership: a signed, short-lived token in the link.
+    // Nothing is stored, so this survives restarts and works across instances.
+    const token = await this.jwtService.signAsync(
+      { welcomeOrderId: order.id, email: order.email, purpose: RESUME_TOKEN_PURPOSE },
+      { secret: resumeTokenSecret(), expiresIn: '2h' },
+    );
+
+    // Hardcoded to the live site (same as auth.service.ts does for password
+    // resets) so a misconfigured FRONTEND_URL can never email a patient a link
+    // pointing at localhost or a preview host.
+    const frontendUrl = 'https://formamd.com';
+    const resumeLink = `${frontendUrl}/register/resume?token=${encodeURIComponent(token)}`;
+
+    try {
+      // Same branded template as the rest of our transactional mail.
+      await this.mailerService.sendSignupResumeEmail(order.email, resumeLink);
+    } catch (err) {
+      // Don't leak delivery problems back to the caller either.
+      console.error('[signup resume] Failed to send resume link:', err);
+      return noMatch;
+    }
+
+    return { linkSent: true };
+  }
+
+  async verifyResumeToken(token: string) {
+    const invalid = new BadRequestException('This link is invalid or has expired. Please request a new one.');
+    if (!token?.trim()) throw invalid;
+
+    let payload: any;
+    try {
+      payload = await this.jwtService.verifyAsync(token, { secret: resumeTokenSecret() });
+    } catch {
+      throw invalid;
+    }
+
+    // A token minted for anything else must never unlock a paid signup.
+    if (payload?.purpose !== RESUME_TOKEN_PURPOSE || !payload?.welcomeOrderId) throw invalid;
+
+    const order = await this.prisma.welcomeOrder.findFirst({
+      where: {
+        id: payload.welcomeOrderId,
+        isCompleted: false,
+        paymentStatus: PaymentStatus.SUCCEEDED,
+      },
+    });
+    if (!order) throw invalid;
+
+    return {
+      welcomeOrderId: order.id,
+      email: order.email,
+      paymentIntentId: order.paymentIntentId,
+      paymentStatus: order.paymentStatus,
+      currentStep: order.currentStep,
+      currentSubStep: order.currentSubStep,
+    };
+  }
+
   // Complete the signup process and create or update user
   async completeSignup(welcomeOrderId: string, userData: any) {
     const welcomeOrder = await this.prisma.welcomeOrder.findUnique({
@@ -463,6 +625,9 @@ export class NewSignupService {
         isEmailVerified: false,
         hasCompletedIntakeForm: true,
         intakeFormCompletedAt: new Date(),
+        // Carried from the welcome order, which is the record that was actually
+        // priced and paid — never re-read from the client at this point.
+        isMedicalMarijuana: Boolean((welcomeOrder as any)?.isMedicalMarijuana),
       };
       
       // Handle dateOfBirth
@@ -529,6 +694,25 @@ export class NewSignupService {
       data: { userId: user.id },
     });
 
+    // Partner-program attribution: bind the visitor's last-touch partner click to
+    // this new account. QUALIFYING (the event that earns the partner a commission)
+    // requires this welcome order to have actually been paid — reaching this step
+    // doesn't guarantee that server-side, so it's checked explicitly rather than
+    // assumed from step order. Both are non-fatal — a referral hiccup must never
+    // block account creation.
+    try {
+      await this.partnersService.bindOnSignup(mergedUserData.visitorId || userData.visitorId, user.id, user.primaryEmail || undefined);
+      if (welcomeOrder.paymentStatus === PaymentStatus.SUCCEEDED) {
+        await this.partnersService.qualify(user.id, {
+          revenueCents: Math.round(Number(welcomeOrder.finalAmount || 0) * 100),
+        });
+      } else {
+        console.log(`Skipping partner qualification for welcome order ${welcomeOrder.id} — payment not succeeded (${welcomeOrder.paymentStatus})`);
+      }
+    } catch (partnerErr) {
+      console.error('Partner attribution/qualification failed (non-fatal):', partnerErr);
+    }
+
     return {
       user,
       welcomeOrder: {
@@ -563,6 +747,22 @@ export class NewSignupService {
     return welcomeOrder;
   }
 
+  // A welcome order fully covered by partner credit (finalAmount rounds to $0) never
+  // gets a real Stripe PaymentIntent — createPaymentIntent refuses amounts <= 0. This
+  // reuses all of updatePaymentStatus's logic (ledger write, credit deduction, email)
+  // with a synthetic non-Stripe id, same pattern as the existing free-appointment flow.
+  async confirmFreeWelcomeOrder(welcomeOrderId: string) {
+    const order = await this.prisma.welcomeOrder.findUnique({ where: { id: welcomeOrderId } });
+    if (!order) throw new NotFoundException('Welcome order not found');
+    if (Number(order.finalAmount) !== 0) {
+      throw new BadRequestException('This order is not fully covered by credit');
+    }
+    if (order.paymentStatus === PaymentStatus.SUCCEEDED) {
+      return this.getWelcomeOrder(welcomeOrderId); // already confirmed, idempotent no-op
+    }
+    return this.updatePaymentStatus(welcomeOrderId, `free-${welcomeOrderId}`, PaymentStatus.SUCCEEDED);
+  }
+
   // Update payment status
   async updatePaymentStatus(welcomeOrderId: string, paymentIntentId: string, status: PaymentStatus) {
     // Fetch welcome order with signup steps to get user info
@@ -592,6 +792,53 @@ export class NewSignupService {
         status: status === PaymentStatus.SUCCEEDED ? WelcomeOrderStatus.IN_PROGRESS : WelcomeOrderStatus.PENDING,
       },
     });
+
+    // --- Dual-write signup payment into the unified ledger (additive; Part A) ---
+    // welcomeOrder logic above is untouched. Runs only on success.
+    if (status === PaymentStatus.SUCCEEDED) {
+      // No line items for a flat signup fee — the receipt link is what "expand" shows
+      // for this row instead. Best-effort; never blocks the write if unavailable.
+      const receiptUrl = await this.stripeService.getReceiptUrl(paymentIntentId);
+      await this.paymentLedger.upsertFromStripe({
+        stripePaymentIntentId: paymentIntentId,
+        userId: welcomeOrder.userId ?? null,
+        welcomeOrderId: welcomeOrder.id,
+        // Payment happens at Checkout (step 2), before the User account exists
+        // (created a step later, at Password). userId is null at write-time for
+        // nearly every signup — billingEmail is what makes this record findable
+        // in the patient's own billing history once they do have an account.
+        billingEmail: welcomeOrder.email,
+        channel: 'PLATFORM',
+        category: 'SIGNUP',
+        billing: 'ONE_TIME',
+        amount: Number(welcomeOrder.finalAmount),
+        currency: 'usd',
+        status: 'SUCCEEDED',
+        paidAt: welcomeOrder.paidAt ?? new Date(),
+        receiptUrl,
+        // Naming the intake type explains the amount without anyone having to
+        // look up the order to see why it was 150 rather than 65.
+        note: (welcomeOrder as any).isMedicalMarijuana
+          ? `Signup order ${welcomeOrder.orderNumber} — medical marijuana intake`
+          : `Signup order ${welcomeOrder.orderNumber}`,
+      });
+
+      // Actually spend the reserved partner credit now that payment truly succeeded —
+      // never at order-creation time, so an abandoned/failed checkout never burns real
+      // credit. partnerCreditDeducted guards against double-spending on a retried
+      // confirm-payment call for the same order.
+      if (
+        welcomeOrder.partnerCreditPartnerId &&
+        (welcomeOrder.partnerCreditAppliedCents ?? 0) > 0 &&
+        !welcomeOrder.partnerCreditDeducted
+      ) {
+        await this.partnersService.spendCredit(welcomeOrder.partnerCreditPartnerId, welcomeOrder.partnerCreditAppliedCents!);
+        await this.prisma.welcomeOrder.update({
+          where: { id: welcomeOrder.id },
+          data: { partnerCreditDeducted: true },
+        });
+      }
+    }
 
     // Send payment confirmation email if payment succeeded
     if (status === PaymentStatus.SUCCEEDED) {
@@ -699,6 +946,18 @@ export class NewSignupService {
       // Generate patient ID
       const patientId = await generateNextPatientId(this.prisma);
 
+      // This is the path that actually creates the account during signup (the
+      // password step), and it is handed only userData — it never sees the
+      // welcome order. The medical-marijuana answer was given before the account
+      // existed, so it lives on the order; look it up by the same email that
+      // priced the order, or the flag is silently lost and the patient is still
+      // blocked by the lab requirement they were told they were exempt from.
+      const paidOrder = await this.prisma.welcomeOrder.findFirst({
+        where: { email: normalizedEmail },
+        orderBy: { createdAt: 'desc' },
+        select: { isMedicalMarijuana: true },
+      });
+
       // Create user with only the provided fields
       const user = await this.prisma.user.create({
         data: {
@@ -709,6 +968,7 @@ export class NewSignupService {
           gender: userData.gender,
           password: hashedPassword,
           patientId, // Assign sequential patient ID
+          isMedicalMarijuana: Boolean(paidOrder?.isMedicalMarijuana),
           isActive: userData.isActive ?? true,
           isEmailVerified: userData.isEmailVerified ?? false,
           hasCompletedMedicalForm: userData.hasCompletedMedicalForm ?? false,
@@ -750,6 +1010,30 @@ export class NewSignupService {
         } catch (refErr) {
           console.error('Referral creation failed (non-fatal):', refErr);
         }
+      }
+
+      // Partner-program attribution — separate from the patient referral hook above.
+      // Binding (visitorId -> this new userId) happens regardless, so the click is
+      // never lost even if payment comes later or never completes. QUALIFYING —
+      // the event that actually earns the partner a commission — requires an actual
+      // SUCCEEDED welcome order for this email; a created-but-unpaid account (or one
+      // created through a path with no welcome order at all) must never qualify.
+      try {
+        await this.partnersService.bindOnSignup(userData.visitorId, user.id, normalizedEmail);
+
+        const paidWelcomeOrder = await this.prisma.welcomeOrder.findFirst({
+          where: { email: normalizedEmail, paymentStatus: PaymentStatus.SUCCEEDED },
+          orderBy: { paidAt: 'desc' },
+        });
+        if (paidWelcomeOrder) {
+          await this.partnersService.qualify(user.id, {
+            revenueCents: Math.round(Number(paidWelcomeOrder.finalAmount) * 100),
+          });
+        } else {
+          console.log(`Skipping partner qualification for ${normalizedEmail} — no paid welcome order yet`);
+        }
+      } catch (partnerErr) {
+        console.error('Partner attribution/qualification failed (non-fatal):', partnerErr);
       }
 
       // Generate JWT token (same format as login)
