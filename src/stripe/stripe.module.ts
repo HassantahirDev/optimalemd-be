@@ -11,10 +11,9 @@ import { GoogleCalendarModule } from '../google-calendar/google-calendar.module'
 import { ReferralModule } from '../referral/referral.module';
 import { PaymentsModule } from '../payments/payments.module';
 import { PartnersModule } from '../partners/partners.module';
-import { SupplementsModule } from '../supplements/supplements.module';
 
 @Module({
-  imports: [ConfigModule, PrismaModule, AppointmentsModule, MailerModule, GoogleCalendarModule, ReferralModule, PaymentsModule, PartnersModule, SupplementsModule],
+  imports: [ConfigModule, PrismaModule, AppointmentsModule, MailerModule, GoogleCalendarModule, ReferralModule, PaymentsModule, PartnersModule],
   providers: [StripeService, StripePosService],
   controllers: [StripeController, StripeWebhookController, StripePosController],
   exports: [StripeService],

@@ -27,4 +27,14 @@ export const MEMBER_DISCOUNT_PERCENT = 20;
 export const memberPrice = (price: number) =>
   Math.round(price * (100 - MEMBER_DISCOUNT_PERCENT)) / 100;
 
+/** Marks a PaymentIntent as belonging to the supplements store (webhook routing). */
+export const SUPPLEMENT_PI_KIND = 'supplement_order';
+
+/**
+ * DI token for SupplementsService. StripeService resolves it lazily (ModuleRef)
+ * for the webhook, so SupplementsModule can import StripeModule — needed to check
+ * membership the same way the rest of the app does — without a module cycle.
+ */
+export const SUPPLEMENTS_SERVICE = 'SUPPLEMENTS_SERVICE';
+
 export const findSupplement = (slug: string) => SUPPLEMENT_CATALOG.find((p) => p.slug === slug);

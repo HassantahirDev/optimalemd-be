@@ -6,11 +6,17 @@ import Stripe from 'stripe';
 import { PrismaService } from '../prisma/prisma.service';
 import { MailerService } from '../mailer/mailer.service';
 import { PaymentLedgerService } from '../payments/payment-ledger.service';
-import { findSupplement, MEMBER_DISCOUNT_PERCENT, memberPrice, SUPPLEMENT_CATALOG } from './supplements.catalog';
+import { StripeService } from '../stripe/stripe.service';
+import {
+  findSupplement,
+  MEMBER_DISCOUNT_PERCENT,
+  memberPrice,
+  SUPPLEMENT_CATALOG,
+  SUPPLEMENT_PI_KIND,
+} from './supplements.catalog';
 import { CreateSupplementCheckoutDto } from './dto/checkout.dto';
 
-/** Marks a PaymentIntent as belonging to the supplements store (webhook routing). */
-export const SUPPLEMENT_PI_KIND = 'supplement_order';
+export { SUPPLEMENT_PI_KIND };
 
 const orderWithItems = Prisma.validator<Prisma.SupplementOrderDefaultArgs>()({
   include: { items: true },
@@ -32,6 +38,7 @@ export class SupplementsService {
     private readonly mailer: MailerService,
     private readonly config: ConfigService,
     private readonly ledger: PaymentLedgerService,
+    private readonly stripeService: StripeService,
   ) {
     this.stripe = new Stripe(this.config.get<string>('STRIPE_SECRET_KEY') as string, {
       apiVersion: '2025-10-29.clover' as any,
@@ -51,13 +58,26 @@ export class SupplementsService {
     };
   }
 
-  /** Signed-in patient (userType 'user') with their membership flag; null for guests/staff. */
+  /**
+   * Signed-in patient (userType 'user') and whether they're a member; null for
+   * guests/staff. Membership comes from the same check as the "Performance
+   * Member" badge (getSubscriptionStatus), which reconciles with Stripe live —
+   * the stored isSubscribed flag alone can lag behind a renewal or webhook.
+   */
   private async resolveMember(viewer: StoreViewer) {
     if (!viewer?.id || viewer.userType !== 'user') return null;
-    return this.prisma.user.findUnique({
+    const user = await this.prisma.user.findUnique({
       where: { id: viewer.id },
       select: { id: true, isSubscribed: true, stripeCustomerId: true },
     });
+    if (!user) return null;
+    try {
+      const status = await this.stripeService.getSubscriptionStatus(user.id);
+      return { ...user, isSubscribed: !!status?.isSubscribed };
+    } catch (err: any) {
+      this.logger.warn(`Membership check fell back to stored flag for ${user.id}: ${err?.message}`);
+      return user;
+    }
   }
 
   /**

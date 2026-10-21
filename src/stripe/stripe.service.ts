@@ -1,8 +1,10 @@
 import { Injectable, BadRequestException, NotFoundException, ForbiddenException } from '@nestjs/common';
+import { ModuleRef } from '@nestjs/core';
 import { ConfigService } from '@nestjs/config';
 import Stripe from 'stripe';
 import { PrismaService } from '../prisma/prisma.service';
-import { SupplementsService, SUPPLEMENT_PI_KIND } from '../supplements/supplements.service';
+import type { SupplementsService } from '../supplements/supplements.service';
+import { SUPPLEMENT_PI_KIND, SUPPLEMENTS_SERVICE } from '../supplements/supplements.catalog';
 import { AppointmentsService } from '../appointments/appointments.service';
 import { MailerService } from '../mailer/mailer.service';
 import { GoogleCalendarService } from '../google-calendar/google-calendar.service';
@@ -24,7 +26,7 @@ export class StripeService {
     private referralService: ReferralService,
     private paymentLedger: PaymentLedgerService,
     private partnersService: PartnersService,
-    private supplementsService: SupplementsService,
+    private moduleRef: ModuleRef,
   ) {
     const stripeKey = this.configService.get('STRIPE_SECRET_KEY');
     if (!stripeKey) {
@@ -1634,6 +1636,11 @@ export class StripeService {
     };
   }
 
+  /** Supplements store, resolved lazily (it depends on this service, not the reverse). */
+  private supplements(): SupplementsService {
+    return this.moduleRef.get<SupplementsService>(SUPPLEMENTS_SERVICE, { strict: false });
+  }
+
   /**
    * Get subscription status
    */
@@ -2320,7 +2327,7 @@ export class StripeService {
           // flows confirm on their own endpoints, so only supplement PIs are handled.
           const pi = event.data.object as Stripe.PaymentIntent;
           if (pi.metadata?.kind === SUPPLEMENT_PI_KIND) {
-            await this.supplementsService.handlePaymentSucceeded(pi);
+            await this.supplements().handlePaymentSucceeded(pi);
           }
           break;
         }
@@ -2340,7 +2347,7 @@ export class StripeService {
           );
           // No-op unless the PaymentIntent belongs to a supplements order.
           const refundedPi = typeof charge.payment_intent === 'string' ? charge.payment_intent : charge.payment_intent?.id;
-          if (refundedPi) await this.supplementsService.handleRefund(refundedPi, !!charge.refunded);
+          if (refundedPi) await this.supplements().handleRefund(refundedPi, !!charge.refunded);
           break;
         }
 
