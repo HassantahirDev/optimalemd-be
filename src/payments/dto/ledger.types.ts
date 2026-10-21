@@ -10,6 +10,7 @@ export type LedgerCategory =
   | 'MEMBERSHIP'
   | 'APPOINTMENT'
   | 'SIGNUP'
+  | 'SUPPLEMENT'
   | 'OTHER';
 export type LedgerBilling = 'ONE_TIME' | 'SUBSCRIPTION';
 export type LedgerStatus =

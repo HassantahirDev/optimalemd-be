@@ -32,6 +32,7 @@ import { AiModule } from './ai/ai.module';
 import { PaymentsModule } from './payments/payments.module';
 import { EmailCheckerModule } from './email-checker/email-checker.module';
 import { PartnersModule } from './partners/partners.module';
+import { SupplementsModule } from './supplements/supplements.module';
 
 @Module({
   imports: [
@@ -68,6 +69,7 @@ import { PartnersModule } from './partners/partners.module';
     EmailCheckerModule,
     PaymentsModule,
     PartnersModule,
+    SupplementsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

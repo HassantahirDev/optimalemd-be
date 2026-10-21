@@ -2,6 +2,7 @@ import { Injectable, BadRequestException, NotFoundException, ForbiddenException 
 import { ConfigService } from '@nestjs/config';
 import Stripe from 'stripe';
 import { PrismaService } from '../prisma/prisma.service';
+import { SupplementsService, SUPPLEMENT_PI_KIND } from '../supplements/supplements.service';
 import { AppointmentsService } from '../appointments/appointments.service';
 import { MailerService } from '../mailer/mailer.service';
 import { GoogleCalendarService } from '../google-calendar/google-calendar.service';
@@ -23,6 +24,7 @@ export class StripeService {
     private referralService: ReferralService,
     private paymentLedger: PaymentLedgerService,
     private partnersService: PartnersService,
+    private supplementsService: SupplementsService,
   ) {
     const stripeKey = this.configService.get('STRIPE_SECRET_KEY');
     if (!stripeKey) {
@@ -2312,6 +2314,17 @@ export class StripeService {
           break;
         }
 
+        case 'payment_intent.succeeded': {
+          // Supplements store fallback: records the order as paid if the shopper
+          // closed the tab before the storefront's confirm call. Other payment
+          // flows confirm on their own endpoints, so only supplement PIs are handled.
+          const pi = event.data.object as Stripe.PaymentIntent;
+          if (pi.metadata?.kind === SUPPLEMENT_PI_KIND) {
+            await this.supplementsService.handlePaymentSucceeded(pi);
+          }
+          break;
+        }
+
         case 'charge.refunded': {
           // --- Part D: reflect refunds in the ledger (previously untracked) ---
           const charge = event.data.object as any;
@@ -2325,6 +2338,9 @@ export class StripeService {
             },
             charge.amount_refunded != null ? charge.amount_refunded / 100 : null,
           );
+          // No-op unless the PaymentIntent belongs to a supplements order.
+          const refundedPi = typeof charge.payment_intent === 'string' ? charge.payment_intent : charge.payment_intent?.id;
+          if (refundedPi) await this.supplementsService.handleRefund(refundedPi, !!charge.refunded);
           break;
         }
 
