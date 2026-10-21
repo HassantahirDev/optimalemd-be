@@ -8,6 +8,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import Stripe from 'stripe';
 import { PrismaService } from '../prisma/prisma.service';
+import { linkGuestSupplementPurchases } from '../supplements/link-guest-purchases';
 import { MedicationsCombinedService } from './medications-combined.service';
 import { PaymentFlowsCombinedService } from './payment-flows-combined.service';
 
@@ -526,6 +527,10 @@ export class PaymentsPortalService implements OnModuleInit {
     const emails = Array.from(
       new Set([user.primaryEmail, user.email].filter(Boolean).map((e) => (e as string).toLowerCase())),
     );
+
+    // Guest supplements purchases made with this email (e.g. before signing up)
+    // become this patient's for good.
+    await linkGuestSupplementPurchases(this.prisma, userId, emails);
 
     // Everything for this patient from the SYNCED DB (fast). Matched by our
     // userId OR the billing email captured during sync (covers guest checkouts).

@@ -7,6 +7,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { MailerService } from '../mailer/mailer.service';
 import { PaymentLedgerService } from '../payments/payment-ledger.service';
 import { StripeService } from '../stripe/stripe.service';
+import { findUserIdByEmail, linkGuestSupplementPurchases } from './link-guest-purchases';
 import {
   findSupplement,
   MEMBER_DISCOUNT_PERCENT,
@@ -68,9 +69,11 @@ export class SupplementsService {
     if (!viewer?.id || viewer.userType !== 'user') return null;
     const user = await this.prisma.user.findUnique({
       where: { id: viewer.id },
-      select: { id: true, isSubscribed: true, stripeCustomerId: true },
+      select: { id: true, isSubscribed: true, stripeCustomerId: true, primaryEmail: true, email: true },
     });
     if (!user) return null;
+    // Claim any earlier guest purchases made with this patient's email.
+    void linkGuestSupplementPurchases(this.prisma, user.id, [user.primaryEmail, user.email]);
     try {
       const status = await this.stripeService.getSubscriptionStatus(user.id);
       return { ...user, isSubscribed: !!status?.isSubscribed };
@@ -116,8 +119,11 @@ export class SupplementsService {
     if (amountCents < 50) throw new BadRequestException('Order total is too low');
 
     const email = dto.email.trim().toLowerCase();
+    // Guest checkout with an email that already has an account → link it to that
+    // account (billing history) — but pricing stays list price unless signed in.
+    const userId = patient?.id ?? (await findUserIdByEmail(this.prisma, email));
     const order = await this.createOrderWithUniqueNumber({
-      userId: patient?.id ?? null,
+      userId,
       isMember,
       discountAmount,
       email,

@@ -2,6 +2,7 @@ import { BadRequestException, Injectable, Logger, NotFoundException } from '@nes
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { MailerService } from '../mailer/mailer.service';
+import { findUserIdByEmail, linkGuestSupplementPurchases } from './link-guest-purchases';
 import { FulfillmentStatus, ListSupplementOrdersQueryDto, UpdateFulfillmentDto } from './dto/admin-orders.dto';
 
 /** Staff view of supplements orders: listing, filtering and shipping updates. */
@@ -54,6 +55,16 @@ export class SupplementOrdersAdminService {
       // Tab counts respect the payment + search filters, not the status tab itself.
       this.prisma.supplementOrder.groupBy({ by: ['fulfillmentStatus'], where: base, _count: { _all: true } }),
     ]);
+
+    // Guest orders whose email now belongs to an account (signed up since) get
+    // linked to it, so they show as that patient's in billing and here.
+    const guestEmails = Array.from(new Set(orders.filter((o) => !o.userId).map((o) => o.email)));
+    for (const email of guestEmails) {
+      const userId = await findUserIdByEmail(this.prisma, email);
+      if (!userId) continue;
+      await linkGuestSupplementPurchases(this.prisma, userId, [email]);
+      for (const o of orders) if (!o.userId && o.email === email) o.userId = userId;
+    }
 
     const counts = { PENDING: 0, SHIPPED: 0, DELIVERED: 0 } as Record<FulfillmentStatus, number>;
     for (const g of grouped) counts[g.fulfillmentStatus as FulfillmentStatus] = g._count._all;
