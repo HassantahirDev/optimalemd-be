@@ -2,6 +2,7 @@ import { Injectable, BadRequestException, NotFoundException, ForbiddenException 
 import { ModuleRef } from '@nestjs/core';
 import { ConfigService } from '@nestjs/config';
 import Stripe from 'stripe';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import type { SupplementsService } from '../supplements/supplements.service';
 import { SUPPLEMENT_PI_KIND, SUPPLEMENTS_SERVICE } from '../supplements/supplements.catalog';
@@ -3312,6 +3313,101 @@ export class StripeService {
   /**
    * Get medication payment status
    */
+  /**
+   * Patient chart: has the patient paid for their most recently prescribed
+   * medications? Finds the latest appointment that actually has medications
+   * prescribed, and returns its invoice (what the patient is asked to pay), the
+   * payment/subscription state and the reminder history. Staff-only (checked by
+   * the controller), so any doctor/admin can see it, not just the visit's doctor.
+   */
+  async getLatestMedicationPaymentForPatient(patientId: string) {
+    const candidates = await this.prisma.appointment.findMany({
+      where: { patientId, NOT: { medications: { equals: Prisma.DbNull } } },
+      orderBy: [{ appointmentDate: 'desc' }, { appointmentTime: 'desc' }],
+      take: 25,
+      select: {
+        id: true,
+        appointmentDate: true,
+        appointmentTime: true,
+        medications: true,
+        notesSignedAt: true,
+        medicationPaymentReminderSentAt: true,
+        medicationPaymentReminderCount: true,
+        doctor: { select: { firstName: true, lastName: true } },
+      },
+    });
+    const latest = candidates.find((a) => this.appointmentsService.hasPrescribedMedications(a.medications));
+    if (!latest) return { hasPrescription: false };
+
+    const [payment, invoice] = await Promise.all([
+      this.getMedicationPaymentStatus(latest.id, '', 'admin'),
+      this.calculateMedicationInvoice(latest.id, patientId).catch(() => null),
+    ]);
+
+    return {
+      hasPrescription: true,
+      appointmentId: latest.id,
+      appointmentDate: latest.appointmentDate,
+      appointmentTime: latest.appointmentTime,
+      doctorName: latest.doctor ? `Dr. ${latest.doctor.firstName} ${latest.doctor.lastName}` : null,
+      notesSignedAt: latest.notesSignedAt,
+      reminder: {
+        lastSentAt: latest.medicationPaymentReminderSentAt,
+        count: latest.medicationPaymentReminderCount,
+      },
+      invoice: invoice
+        ? {
+            items: (invoice.items || []).map((i: any) => ({
+              name: i.name,
+              strength: i.strength,
+              dose: i.dose,
+              frequency: i.frequency,
+              route: i.route,
+              price: Number(i.price ?? 0),
+            })),
+            total: Number(invoice.total ?? 0),
+            requiresPremium: !!(invoice as any).requiresPremium,
+            premiumMonthly: Number((invoice as any).premiumMonthly ?? 0),
+            isSubscribed: !!invoice.isSubscribed,
+          }
+        : null,
+      paid: this.isMedicationPaid(payment),
+      payment,
+    };
+  }
+
+  /**
+   * Paid = the payment succeeded and, for a subscription, it's still billing
+   * (active/trialing, or set to cancel at period end). getMedicationPaymentStatus's
+   * own `paid` flag is subscription-only, so one-time payments need this.
+   */
+  private isMedicationPaid(p: any): boolean {
+    if (!p || p.status !== 'SUCCEEDED') return false;
+    if (!p.isSubscription) return true;
+    return ['active', 'trialing', 'canceling'].includes(p.subscriptionStatus);
+  }
+
+  /** Staff "remind to pay" for the latest prescription; refuses if it's already paid. */
+  async sendMedicationPaymentReminder(appointmentId: string) {
+    const appointment = await this.prisma.appointment.findUnique({
+      where: { id: appointmentId },
+      select: { patientId: true },
+    });
+    if (!appointment) throw new NotFoundException('Appointment not found');
+
+    const payment = await this.getMedicationPaymentStatus(appointmentId, '', 'admin');
+    if (this.isMedicationPaid(payment)) throw new BadRequestException('This patient has already paid for these medications.');
+
+    const invoice = await this.calculateMedicationInvoice(appointmentId, appointment.patientId).catch(() => null);
+    return this.appointmentsService.sendMedicationPaymentReminder(appointmentId, {
+      items: (invoice?.items || []).map((i: any) => ({
+        name: i.name,
+        detail: [i.strength, i.frequency].filter(Boolean).join(', ') || undefined,
+      })),
+      total: invoice?.total ? Number(invoice.total) : null,
+    });
+  }
+
   async getMedicationPaymentStatus(appointmentId: string, userId: string, userType?: string) {
     const appointment = await this.prisma.appointment.findUnique({
       where: { id: appointmentId },

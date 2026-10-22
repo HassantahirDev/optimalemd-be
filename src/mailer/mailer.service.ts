@@ -1625,6 +1625,72 @@ export class MailerService implements OnModuleInit {
   }
 
   /**
+   * Staff-sent reminder to pay for prescribed medications. Same look and the same
+   * one-click "Pay for Medications" button as the care-plan-ready email.
+   */
+  async sendMedicationPaymentReminderEmail(
+    patientEmail: string,
+    patientName: string,
+    paymentLink: string,
+    doctorName: string,
+    items: { name: string; detail?: string }[],
+    total: number | null,
+  ): Promise<void> {
+    const esc = (v: string) =>
+      v.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string));
+    const list = items.length
+      ? `<ul style="margin: 8px 0 0 0; padding-left: 20px;">${items
+          .map((i) => `<li>${esc(i.name)}${i.detail ? ` <span style="color: #6b7280;">(${esc(i.detail)})</span>` : ''}</li>`)
+          .join('')}</ul>`
+      : '';
+    const html = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      </head>
+      <body style="font-family: Arial, sans-serif; line-height: 1.6; margin: 0; padding: 20px; background-color: #f4f4f4; color: #333333;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); overflow: hidden;">
+          <div style="background-color: #000000; padding: 25px; text-align: center;">
+            <h1 style="color: #ffffff; font-size: 24px; font-weight: bold; text-transform: uppercase; margin: 0;">FormaMD</h1>
+          </div>
+          <div style="padding: 30px; text-align: center;">
+            <h2 style="color: #dc2626; font-size: 24px; font-weight: bold; margin-bottom: 20px;">Your Medications Are Waiting</h2>
+            <p>Dear ${esc(patientName)},</p>
+            <p>${esc(doctorName)} has prescribed your treatment, and it's ready to be sent out as soon as payment is complete.</p>
+            ${list ? `<div style="background-color: #f9f9f9; border-left: 4px solid #dc2626; padding: 20px; margin: 20px 0; text-align: left;">
+              <p style="margin: 0;"><strong>Prescribed for you:</strong></p>${list}
+              ${total ? `<p style="margin: 12px 0 0 0;"><strong>Total due: $${total.toFixed(2)}</strong></p>` : ''}
+            </div>` : ''}
+            <div style="text-align: center; margin: 30px 0;">
+              <a href="${paymentLink}" target="_blank" style="display: inline-block; background-color: #dc2626; color: #ffffff; text-decoration: none; font-weight: bold; font-size: 16px; padding: 14px 32px; border-radius: 8px;">Pay for Medications</a>
+              <p style="margin: 12px 0 0 0; font-size: 12px; color: #6b7280;">This secure link takes you straight to your care plan — no need to log in again.</p>
+            </div>
+            <div style="background-color: #f9f9f9; border-left: 4px solid #dc2626; padding: 20px; margin: 20px 0; text-align: left;">
+              <p style="margin: 0;">Once payment is made, your order will be processed and shipped within 5 business days.</p>
+            </div>
+            <p style="margin-top: 30px;">Best regards,<br><strong>The FormaMD Team</strong></p>
+          </div>
+          <div style="background-color: #000000; color: #ffffff; padding: 20px; text-align: center; font-size: 12px;">
+            <p>This is an automated email, please do not reply.</p>
+            <p>&copy; ${new Date().getFullYear()} FormaMD</p>
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+    const fromEmail = this.configService.get<string>('APPOINTMENT_SMTP_FROM') || this.configService.get<string>('SMTP_FROM');
+    await this.appointmentTransporter.sendMail({
+      from: `"FormaMD" <${fromEmail}>`,
+      to: patientEmail,
+      subject: 'Reminder: complete payment for your medications | FormaMD',
+      html,
+    });
+    console.log(`Medication payment reminder sent to ${patientEmail}`);
+  }
+
+  /**
    * Sent once the visit is closed out — the doctor signs the note, or records the
    * visit as completed, whichever happens first. Tells the patient their care plan
    * is viewable and that they can authorise payment for the treatment plan.

@@ -911,6 +911,9 @@ model Appointment {
   cancelledAt       DateTime?
   completedAt       DateTime?
   notesSignedAt     DateTime?  // When doctor signed the notes (locks editing)
+  // Staff-sent "please pay for your medications" reminders (patient chart button).
+  medicationPaymentReminderSentAt DateTime?
+  medicationPaymentReminderCount  Int       @default(0)
   
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
