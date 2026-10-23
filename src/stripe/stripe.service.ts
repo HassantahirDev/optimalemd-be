@@ -1733,6 +1733,21 @@ export class StripeService {
     }
   }
 
+  /**
+   * FormaMD and Optimale share one Stripe account but have separate databases,
+   * so every webhook endpoint also receives events for the OTHER app's patients.
+   * Those must be acknowledged and skipped — updating a user that isn't in this
+   * database throws, the webhook returns an error, and Stripe keeps retrying and
+   * eventually flags/disables the endpoint.
+   */
+  private async webhookUserExists(userId: string, event: Stripe.Event): Promise<boolean> {
+    const found = await this.prisma.user.findUnique({ where: { id: userId }, select: { id: true } });
+    if (!found) {
+      console.log(`ℹ️  ${event.type} ${event.id}: user ${userId} isn't in this database (other app) — skipping`);
+    }
+    return !!found;
+  }
+
   /** Supplements store, resolved lazily (it depends on this service, not the reverse). */
   private supplements(): SupplementsService {
     return this.moduleRef.get<SupplementsService>(SUPPLEMENTS_SERVICE, { strict: false });
@@ -2137,6 +2152,7 @@ export class StripeService {
             console.error('❌ No userId in subscription metadata');
             return { received: false, error: 'Missing userId' };
           }
+          if (!(await this.webhookUserExists(userId, event))) break;
 
           // P0: only the premium membership subscription may touch the user's premium fields.
           // Medication/other subscriptions are tracked by their own models — skip here.
@@ -2231,6 +2247,7 @@ export class StripeService {
             console.error('❌ No userId in subscription metadata');
             return { received: false, error: 'Missing userId' };
           }
+          if (!(await this.webhookUserExists(userId, event))) break;
 
           // P0: only premium-membership subscriptions affect premium status.
           if (subscription.metadata?.type !== 'premium_subscription') {
@@ -2308,6 +2325,7 @@ export class StripeService {
             console.error('❌ No userId in subscription metadata');
             return { received: false, error: 'Missing userId' };
           }
+          if (!(await this.webhookUserExists(userId, event))) break;
 
           // Every monthly renewal (membership or medications) goes into the payment
           // ledger, so it shows in the patient's billing history and totals. First
@@ -2411,6 +2429,7 @@ export class StripeService {
             console.error('❌ No userId in subscription metadata');
             return { received: false, error: 'Missing userId' };
           }
+          if (!(await this.webhookUserExists(userId, event))) break;
 
           // P0: only premium-membership invoices update the user's premium fields.
           if (sub.metadata?.type !== 'premium_subscription') {
