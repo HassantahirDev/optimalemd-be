@@ -422,7 +422,10 @@ export class AppointmentsController {
     @Query() query: QueryAppointmentsDto,
     @CurrentUser() user: any,
   ): Promise<PaginatedApiResponse<AppointmentWithRelationsResponseDto>> {
-    const { appointments, total } = await this.appointmentsService.getPatientAppointments(patientId, query);
+    const { appointments, total } = await this.appointmentsService.getPatientAppointments(patientId, query, {
+      // Patients don't see an encounter until the doctor signs it.
+      hideUnsignedEncounters: user?.userType === 'user',
+    });
     const page = query.page || 1;
     const limit = query.limit || 10;
     const totalPages = Math.ceil(total / limit);
@@ -901,6 +904,36 @@ export class AppointmentsController {
       data,
       timestamp: new Date().toISOString(),
       path: `/api/appointments/${id}/dr-assessment-notes`,
+    };
+  }
+
+  @Post('encounters')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Start a new encounter',
+    description:
+      "Doctor-only. Creates a fresh visit record for an existing patient (no slot, no payment, no emails) so the doctor can document changes; it completes when the notes are signed.",
+  })
+  async createEncounter(
+    @Body() body: { patientId: string },
+    @CurrentUser() user: any,
+  ): Promise<BaseApiResponse<any>> {
+    // Assistants sign in as their linked doctor (userType 'doctor', id = doctor's id).
+    if (user.userType !== 'doctor') {
+      throw new ForbiddenException('Only doctors can start an encounter.');
+    }
+    if (!body?.patientId || typeof body.patientId !== 'string') {
+      throw new BadRequestException('patientId is required');
+    }
+    const data = await this.appointmentsService.createEncounter(body.patientId, user.id);
+    return {
+      success: true,
+      statusCode: HttpStatus.CREATED,
+      message: 'Encounter started',
+      data,
+      timestamp: new Date().toISOString(),
+      path: '/api/appointments/encounters',
     };
   }
 
