@@ -106,7 +106,8 @@ export class PaymentLedgerService {
       if (
         input.category === 'MEDICATION' &&
         input.status === 'SUCCEEDED' &&
-        userId
+        userId &&
+        !input.skipMedicationLifecycle
       ) {
         await this.runMedicationLifecycle({
           paymentRecordId: recordId,

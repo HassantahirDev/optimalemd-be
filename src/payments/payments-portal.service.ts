@@ -663,6 +663,15 @@ export class PaymentsPortalService implements OnModuleInit {
           };
         });
 
+    // Paid Stripe invoices that aren't in the ledger still appear in the history
+    // (e.g. subscription renewals the webhook missed), so they belong in the
+    // total too — otherwise "Total paid" disagrees with the rows shown.
+    for (const iv of invoicesOut as any[]) {
+      if (iv.status === 'SUCCEEDED' && !ledgerInvoiceIds.has(iv.id)) {
+        lifetimePaid += Number(iv.amountPaid ?? iv.amount ?? 0);
+      }
+    }
+
     // Old payment flows (appointment consult, signup order, premium membership)
     // read from their own source tables — deduped against the synced ledger by
     // Stripe payment-intent so a charge is never shown or counted twice.
