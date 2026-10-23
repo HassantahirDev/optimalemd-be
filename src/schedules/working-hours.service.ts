@@ -457,6 +457,8 @@ export class WorkingHoursService {
               doctorId,
               appointmentDate: currentDate,
               status: { notIn: ['CANCELLED'] as any },
+              // Encounters are chart-only records with no slot — they never block booking.
+              isEncounter: false,
             },
             select: { appointmentTime: true, duration: true },
           });

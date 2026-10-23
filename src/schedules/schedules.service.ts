@@ -336,6 +336,7 @@ export class SchedulesService {
       where: {
         slotId: null,
         status: { not: 'CANCELLED' as any },
+        isEncounter: false, // encounters are chart records, not booked time
         appointmentDate: {
           gte: getUTCMidnight(dateStringToUTC(startDate)),
           lte: getUTCEndOfDay(dateStringToUTC(endDate || startDate)),
