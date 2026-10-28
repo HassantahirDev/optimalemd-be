@@ -171,6 +171,53 @@ export class NewSignupService {
   static readonly WELCOME_FEE_STANDARD = 65;
   static readonly WELCOME_FEE_MEDICAL_MARIJUANA = 150;
 
+  /**
+   * TEMPORARY test coupon: makes the welcome order $1 so real end-to-end test
+   * purchases (e.g. Google verifying the GTM `purchase` conversion) cost almost
+   * nothing. Checked and applied only here on the server — the code is never in
+   * the website bundle. Override with WELCOME_TEST_COUPON_CODE, or set it to
+   * "off" to disable. Remove once testing is done.
+   */
+  static readonly TEST_COUPON_CODE = 'forma1!';
+  static readonly TEST_COUPON_PRICE = 1;
+
+  private testCouponCode(): string | null {
+    const fromEnv = process.env.WELCOME_TEST_COUPON_CODE?.trim();
+    if (fromEnv && fromEnv.toLowerCase() === 'off') return null;
+    return (fromEnv || NewSignupService.TEST_COUPON_CODE).toLowerCase();
+  }
+
+  /** Applies the test coupon to an unpaid welcome order: total becomes $1. */
+  async applyWelcomeCoupon(welcomeOrderId: string, code: string) {
+    const expected = this.testCouponCode();
+    if (!expected || (code || '').trim().toLowerCase() !== expected) {
+      throw new BadRequestException('That coupon code is not valid.');
+    }
+
+    const order = await this.prisma.welcomeOrder.findUnique({ where: { id: welcomeOrderId } });
+    if (!order) throw new NotFoundException('Welcome order not found');
+    if (order.paymentStatus === 'SUCCEEDED') {
+      throw new BadRequestException('This order has already been paid.');
+    }
+
+    // Never raises the price (e.g. an order already fully covered by credit stays $0).
+    const finalAmount = Math.min(Number(order.finalAmount), NewSignupService.TEST_COUPON_PRICE);
+    const totalAmount = Number(order.totalAmount);
+    const updated = await this.prisma.welcomeOrder.update({
+      where: { id: welcomeOrderId },
+      data: {
+        finalAmount,
+        discountAmount: Math.round((totalAmount - finalAmount) * 100) / 100,
+        // The coupon replaces any partner credit reservation, so that credit isn't
+        // spent on an order that now costs $1.
+        partnerCreditPartnerId: null,
+        partnerCreditAppliedCents: null,
+      } as any,
+    });
+    console.log(`[welcome coupon] applied to ${updated.orderNumber}: $${finalAmount}`);
+    return updated;
+  }
+
   // Create a new welcome order
   async createWelcomeOrder(createDto: CreateWelcomeOrderDto) {
     const orderNumber = this.generateOrderNumber();
