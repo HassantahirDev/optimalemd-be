@@ -1,7 +1,11 @@
 import { Injectable, BadRequestException, NotFoundException, ForbiddenException } from '@nestjs/common';
+import { ModuleRef } from '@nestjs/core';
 import { ConfigService } from '@nestjs/config';
 import Stripe from 'stripe';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import type { SupplementsService } from '../supplements/supplements.service';
+import { SUPPLEMENT_PI_KIND, SUPPLEMENTS_SERVICE } from '../supplements/supplements.catalog';
 import { AppointmentsService } from '../appointments/appointments.service';
 import { MailerService } from '../mailer/mailer.service';
 import { GoogleCalendarService } from '../google-calendar/google-calendar.service';
@@ -23,6 +27,7 @@ export class StripeService {
     private referralService: ReferralService,
     private paymentLedger: PaymentLedgerService,
     private partnersService: PartnersService,
+    private moduleRef: ModuleRef,
   ) {
     const stripeKey = this.configService.get('STRIPE_SECRET_KEY');
     if (!stripeKey) {
@@ -862,11 +867,11 @@ export class StripeService {
 
     // Only set dates if they exist (subscription might be incomplete initially)
     const sub = subscription as any;
-    if (sub.current_period_start) {
-      subscriptionData.subscriptionStartDate = new Date(sub.current_period_start * 1000);
+    if (periodStartOf(sub)) {
+      subscriptionData.subscriptionStartDate = new Date(periodStartOf(sub) * 1000);
     }
-    if (sub.current_period_end) {
-      subscriptionData.subscriptionEndDate = new Date(sub.current_period_end * 1000);
+    if (periodEndOf(sub)) {
+      subscriptionData.subscriptionEndDate = new Date(periodEndOf(sub) * 1000);
     }
 
     await this.prisma.user.update({
@@ -981,7 +986,7 @@ export class StripeService {
       
       // Log subscription period info for debugging
       const sub = updatedSubscription as any;
-      console.log(`📅 Subscription period - start: ${sub.current_period_start}, end: ${sub.current_period_end}`);
+      console.log(`📅 Subscription period - start: ${periodStartOf(sub)}, end: ${periodEndOf(sub)}`);
     } catch (error: any) {
       console.error(`❌ Failed to retrieve updated subscription: ${error.message}`);
       // Use the original subscription if retrieval fails
@@ -997,8 +1002,8 @@ export class StripeService {
 
     // Access period dates - try subscription first, then invoice
     const sub = updatedSubscription as any;
-    const periodStart = sub.current_period_start ?? invoicePeriodStart;
-    const periodEnd = sub.current_period_end ?? invoicePeriodEnd;
+    const periodStart = periodStartOf(sub) ?? invoicePeriodStart;
+    const periodEnd = periodEndOf(sub) ?? invoicePeriodEnd;
     
     console.log(`🔍 Raw period values - start: ${periodStart} (type: ${typeof periodStart}), end: ${periodEnd} (type: ${typeof periodEnd})`);
     
@@ -1153,8 +1158,8 @@ export class StripeService {
     );
 
     // Get subscription end date
-    const subscriptionEndDate = (subscription as any).current_period_end
-      ? new Date((subscription as any).current_period_end * 1000)
+    const subscriptionEndDate = periodEndOf(subscription)
+      ? new Date(periodEndOf(subscription) * 1000)
       : user.subscriptionEndDate || new Date();
 
     // Update user
@@ -1329,8 +1334,8 @@ export class StripeService {
           const sub = updatedSubscription as any;
           
           // Extract dates with robust fallback logic (same as getSubscriptionStatus)
-          let periodStart: number | null = sub.current_period_start || null;
-          let periodEnd: number | null = sub.current_period_end || null;
+          let periodStart: number | null = periodStartOf(sub) || null;
+          let periodEnd: number | null = periodEndOf(sub) || null;
 
           // If subscription doesn't have dates, try to get from latest invoice
           if ((!periodStart || !periodEnd) && sub.latest_invoice) {
@@ -1485,8 +1490,8 @@ export class StripeService {
           const sub = updatedSubscription as any;
           
           // Extract dates with robust fallback logic (same as getSubscriptionStatus)
-          let periodStart: number | null = sub.current_period_start || null;
-          let periodEnd: number | null = sub.current_period_end || null;
+          let periodStart: number | null = periodStartOf(sub) || null;
+          let periodEnd: number | null = periodEndOf(sub) || null;
 
           // If subscription doesn't have dates, try to get from latest invoice
           if ((!periodStart || !periodEnd) && sub.latest_invoice) {
@@ -1633,6 +1638,122 @@ export class StripeService {
   }
 
   /**
+   * Stripe API 2025-03-31.basil+ (we use 2025-10-29.clover) removed
+   * `invoice.subscription` and `invoice.payment_intent`. Fill them back in from
+   * their new homes so the webhook code below keeps working. Never throws.
+   */
+  private async normalizeInvoice(invoice: any): Promise<void> {
+    try {
+      if (!invoice.subscription) {
+        const l0 = invoice.lines?.data?.[0];
+        invoice.subscription =
+          invoice.parent?.subscription_details?.subscription ||
+          l0?.subscription ||
+          l0?.parent?.subscription_item_details?.subscription ||
+          null;
+      }
+      if (!invoice.payment_intent) {
+        let payments = invoice.payments?.data;
+        if (!payments) {
+          const full: any = await this.stripe.invoices.retrieve(invoice.id, { expand: ['payments'] });
+          payments = full?.payments?.data;
+        }
+        const paid = (payments || []).find((p: any) => p?.payment?.payment_intent) || null;
+        const pi = paid?.payment?.payment_intent;
+        invoice.payment_intent = typeof pi === 'string' ? pi : pi?.id || null;
+      }
+    } catch (e: any) {
+      console.log(`ℹ️  Could not normalize invoice ${invoice?.id}: ${e?.message}`);
+    }
+  }
+
+  /**
+   * A paid monthly renewal (membership or medications) → one row in the unified
+   * payment ledger (billing history + totals). Idempotent on the invoice /
+   * payment intent. Doesn't touch medication order sets — a renewal never changes
+   * which medications are active. Never throws.
+   */
+  private async recordSubscriptionRenewalInLedger(invoice: any, sub: any, userId: string): Promise<void> {
+    try {
+      const type = sub?.metadata?.type || '';
+      const category =
+        type === 'premium_subscription' ? 'MEMBERSHIP' : type.startsWith('medication') ? 'MEDICATION' : 'OTHER';
+      const paymentIntentId: string | null = invoice.payment_intent || null;
+
+      let cardBrand: string | null = null;
+      let cardLast4: string | null = null;
+      let receiptUrl: string | null = null;
+      let chargeId: string | null = null;
+      if (paymentIntentId) {
+        try {
+          const pi: any = await this.stripe.paymentIntents.retrieve(paymentIntentId, { expand: ['latest_charge'] });
+          const charge: any = pi?.latest_charge;
+          if (charge) {
+            chargeId = charge.id || null;
+            receiptUrl = charge.receipt_url || null;
+            cardBrand = charge.payment_method_details?.card?.brand || null;
+            cardLast4 = charge.payment_method_details?.card?.last4 || null;
+          }
+        } catch {
+          /* card details are best-effort */
+        }
+      }
+
+      await this.paymentLedger.upsertFromStripe({
+        stripeInvoiceId: invoice.id,
+        stripePaymentIntentId: paymentIntentId,
+        stripeChargeId: chargeId,
+        stripeSubscriptionId: typeof invoice.subscription === 'string' ? invoice.subscription : sub?.id || null,
+        stripeCustomerId: typeof invoice.customer === 'string' ? invoice.customer : invoice.customer?.id || null,
+        userId,
+        channel: 'PLATFORM',
+        category: category as any,
+        billing: 'SUBSCRIPTION',
+        amount: (invoice.amount_paid ?? 0) / 100,
+        status: 'SUCCEEDED',
+        receiptUrl: receiptUrl || invoice.hosted_invoice_url || null,
+        hostedInvoiceUrl: invoice.hosted_invoice_url || null,
+        cardBrand,
+        cardLast4,
+        billingEmail: invoice.customer_email || null,
+        createdByType: 'system',
+        note: `${category === 'MEMBERSHIP' ? 'Membership' : category === 'MEDICATION' ? 'Medication' : 'Subscription'} renewal`,
+        paidAt: invoice.status_transitions?.paid_at ? new Date(invoice.status_transitions.paid_at * 1000) : new Date(),
+        lineItems: (invoice.lines?.data || []).map((l: any) => ({
+          description: l.description || 'Subscription',
+          quantity: l.quantity || 1,
+          unitAmount: (l.amount ?? 0) / 100 / (l.quantity || 1),
+          isSubscription: true,
+          category: category as any,
+        })),
+        skipMedicationLifecycle: true,
+      });
+    } catch (e: any) {
+      console.error(`❌ [LEDGER] Renewal not recorded for invoice ${invoice?.id}: ${e?.message}`);
+    }
+  }
+
+  /**
+   * FormaMD and Optimale share one Stripe account but have separate databases,
+   * so every webhook endpoint also receives events for the OTHER app's patients.
+   * Those must be acknowledged and skipped — updating a user that isn't in this
+   * database throws, the webhook returns an error, and Stripe keeps retrying and
+   * eventually flags/disables the endpoint.
+   */
+  private async webhookUserExists(userId: string, event: Stripe.Event): Promise<boolean> {
+    const found = await this.prisma.user.findUnique({ where: { id: userId }, select: { id: true } });
+    if (!found) {
+      console.log(`ℹ️  ${event.type} ${event.id}: user ${userId} isn't in this database (other app) — skipping`);
+    }
+    return !!found;
+  }
+
+  /** Supplements store, resolved lazily (it depends on this service, not the reverse). */
+  private supplements(): SupplementsService {
+    return this.moduleRef.get<SupplementsService>(SUPPLEMENTS_SERVICE, { strict: false });
+  }
+
+  /**
    * Get subscription status
    */
   async getSubscriptionStatus(userId: string) {
@@ -1706,11 +1827,11 @@ export class StripeService {
         
         // Always get dates from Stripe subscription first
         const sub = stripeSubscription as any;
-        console.log(`🔍 Subscription ${user.stripeSubscriptionId} - current_period_start: ${sub.current_period_start}, current_period_end: ${sub.current_period_end}`);
+        console.log(`🔍 Subscription ${user.stripeSubscriptionId} - current_period_start: ${periodStartOf(sub)}, current_period_end: ${periodEndOf(sub)}`);
         console.log(`🔍 Subscription status: ${sub.status}, id: ${sub.id}`);
         
         // Try to get period dates from latest invoice ONLY if subscription doesn't have them
-        if ((!sub.current_period_start || !sub.current_period_end) && sub.latest_invoice) {
+        if ((!periodStartOf(sub) || !periodEndOf(sub)) && sub.latest_invoice) {
           try {
             const invoiceId = typeof sub.latest_invoice === 'string' ? sub.latest_invoice : sub.latest_invoice?.id;
             if (invoiceId) {
@@ -1719,11 +1840,11 @@ export class StripeService {
               console.log(`🔍 Invoice ${invoiceId} - period_start: ${inv.period_start}, period_end: ${inv.period_end}`);
               
               // Only use invoice dates if subscription doesn't have them
-              if (!sub.current_period_start && inv.period_start) {
+              if (!periodStartOf(sub) && inv.period_start) {
                 invoicePeriodStart = inv.period_start;
                 console.log(`📅 Using period_start from invoice: ${invoicePeriodStart}`);
               }
-              if (!sub.current_period_end && inv.period_end) {
+              if (!periodEndOf(sub) && inv.period_end) {
                 invoicePeriodEnd = inv.period_end;
                 console.log(`📅 Using period_end from invoice: ${invoicePeriodEnd}`);
               }
@@ -1736,8 +1857,8 @@ export class StripeService {
         // Access period dates - prefer subscription, fallback to invoice
         // IMPORTANT: Only use invoicePeriodStart if subscription period_start is missing
         // Only use invoicePeriodEnd if subscription period_end is missing
-        const periodStart = sub.current_period_start ?? invoicePeriodStart;
-        const periodEnd = sub.current_period_end ?? invoicePeriodEnd;
+        const periodStart = periodStartOf(sub) ?? invoicePeriodStart;
+        const periodEnd = periodEndOf(sub) ?? invoicePeriodEnd;
         
         console.log(`🔍 Final period values - start: ${periodStart} (type: ${typeof periodStart}), end: ${periodEnd} (type: ${typeof periodEnd})`);
         
@@ -1779,11 +1900,15 @@ export class StripeService {
         const isActiveInStripe = stripeStatus === 'active' || stripeStatus === 'trialing';
         
         // Check if we need to update database (status mismatch or missing dates)
-        const needsUpdate = 
-          stripeStatus !== dbStatus || 
+        // Dates are re-synced whenever Stripe's differ, not only when missing —
+        // otherwise every renewal left the stored period stuck on the first month.
+        const sameTime = (a: Date | null | undefined, b: Date | null) =>
+          !!a && !!b && new Date(a).getTime() === b.getTime();
+        const needsUpdate =
+          stripeStatus !== dbStatus ||
           (isActiveInStripe && !user.isSubscribed) ||
-          (!user.subscriptionStartDate && stripeStartDate) ||
-          (!user.subscriptionEndDate && stripeEndDate);
+          (!!stripeStartDate && !sameTime(user.subscriptionStartDate, stripeStartDate)) ||
+          (!!stripeEndDate && !sameTime(user.subscriptionEndDate, stripeEndDate));
         
         if (needsUpdate) {
           console.log('Syncing subscription status from Stripe:', {
@@ -2027,6 +2152,7 @@ export class StripeService {
             console.error('❌ No userId in subscription metadata');
             return { received: false, error: 'Missing userId' };
           }
+          if (!(await this.webhookUserExists(userId, event))) break;
 
           // P0: only the premium membership subscription may touch the user's premium fields.
           // Medication/other subscriptions are tracked by their own models — skip here.
@@ -2051,8 +2177,8 @@ export class StripeService {
           console.log(`   User: ${userId}, Status: ${subscription.status}, Active: ${isActive}`);
           
           // Extract dates with robust fallback logic (same as renewSubscription)
-          let periodStart: number | null = sub.current_period_start || null;
-          let periodEnd: number | null = sub.current_period_end || null;
+          let periodStart: number | null = periodStartOf(sub) || null;
+          let periodEnd: number | null = periodEndOf(sub) || null;
 
           // If subscription doesn't have dates, try to get from latest invoice
           if ((!periodStart || !periodEnd) && sub.latest_invoice) {
@@ -2121,6 +2247,7 @@ export class StripeService {
             console.error('❌ No userId in subscription metadata');
             return { received: false, error: 'Missing userId' };
           }
+          if (!(await this.webhookUserExists(userId, event))) break;
 
           // P0: only premium-membership subscriptions affect premium status.
           if (subscription.metadata?.type !== 'premium_subscription') {
@@ -2177,6 +2304,10 @@ export class StripeService {
             break;
           }
 
+          // Clover API moved the subscription / payment intent off the invoice —
+          // without this every renewal was skipped as "not a subscription".
+          await this.normalizeInvoice(invoice);
+
           if (!invoice.subscription) {
             console.log('ℹ️  Invoice not related to subscription, skipping');
             return { received: true };
@@ -2194,6 +2325,14 @@ export class StripeService {
             console.error('❌ No userId in subscription metadata');
             return { received: false, error: 'Missing userId' };
           }
+          if (!(await this.webhookUserExists(userId, event))) break;
+
+          // Every monthly renewal (membership or medications) goes into the payment
+          // ledger, so it shows in the patient's billing history and totals. First
+          // payments are recorded by their own checkout flows, so only cycles here.
+          if (invoice.billing_reason === 'subscription_cycle') {
+            await this.recordSubscriptionRenewalInLedger(invoice, sub, userId);
+          }
 
           // P0: only premium-membership invoices update the user's premium fields. A medication
           // (or other) subscription invoice must not flip premium membership status/dates.
@@ -2205,8 +2344,8 @@ export class StripeService {
           console.log(`✅ Activating subscription for user ${userId}`);
           
           // Extract dates with robust fallback logic (same as renewSubscription)
-          let periodStart: number | null = sub.current_period_start || null;
-          let periodEnd: number | null = sub.current_period_end || null;
+          let periodStart: number | null = periodStartOf(sub) || null;
+          let periodEnd: number | null = periodEndOf(sub) || null;
 
           // If subscription doesn't have dates, try to get from invoice
           if ((!periodStart || !periodEnd) && invoice.period_start) {
@@ -2270,6 +2409,8 @@ export class StripeService {
             break;
           }
 
+          await this.normalizeInvoice(invoice);
+
           if (!invoice.subscription) {
             console.log('ℹ️  Invoice not related to subscription, skipping');
             return { received: true };
@@ -2288,6 +2429,7 @@ export class StripeService {
             console.error('❌ No userId in subscription metadata');
             return { received: false, error: 'Missing userId' };
           }
+          if (!(await this.webhookUserExists(userId, event))) break;
 
           // P0: only premium-membership invoices update the user's premium fields.
           if (sub.metadata?.type !== 'premium_subscription') {
@@ -2312,6 +2454,17 @@ export class StripeService {
           break;
         }
 
+        case 'payment_intent.succeeded': {
+          // Supplements store fallback: records the order as paid if the shopper
+          // closed the tab before the storefront's confirm call. Other payment
+          // flows confirm on their own endpoints, so only supplement PIs are handled.
+          const pi = event.data.object as Stripe.PaymentIntent;
+          if (pi.metadata?.kind === SUPPLEMENT_PI_KIND) {
+            await this.supplements().handlePaymentSucceeded(pi);
+          }
+          break;
+        }
+
         case 'charge.refunded': {
           // --- Part D: reflect refunds in the ledger (previously untracked) ---
           const charge = event.data.object as any;
@@ -2325,6 +2478,9 @@ export class StripeService {
             },
             charge.amount_refunded != null ? charge.amount_refunded / 100 : null,
           );
+          // No-op unless the PaymentIntent belongs to a supplements order.
+          const refundedPi = typeof charge.payment_intent === 'string' ? charge.payment_intent : charge.payment_intent?.id;
+          if (refundedPi) await this.supplements().handleRefund(refundedPi, !!charge.refunded);
           break;
         }
 
@@ -3169,8 +3325,8 @@ export class StripeService {
       try {
         const subscription = await this.stripe.subscriptions.retrieve(payment.stripeSubscriptionId);
         subscriptionStatus = subscription.status;
-        subscriptionEndDate = (subscription as any).current_period_end
-          ? new Date((subscription as any).current_period_end * 1000)
+        subscriptionEndDate = periodEndOf(subscription)
+          ? new Date(periodEndOf(subscription) * 1000)
           : null;
       } catch (error) {
         console.error('Error retrieving subscription status after confirmation:', error);
@@ -3289,6 +3445,101 @@ export class StripeService {
   /**
    * Get medication payment status
    */
+  /**
+   * Patient chart: has the patient paid for their most recently prescribed
+   * medications? Finds the latest appointment that actually has medications
+   * prescribed, and returns its invoice (what the patient is asked to pay), the
+   * payment/subscription state and the reminder history. Staff-only (checked by
+   * the controller), so any doctor/admin can see it, not just the visit's doctor.
+   */
+  async getLatestMedicationPaymentForPatient(patientId: string) {
+    const candidates = await this.prisma.appointment.findMany({
+      where: { patientId, NOT: { medications: { equals: Prisma.DbNull } } },
+      orderBy: [{ appointmentDate: 'desc' }, { appointmentTime: 'desc' }],
+      take: 25,
+      select: {
+        id: true,
+        appointmentDate: true,
+        appointmentTime: true,
+        medications: true,
+        notesSignedAt: true,
+        medicationPaymentReminderSentAt: true,
+        medicationPaymentReminderCount: true,
+        doctor: { select: { firstName: true, lastName: true } },
+      },
+    });
+    const latest = candidates.find((a) => this.appointmentsService.hasPrescribedMedications(a.medications));
+    if (!latest) return { hasPrescription: false };
+
+    const [payment, invoice] = await Promise.all([
+      this.getMedicationPaymentStatus(latest.id, '', 'admin'),
+      this.calculateMedicationInvoice(latest.id, patientId).catch(() => null),
+    ]);
+
+    return {
+      hasPrescription: true,
+      appointmentId: latest.id,
+      appointmentDate: latest.appointmentDate,
+      appointmentTime: latest.appointmentTime,
+      doctorName: latest.doctor ? `Dr. ${latest.doctor.firstName} ${latest.doctor.lastName}` : null,
+      notesSignedAt: latest.notesSignedAt,
+      reminder: {
+        lastSentAt: latest.medicationPaymentReminderSentAt,
+        count: latest.medicationPaymentReminderCount,
+      },
+      invoice: invoice
+        ? {
+            items: (invoice.items || []).map((i: any) => ({
+              name: i.name,
+              strength: i.strength,
+              dose: i.dose,
+              frequency: i.frequency,
+              route: i.route,
+              price: Number(i.price ?? 0),
+            })),
+            total: Number(invoice.total ?? 0),
+            requiresPremium: !!(invoice as any).requiresPremium,
+            premiumMonthly: Number((invoice as any).premiumMonthly ?? 0),
+            isSubscribed: !!invoice.isSubscribed,
+          }
+        : null,
+      paid: this.isMedicationPaid(payment),
+      payment,
+    };
+  }
+
+  /**
+   * Paid = the payment succeeded and, for a subscription, it's still billing
+   * (active/trialing, or set to cancel at period end). getMedicationPaymentStatus's
+   * own `paid` flag is subscription-only, so one-time payments need this.
+   */
+  private isMedicationPaid(p: any): boolean {
+    if (!p || p.status !== 'SUCCEEDED') return false;
+    if (!p.isSubscription) return true;
+    return ['active', 'trialing', 'canceling'].includes(p.subscriptionStatus);
+  }
+
+  /** Staff "remind to pay" for the latest prescription; refuses if it's already paid. */
+  async sendMedicationPaymentReminder(appointmentId: string) {
+    const appointment = await this.prisma.appointment.findUnique({
+      where: { id: appointmentId },
+      select: { patientId: true },
+    });
+    if (!appointment) throw new NotFoundException('Appointment not found');
+
+    const payment = await this.getMedicationPaymentStatus(appointmentId, '', 'admin');
+    if (this.isMedicationPaid(payment)) throw new BadRequestException('This patient has already paid for these medications.');
+
+    const invoice = await this.calculateMedicationInvoice(appointmentId, appointment.patientId).catch(() => null);
+    return this.appointmentsService.sendMedicationPaymentReminder(appointmentId, {
+      items: (invoice?.items || []).map((i: any) => ({
+        name: i.name,
+        detail: [i.strength, i.frequency].filter(Boolean).join(', ') || undefined,
+      })),
+      total: invoice?.total ? Number(invoice.total) : null,
+    });
+  }
+
   async getMedicationPaymentStatus(appointmentId: string, userId: string, userType?: string) {
     const appointment = await this.prisma.appointment.findUnique({
       where: { id: appointmentId },
@@ -3332,8 +3583,8 @@ export class StripeService {
         // (the Stripe Billing Portal / dashboard use cancel_at). Treat either as canceling so a
         // cancellation done directly in Stripe is reflected here.
         cancelAtPeriodEnd = !!(subscription.cancel_at_period_end || (subscription as any).cancel_at);
-        currentPeriodEnd = (subscription as any).current_period_end
-          ? new Date((subscription as any).current_period_end * 1000)
+        currentPeriodEnd = periodEndOf(subscription)
+          ? new Date(periodEndOf(subscription) * 1000)
           : null;
         
         // Update database with latest subscription status
@@ -3342,8 +3593,8 @@ export class StripeService {
         
         // Get period dates with fallback logic
         const sub = subscription as any;
-        let periodStart: number | null = sub.current_period_start || null;
-        let periodEnd: number | null = sub.current_period_end || null;
+        let periodStart: number | null = periodStartOf(sub) || null;
+        let periodEnd: number | null = periodEndOf(sub) || null;
 
         // If subscription doesn't have period dates, try to get from latest invoice
         if ((!periodStart || !periodEnd) && sub.latest_invoice) {
@@ -3537,8 +3788,8 @@ export class StripeService {
         
         // Get subscription end date with robust fallback logic (same as monthly subscription)
         const sub = updatedSubscription as any;
-        let periodStart: number | null = sub.current_period_start || null;
-        let periodEnd: number | null = sub.current_period_end || null;
+        let periodStart: number | null = periodStartOf(sub) || null;
+        let periodEnd: number | null = periodEndOf(sub) || null;
 
         console.log(`🔍 Subscription ${sub.id} - current_period_start: ${periodStart}, current_period_end: ${periodEnd}`);
 
@@ -3742,7 +3993,7 @@ export class StripeService {
 
         // Get subscription end date with robust fallback logic
         const sub = updatedSubscription as any;
-        let periodEnd: number | null = sub.current_period_end || null;
+        let periodEnd: number | null = periodEndOf(sub) || null;
 
         // If subscription doesn't have period_end, try to get from latest invoice
         if (!periodEnd && sub.latest_invoice) {
@@ -3819,4 +4070,18 @@ export class StripeService {
       return null;
     }
   }
+}
+
+/**
+ * A subscription's current billing period (unix seconds). Since Stripe API
+ * 2025-03-31.basil (we use 2025-10-29.clover) `current_period_start/end` live on
+ * the subscription ITEMS, not the subscription — reading the old field gives
+ * undefined, and the invoice-period fallback then returns the PREVIOUS period
+ * (a renewal invoice bills the period that just ended). Read both places.
+ */
+function periodStartOf(sub: any): any {
+  return sub?.current_period_start ?? sub?.items?.data?.[0]?.current_period_start ?? null;
+}
+function periodEndOf(sub: any): any {
+  return sub?.current_period_end ?? sub?.items?.data?.[0]?.current_period_end ?? null;
 }

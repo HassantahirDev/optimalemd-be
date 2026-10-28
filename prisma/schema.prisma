@@ -911,6 +911,9 @@ model Appointment {
   cancelledAt       DateTime?
   completedAt       DateTime?
   notesSignedAt     DateTime?  // When doctor signed the notes (locks editing)
+  // Staff-sent "please pay for your medications" reminders (patient chart button).
+  medicationPaymentReminderSentAt DateTime?
+  medicationPaymentReminderCount  Int       @default(0)
   
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
@@ -1038,6 +1041,7 @@ enum PaymentCategory {
   MEMBERSHIP
   APPOINTMENT
   SIGNUP
+  SUPPLEMENT // one-time supplements store purchase
   OTHER
 }
 
@@ -1368,6 +1372,9 @@ model Medication {
   // this column is the authoritative source and is never inferred at runtime.
   // Null = no Stripe price; the doctor types the amount by hand.
   stripePriceId   String?
+  // Default "Price for this prescription" in the doctor's dialog. When set it
+  // takes priority over the linked Stripe price; null = use Stripe as before.
+  defaultPrice    Decimal? @db.Decimal(10, 2)
   isActive        Boolean  @default(true)
   
   // Legacy fields for backward compatibility
@@ -1791,4 +1798,88 @@ enum PayoutRequestStatus {
   PENDING
   COMPLETED
   REJECTED
+}
+
+// ─── Supplements store ──────────────────────────────────────────────────────
+// Over-the-counter products sold through the public /supplements storefront.
+// No prescription or account needed (guest checkout), so orders carry their own
+// contact + shipping details rather than relying on a User row. Product names and
+// prices are snapshotted per line so later catalogue changes never rewrite history.
+
+enum SupplementOrderStatus {
+  PENDING   // created, awaiting card payment
+  PAID      // PaymentIntent succeeded
+  FAILED    // payment failed / abandoned
+  CANCELLED
+  REFUNDED
+}
+
+// Shipping progress, set by staff in the admin "Orders" page. Separate from the
+// payment status above: only PAID orders are fulfilled.
+enum SupplementFulfillmentStatus {
+  PENDING   // paid, not shipped yet
+  SHIPPED   // handed to the carrier — customer is emailed
+  DELIVERED
+}
+
+model SupplementOrder {
+  id                      String                @id @default(uuid())
+  orderNumber             String                @unique // human-readable, e.g. SUP-7K2Q9F
+  status                  SupplementOrderStatus @default(PENDING)
+  // Set when a signed-in patient checks out (soft link, like PaymentRecord) so the
+  // order shows in their billing history; null for guest checkout.
+  userId                  String?
+  // Member pricing was applied (patient had an active membership at checkout).
+  isMember                Boolean               @default(false)
+  email                   String
+  firstName               String
+  lastName                String
+  phone                   String?
+  shippingLine1           String
+  shippingLine2           String?
+  shippingCity            String
+  shippingState           String
+  shippingPostalCode      String
+  shippingCountry         String                @default("US")
+  subtotal                Decimal               @db.Decimal(10, 2)
+  discountAmount          Decimal               @default(0) @db.Decimal(10, 2) // member savings vs list price
+  shippingAmount          Decimal               @default(0) @db.Decimal(10, 2)
+  total                   Decimal               @db.Decimal(10, 2)
+  currency                String                @default("usd")
+  stripePaymentIntentId   String?               @unique
+  paidAt                  DateTime?
+  confirmationEmailSentAt DateTime? // claimed atomically so the confirm call and the webhook never both email
+  fulfillmentStatus       SupplementFulfillmentStatus @default(PENDING)
+  carrier                 String?
+  trackingNumber          String?
+  shippedAt               DateTime?
+  deliveredAt             DateTime?
+  shippedEmailSentAt      DateTime? // when the "on its way" email went out
+  fulfillmentUpdatedById  String?   // admin who last changed the shipping status
+  createdAt               DateTime              @default(now())
+  updatedAt               DateTime              @updatedAt
+
+  items SupplementOrderItem[]
+
+  @@index([email])
+  @@index([userId])
+  @@index([status, createdAt])
+  @@index([fulfillmentStatus, createdAt])
+  @@map("supplement_orders")
+}
+
+model SupplementOrderItem {
+  id          String  @id @default(uuid())
+  orderId     String
+  productSlug String
+  productName String
+  unitPrice   Decimal @db.Decimal(10, 2) // price actually charged per unit
+  listPrice   Decimal? @db.Decimal(10, 2) // non-member price, for showing the saving
+  quantity    Int
+  lineTotal   Decimal @db.Decimal(10, 2)
+
+  order SupplementOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@map("supplement_order_items")
 }

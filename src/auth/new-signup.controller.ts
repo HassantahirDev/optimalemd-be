@@ -186,6 +186,17 @@ export class NewSignupController {
     );
   }
 
+  // TEMPORARY test coupon ("forma1!") — makes the welcome order $1. Validated server-side.
+  @Post('welcome-order/:welcomeOrderId/coupon')
+  @HttpCode(HttpStatus.OK)
+  async applyWelcomeCoupon(
+    @Param('welcomeOrderId') welcomeOrderId: string,
+    @Body() body: { code?: string },
+  ) {
+    const data = await this.newSignupService.applyWelcomeCoupon(welcomeOrderId, String(body?.code ?? ''));
+    return { success: true, data };
+  }
+
   // Confirm a welcome order that's fully covered by partner credit ($0 due) — no
   // Stripe payment intent exists for these, so it can't go through the normal
   // payment-status endpoint above.

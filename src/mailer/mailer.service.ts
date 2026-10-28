@@ -1625,6 +1625,72 @@ export class MailerService implements OnModuleInit {
   }
 
   /**
+   * Staff-sent reminder to pay for prescribed medications. Same look and the same
+   * one-click "Pay for Medications" button as the care-plan-ready email.
+   */
+  async sendMedicationPaymentReminderEmail(
+    patientEmail: string,
+    patientName: string,
+    paymentLink: string,
+    doctorName: string,
+    items: { name: string; detail?: string }[],
+    total: number | null,
+  ): Promise<void> {
+    const esc = (v: string) =>
+      v.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string));
+    const list = items.length
+      ? `<ul style="margin: 8px 0 0 0; padding-left: 20px;">${items
+          .map((i) => `<li>${esc(i.name)}${i.detail ? ` <span style="color: #6b7280;">(${esc(i.detail)})</span>` : ''}</li>`)
+          .join('')}</ul>`
+      : '';
+    const html = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      </head>
+      <body style="font-family: Arial, sans-serif; line-height: 1.6; margin: 0; padding: 20px; background-color: #f4f4f4; color: #333333;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); overflow: hidden;">
+          <div style="background-color: #000000; padding: 25px; text-align: center;">
+            <h1 style="color: #ffffff; font-size: 24px; font-weight: bold; text-transform: uppercase; margin: 0;">FormaMD</h1>
+          </div>
+          <div style="padding: 30px; text-align: center;">
+            <h2 style="color: #dc2626; font-size: 24px; font-weight: bold; margin-bottom: 20px;">Your Medications Are Waiting</h2>
+            <p>Dear ${esc(patientName)},</p>
+            <p>${esc(doctorName)} has prescribed your treatment, and it's ready to be sent out as soon as payment is complete.</p>
+            ${list ? `<div style="background-color: #f9f9f9; border-left: 4px solid #dc2626; padding: 20px; margin: 20px 0; text-align: left;">
+              <p style="margin: 0;"><strong>Prescribed for you:</strong></p>${list}
+              ${total ? `<p style="margin: 12px 0 0 0;"><strong>Total due: $${total.toFixed(2)}</strong></p>` : ''}
+            </div>` : ''}
+            <div style="text-align: center; margin: 30px 0;">
+              <a href="${paymentLink}" target="_blank" style="display: inline-block; background-color: #dc2626; color: #ffffff; text-decoration: none; font-weight: bold; font-size: 16px; padding: 14px 32px; border-radius: 8px;">Pay for Medications</a>
+              <p style="margin: 12px 0 0 0; font-size: 12px; color: #6b7280;">This secure link takes you straight to your care plan — no need to log in again.</p>
+            </div>
+            <div style="background-color: #f9f9f9; border-left: 4px solid #dc2626; padding: 20px; margin: 20px 0; text-align: left;">
+              <p style="margin: 0;">Once payment is made, your order will be processed and shipped within 5 business days.</p>
+            </div>
+            <p style="margin-top: 30px;">Best regards,<br><strong>The FormaMD Team</strong></p>
+          </div>
+          <div style="background-color: #000000; color: #ffffff; padding: 20px; text-align: center; font-size: 12px;">
+            <p>This is an automated email, please do not reply.</p>
+            <p>&copy; ${new Date().getFullYear()} FormaMD</p>
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+    const fromEmail = this.configService.get<string>('APPOINTMENT_SMTP_FROM') || this.configService.get<string>('SMTP_FROM');
+    await this.appointmentTransporter.sendMail({
+      from: `"FormaMD" <${fromEmail}>`,
+      to: patientEmail,
+      subject: 'Reminder: complete payment for your medications | FormaMD',
+      html,
+    });
+    console.log(`Medication payment reminder sent to ${patientEmail}`);
+  }
+
+  /**
    * Sent once the visit is closed out — the doctor signs the note, or records the
    * visit as completed, whichever happens first. Tells the patient their care plan
    * is viewable and that they can authorise payment for the treatment plan.
@@ -1668,7 +1734,7 @@ export class MailerService implements OnModuleInit {
 
             ${carePlanLink ? `
             <div style="text-align: center; margin: 30px 0;">
-              <a href="${carePlanLink}" target="_blank" style="display: inline-block; background-color: #dc2626; color: #ffffff; text-decoration: none; font-weight: bold; font-size: 16px; padding: 14px 32px; border-radius: 8px;">View Your Care Plan</a>
+              <a href="${carePlanLink}" target="_blank" style="display: inline-block; background-color: #dc2626; color: #ffffff; text-decoration: none; font-weight: bold; font-size: 16px; padding: 14px 32px; border-radius: 8px;">${hasMedications ? 'Pay for Medications' : 'View Your Care Plan'}</a>
               <p style="margin: 12px 0 0 0; font-size: 12px; color: #6b7280;">This secure link takes you straight to your care plan — no need to log in again.</p>
             </div>` : ''}
 
@@ -4814,4 +4880,136 @@ For your security, you will be asked to set a new password the first time you lo
       throw error;
     }
   }
-} 
+
+  // ─── Supplements store ────────────────────────────────────────────────────
+
+  private escapeHtml(v: string): string {
+    return v.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string));
+  }
+
+  /** `intro` must already be HTML-safe — callers escape any customer input in it. */
+  private supplementOrderHtml(order: SupplementOrderEmail, intro: string, heading: string): string {
+    const esc = (v: string) => this.escapeHtml(v);
+    const money = (n: number) => `$${n.toFixed(2)}`;
+    const rows = order.items
+      .map(
+        (i) => `<tr>
+          <td style="padding: 10px 0; border-bottom: 1px solid #eee;">${esc(i.name)} &times; ${i.quantity}</td>
+          <td style="padding: 10px 0; border-bottom: 1px solid #eee; text-align: right;">${money(i.lineTotal)}</td>
+        </tr>`,
+      )
+      .join('');
+    return `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      </head>
+      <body style="font-family: Arial, sans-serif; line-height: 1.6; margin: 0; padding: 20px; background-color: #f4f4f4; color: #333333;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; overflow: hidden;">
+          <div style="background-color: #000000; padding: 25px; text-align: center;">
+            <h1 style="color: #ffffff; font-size: 24px; font-weight: bold; text-transform: uppercase; margin: 0;">FormaMD</h1>
+          </div>
+          <div style="padding: 30px;">
+            <h2 style="color: #dc2626; font-size: 22px; margin: 0 0 16px 0;">${heading}</h2>
+            <p>${intro}</p>
+            <p style="margin: 20px 0 6px 0;"><strong>Order ${esc(order.orderNumber)}</strong></p>
+            <table style="width: 100%; border-collapse: collapse;">
+              ${rows}
+              ${order.discount && order.discount > 0 ? `<tr>
+                <td style="padding: 10px 0; color: #16a34a;">Member savings (20% off)</td>
+                <td style="padding: 10px 0; text-align: right; color: #16a34a;">&minus;${money(order.discount)}</td>
+              </tr>` : ''}
+              <tr>
+                <td style="padding: 10px 0;">Shipping</td>
+                <td style="padding: 10px 0; text-align: right;">Free</td>
+              </tr>
+              <tr>
+                <td style="padding: 10px 0; font-weight: bold;">Total</td>
+                <td style="padding: 10px 0; text-align: right; font-weight: bold;">${money(order.total)}</td>
+              </tr>
+            </table>
+            <div style="background-color: #f9f9f9; border-left: 4px solid #dc2626; padding: 16px 20px; margin: 20px 0;">
+              <p style="margin: 0 0 6px 0;"><strong>Shipping to</strong></p>
+              <p style="margin: 0;">${esc(`${order.firstName} ${order.lastName}`)}<br>${order.address.map(esc).join('<br>')}</p>
+            </div>
+            <p style="font-size: 12px; color: #6b7280;">These statements have not been evaluated by the Food and Drug Administration. This product is not intended to diagnose, treat, cure, or prevent any disease.</p>
+          </div>
+          <div style="background-color: #000000; color: #ffffff; padding: 20px; text-align: center; font-size: 12px;">
+            <p style="margin: 0;">&copy; ${new Date().getFullYear()} FormaMD</p>
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+  }
+
+  /** Customer receipt for a paid supplements order. */
+  async sendSupplementOrderConfirmation(order: SupplementOrderEmail): Promise<void> {
+    const fromEmail = this.configService.get<string>('APPOINTMENT_SMTP_FROM') || this.configService.get<string>('SMTP_FROM');
+    await this.appointmentTransporter.sendMail({
+      from: `"FormaMD" <${fromEmail}>`,
+      to: order.email,
+      subject: `Your FormaMD order ${order.orderNumber} is confirmed`,
+      html: this.supplementOrderHtml(
+        order,
+        `Thanks for your order, ${this.escapeHtml(order.firstName)}. We've received your payment and will ship your order within 5 business days. You'll receive a separate payment receipt from Stripe.`,
+        'Order Confirmed',
+      ),
+    });
+    console.log(`Supplement order confirmation sent for ${order.orderNumber}`);
+  }
+
+  /** "Your order is on its way" — sent when staff mark the order shipped. */
+  async sendSupplementOrderShipped(
+    order: SupplementOrderEmail & { carrier?: string | null; trackingNumber?: string | null },
+  ): Promise<void> {
+    const fromEmail = this.configService.get<string>('APPOINTMENT_SMTP_FROM') || this.configService.get<string>('SMTP_FROM');
+    const tracking = order.trackingNumber
+      ? `<br><br><strong>Tracking:</strong> ${order.carrier ? `${this.escapeHtml(order.carrier)} · ` : ''}${this.escapeHtml(order.trackingNumber)}`
+      : order.carrier
+        ? `<br><br><strong>Carrier:</strong> ${this.escapeHtml(order.carrier)}`
+        : '';
+    await this.appointmentTransporter.sendMail({
+      from: `"FormaMD" <${fromEmail}>`,
+      to: order.email,
+      subject: `Your FormaMD order ${order.orderNumber} is on its way`,
+      html: this.supplementOrderHtml(
+        order,
+        `Good news, ${this.escapeHtml(order.firstName)} — your order has shipped and is on its way to you.${tracking}<br><br>Questions about your delivery? Email support@formamd.com and we'll help.`,
+        'Your Order Has Shipped',
+      ),
+    });
+    console.log(`Supplement order shipped email sent for ${order.orderNumber}`);
+  }
+
+  /** Internal fulfilment alert so the team can ship the order. */
+  async sendSupplementOrderNotification(to: string, order: SupplementOrderEmail): Promise<void> {
+    const fromEmail = this.configService.get<string>('APPOINTMENT_SMTP_FROM') || this.configService.get<string>('SMTP_FROM');
+    await this.appointmentTransporter.sendMail({
+      from: `"FormaMD Store" <${fromEmail}>`,
+      to,
+      replyTo: order.email,
+      subject: `New supplements order ${order.orderNumber} — ship to ${order.firstName} ${order.lastName}`,
+      html: this.supplementOrderHtml(
+        order,
+        `A new supplements order has been paid and needs to be shipped. Customer: ${this.escapeHtml(order.email)}${order.phone ? `, ${this.escapeHtml(order.phone)}` : ''}.`,
+        'New Order to Fulfil',
+      ),
+    });
+  }
+}
+
+export interface SupplementOrderEmail {
+  orderNumber: string;
+  firstName: string;
+  lastName: string;
+  email: string;
+  phone?: string | null;
+  address: string[];
+  items: { name: string; quantity: number; lineTotal: number }[];
+  total: number;
+  /** Member savings already deducted from the line totals (0 for non-members). */
+  discount?: number;
+}

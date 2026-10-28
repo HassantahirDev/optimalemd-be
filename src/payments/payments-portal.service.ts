@@ -8,6 +8,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import Stripe from 'stripe';
 import { PrismaService } from '../prisma/prisma.service';
+import { linkGuestSupplementPurchases } from '../supplements/link-guest-purchases';
 import { MedicationsCombinedService } from './medications-combined.service';
 import { PaymentFlowsCombinedService } from './payment-flows-combined.service';
 
@@ -527,6 +528,10 @@ export class PaymentsPortalService implements OnModuleInit {
       new Set([user.primaryEmail, user.email].filter(Boolean).map((e) => (e as string).toLowerCase())),
     );
 
+    // Guest supplements purchases made with this email (e.g. before signing up)
+    // become this patient's for good.
+    await linkGuestSupplementPurchases(this.prisma, userId, emails);
+
     // Everything for this patient from the SYNCED DB (fast). Matched by our
     // userId OR the billing email captured during sync (covers guest checkouts).
     const records = await this.prisma.paymentRecord.findMany({
@@ -657,6 +662,15 @@ export class PaymentsPortalService implements OnModuleInit {
             items: mapItems(r.lineItems),
           };
         });
+
+    // Paid Stripe invoices that aren't in the ledger still appear in the history
+    // (e.g. subscription renewals the webhook missed), so they belong in the
+    // total too — otherwise "Total paid" disagrees with the rows shown.
+    for (const iv of invoicesOut as any[]) {
+      if (iv.status === 'SUCCEEDED' && !ledgerInvoiceIds.has(iv.id)) {
+        lifetimePaid += Number(iv.amountPaid ?? iv.amount ?? 0);
+      }
+    }
 
     // Old payment flows (appointment consult, signup order, premium membership)
     // read from their own source tables — deduped against the synced ledger by

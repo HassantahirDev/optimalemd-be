@@ -209,6 +209,8 @@ export class MedicationsService {
         // True when the medicine IS linked but the price could not be read —
         // lets the UI say "unavailable" rather than "no price".
         stripePriceUnavailable: Boolean(med.stripePriceId && !linked),
+        // Catalogue default for the doctor's price field; wins over Stripe when set.
+        defaultPrice: med.defaultPrice != null ? Number(med.defaultPrice) : null,
       } as any);
     });
 

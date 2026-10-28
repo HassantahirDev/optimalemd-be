@@ -1,4 +1,4 @@
-import { Controller, Post, Body, Get, Param, UseGuards, Request, BadRequestException, Headers, RawBodyRequest, Req } from '@nestjs/common';
+import { Controller, Post, Body, Get, Param, UseGuards, Request, BadRequestException, ForbiddenException, Headers, RawBodyRequest, Req } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth, ApiExcludeEndpoint } from '@nestjs/swagger';
 import { StripeService } from './stripe.service';
@@ -227,6 +227,20 @@ export class StripeController {
     };
   }
 
+  @Get('medications/patient/:patientId/latest-payment')
+  @ApiOperation({ summary: "Staff: payment status of the patient's latest prescribed medications" })
+  async getLatestMedicationPayment(@Param('patientId') patientId: string, @Request() req) {
+    assertStaff(req);
+    return { success: true, data: await this.stripeService.getLatestMedicationPaymentForPatient(patientId) };
+  }
+
+  @Post('medications/payment-reminder/:appointmentId')
+  @ApiOperation({ summary: 'Staff: email the patient a "Pay for Medications" reminder' })
+  async sendMedicationPaymentReminder(@Param('appointmentId') appointmentId: string, @Request() req) {
+    assertStaff(req);
+    return { success: true, data: await this.stripeService.sendMedicationPaymentReminder(appointmentId) };
+  }
+
   @Get('medications/payment-status/:appointmentId')
   @ApiOperation({ summary: 'Get medication payment status for an appointment' })
   @ApiResponse({ status: 200, description: 'Payment status retrieved successfully' })
@@ -345,3 +359,10 @@ export class StripeWebhookController {
     }
   }
 }
+
+/** Doctors (incl. assistants acting as their doctor) and admins only. */
+const assertStaff = (req: any) => {
+  if (!['doctor', 'admin'].includes(req.user?.userType)) {
+    throw new ForbiddenException('Only clinical staff can view or send medication payment reminders.');
+  }
+};

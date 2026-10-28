@@ -1084,7 +1084,7 @@ export class AppointmentsService {
    * why this is stricter than the display check (`Object.keys(...).length > 0`)
    * the patient list uses for its badge.
    */
-  private hasPrescribedMedications(medications: any): boolean {
+  hasPrescribedMedications(medications: any): boolean {
     if (!medications || typeof medications !== 'object' || Array.isArray(medications)) {
       return false;
     }
@@ -1099,6 +1099,64 @@ export class AppointmentsService {
         return false;
       });
     });
+  }
+
+  /**
+   * Staff "remind to pay" from the patient chart: emails the patient the same
+   * one-click "Pay for Medications" link as the care-plan email (auto-login to the
+   * care plan, where the invoice sits at the top) and records when it went out.
+   * A short cooldown stops double clicks / two staff sending duplicates.
+   */
+  async sendMedicationPaymentReminder(
+    appointmentId: string,
+    invoice: { items: { name: string; detail?: string }[]; total: number | null },
+  ) {
+    const appt = await this.prisma.appointment.findUnique({
+      where: { id: appointmentId },
+      include: {
+        patient: { select: { id: true, firstName: true, lastName: true, primaryEmail: true, email: true } },
+        doctor: { select: { firstName: true, lastName: true } },
+      },
+    });
+    if (!appt) throw new NotFoundException('Appointment not found');
+    const to = appt.patient?.primaryEmail || appt.patient?.email;
+    if (!to) throw new BadRequestException('This patient has no email address on file.');
+
+    const now = new Date();
+    const cooldown = new Date(now.getTime() - 2 * 60 * 1000);
+    const claim = await this.prisma.appointment.updateMany({
+      where: {
+        id: appointmentId,
+        OR: [{ medicationPaymentReminderSentAt: null }, { medicationPaymentReminderSentAt: { lt: cooldown } }],
+      },
+      data: { medicationPaymentReminderSentAt: now, medicationPaymentReminderCount: { increment: 1 } },
+    });
+    if (claim.count === 0) {
+      throw new BadRequestException('A reminder was just sent. Please wait a couple of minutes before sending another.');
+    }
+
+    const patientName = `${appt.patient.firstName || ''} ${appt.patient.lastName || ''}`.trim() || 'there';
+    const doctorName = appt.doctor ? `Dr. ${appt.doctor.firstName} ${appt.doctor.lastName}` : 'Your provider';
+    const link = buildAutoLoginLink(
+      this.jwtService,
+      this.configService,
+      appt.patient,
+      `/dashboard/care-plan-details/${appointmentId}`,
+    );
+    try {
+      await this.mailerService.sendMedicationPaymentReminderEmail(to, patientName, link, doctorName, invoice.items, invoice.total);
+    } catch (err) {
+      // Roll back so the chart doesn't claim a reminder that never went out.
+      await this.prisma.appointment.update({
+        where: { id: appointmentId },
+        data: {
+          medicationPaymentReminderSentAt: appt.medicationPaymentReminderSentAt,
+          medicationPaymentReminderCount: appt.medicationPaymentReminderCount,
+        },
+      });
+      throw new BadRequestException('The reminder email could not be sent. Please try again.');
+    }
+    return { sentTo: to, sentAt: now, count: appt.medicationPaymentReminderCount + 1 };
   }
 
   /**

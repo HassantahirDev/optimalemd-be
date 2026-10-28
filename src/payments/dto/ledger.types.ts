@@ -10,6 +10,7 @@ export type LedgerCategory =
   | 'MEMBERSHIP'
   | 'APPOINTMENT'
   | 'SIGNUP'
+  | 'SUPPLEMENT'
   | 'OTHER';
 export type LedgerBilling = 'ONE_TIME' | 'SUBSCRIPTION';
 export type LedgerStatus =
@@ -33,6 +34,12 @@ export interface LedgerLineItemInput {
 }
 
 export interface UpsertPaymentInput {
+  /**
+   * Record the payment only — don't touch MedicationOrder sets. Used for
+   * subscription renewals, which never change which medications are active.
+   */
+  skipMedicationLifecycle?: boolean;
+
   // --- Idempotency: at least ONE of these unique Stripe ids must be present ---
   stripePaymentIntentId?: string | null;
   stripeInvoiceId?: string | null;
