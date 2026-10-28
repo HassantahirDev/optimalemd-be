@@ -1372,6 +1372,9 @@ model Medication {
   // this column is the authoritative source and is never inferred at runtime.
   // Null = no Stripe price; the doctor types the amount by hand.
   stripePriceId   String?
+  // Default "Price for this prescription" in the doctor's dialog. When set it
+  // takes priority over the linked Stripe price; null = use Stripe as before.
+  defaultPrice    Decimal? @db.Decimal(10, 2)
   isActive        Boolean  @default(true)
   
   // Legacy fields for backward compatibility
