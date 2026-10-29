@@ -487,6 +487,7 @@ export class DoctorsService {
     const todaysAppointments = await this.prisma.appointment.count({
       where: {
         doctorId,
+        isEncounter: false, // encounters are chart updates, not visits
         appointmentDate: {
           gte: today,
           lt: tomorrow
@@ -500,6 +501,7 @@ export class DoctorsService {
     const upcomingAppointments = await this.prisma.appointment.count({
       where: {
         doctorId,
+        isEncounter: false, // encounters are chart updates, not visits
         appointmentDate: {
           gte: tomorrow,
           lt: nextWeek
@@ -514,6 +516,7 @@ export class DoctorsService {
     const noShowToday = await this.prisma.appointment.count({
       where: {
         doctorId,
+        isEncounter: false, // encounters are chart updates, not visits
         appointmentDate: {
           gte: today,
           lt: tomorrow
@@ -526,6 +529,7 @@ export class DoctorsService {
     const patientsInQueue = await this.prisma.appointment.count({
       where: {
         doctorId,
+        isEncounter: false, // encounters are chart updates, not visits
         appointmentDate: {
           gte: today,
           lt: tomorrow

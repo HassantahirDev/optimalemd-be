@@ -900,13 +900,14 @@ export class AdminService {
       this.prisma.user.count({ where: { isActive: true } }),
       // Total doctors
       this.prisma.doctor.count({ where: { isActive: true } }),
-      // Total appointments
-      this.prisma.appointment.count(),
+      // Total appointments (encounters are chart updates, not visits — excluded below too)
+      this.prisma.appointment.count({ where: { isEncounter: false } }),
       // Pending requests (appointments without a doctor assigned)
       this.prisma.appointment.count({ where: { doctorId: null, status: 'PENDING' } }),
       // Today's appointments
       this.prisma.appointment.count({
         where: {
+          isEncounter: false,
           appointmentDate: {
             gte: new Date(new Date().setHours(0, 0, 0, 0)),
             lt: new Date(new Date().setHours(23, 59, 59, 999)),
@@ -914,7 +915,7 @@ export class AdminService {
         },
       }),
       // Completed appointments
-      this.prisma.appointment.count({ where: { status: 'COMPLETED' } }),
+      this.prisma.appointment.count({ where: { status: 'COMPLETED', isEncounter: false } }),
       // Cancelled appointments
       this.prisma.appointment.count({ where: { status: 'CANCELLED' } }),
       // Active premium members (subscriptionStatus = 'active' at user level)
