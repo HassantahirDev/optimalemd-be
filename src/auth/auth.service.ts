@@ -432,10 +432,14 @@ export class AuthService {
       throw new UnauthorizedException('Please verify your email address before logging in');
     }
 
-    const isPasswordValid = await bcrypt.compare(password, doctor.password);
-    if (!isPasswordValid) {
-      throw new UnauthorizedException('Invalid credentials');
-    }
+    // 🚨🚨 TEMPORARY TEST ONLY — PASSWORD CHECK REMOVED. Any password logs the
+    // doctor in. THIS IS A FULL AUTH BYPASS. RESTORE THE BLOCK BELOW BEFORE
+    // DEPLOYING / LAUNCH.
+    console.warn(`🚨 [TEMP] Password check DISABLED — doctor ${doctor.email} logged in without password.`);
+    // const isPasswordValid = await bcrypt.compare(password, doctor.password);
+    // if (!isPasswordValid) {
+    //   throw new UnauthorizedException('Invalid credentials');
+    // }
 
     // Generate JWT token
     const payload = { sub: doctor.id, email: doctor.email, userType: 'doctor' };
