@@ -470,6 +470,16 @@ export class AppointmentsService {
       throw new NotFoundException('Appointment not found');
     }
 
+    // Encounters created before they cloned a medical form have none of their own —
+    // fall back to the patient's latest so the subjective/objective templates fill in.
+    if (!appointment.medicalForm && (appointment as any).isEncounter) {
+      const latestForm = await this.prisma.medicalForm.findFirst({
+        where: { patientId: appointment.patientId },
+        orderBy: { createdAt: 'desc' },
+      });
+      if (latestForm) (appointment as any).medicalForm = latestForm;
+    }
+
     return appointment;
   }
 
@@ -1222,7 +1232,7 @@ export class AppointmentsService {
 3. Follow up with lab work as scheduled
 4. Maintain healthy lifestyle habits (diet, exercise, sleep)`;
 
-    return this.prisma.appointment.create({
+    const encounter = await this.prisma.appointment.create({
       data: {
         patient: { connect: { id: patientId } },
         doctor: { connect: { id: doctorId } },
@@ -1241,6 +1251,23 @@ export class AppointmentsService {
       } as any,
       select: { id: true, appointmentDate: true, appointmentTime: true, status: true, isEncounter: true },
     });
+
+    // Clone the patient's latest medical form onto the encounter, like every new
+    // appointment — the subjective/objective note templates are built from it.
+    try {
+      const lastForm = await this.prisma.medicalForm.findFirst({
+        where: { patientId },
+        orderBy: { createdAt: 'desc' },
+      });
+      const { id: _id, createdAt: _ca, updatedAt: _ua, appointmentId: _oldAptId, ...rest } = (lastForm || {}) as any;
+      await this.prisma.medicalForm.create({
+        data: { ...rest, patientId, appointmentId: encounter.id } as any,
+      });
+    } catch (err) {
+      console.error('Failed to clone medical form for encounter:', err);
+    }
+
+    return encounter;
   }
 
   async signNotes(appointmentId: string, doctorId: string): Promise<AppointmentResponseDto> {
