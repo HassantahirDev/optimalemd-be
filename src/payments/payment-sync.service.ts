@@ -111,11 +111,10 @@ export class PaymentSyncService implements OnModuleInit {
       // Fields refreshed on every sync: money, status, card, receipt, links.
       // NOTE: channel/category/description are deliberately NOT here — those are
       // the record's "type", owned by whoever created it.
-      const common = {
-        userId,
-        amount: pi.amount / 100,
-        currency: pi.currency,
-        status: this.piStatus(pi) as any,
+      // Stripe-sourced details. On an EXISTING row only non-empty values are
+      // written, so a sync can refresh them but never blank out what's there
+      // (e.g. a PI fetched without its charge must not erase the receipt link).
+      const details: Record<string, any> = {
         refundedAmount: ch && (ch.amount_refunded || 0) > 0 ? ch.amount_refunded / 100 : null,
         stripeChargeId: ch?.id ?? null,
         stripeCustomerId: this.piCustomerId(pi),
@@ -123,27 +122,55 @@ export class PaymentSyncService implements OnModuleInit {
         cardBrand: ch?.payment_method_details?.card?.brand ?? null,
         cardLast4: ch?.payment_method_details?.card?.last4 ?? null,
         paymentMethodType: ch?.payment_method_details?.type ?? null,
-        billingEmail: email,
+        // Stored lowercase — patient billing history matches emails in lowercase.
+        billingEmail: email ? email.toLowerCase() : null,
         paidAt: pi.status === 'succeeded' ? new Date((ch?.created ?? pi.created) * 1000) : null,
+      };
+      const always = {
+        amount: pi.amount / 100,
+        currency: pi.currency,
+        status: this.piStatus(pi) as any,
         stripeCreated: new Date(pi.created * 1000),
       };
 
       const existing = await this.prisma.paymentRecord.findUnique({
         where: { stripePaymentIntentId: pi.id },
-        select: { id: true },
+        select: { id: true, userId: true, billingEmail: true },
       });
 
       if (existing) {
         // Already in our DB — created by an app flow (portal invoice, POS,
         // premium, medication, signup…) OR a previous import. KEEP its type:
         // never overwrite channel/category/description/createdByType here.
-        await this.prisma.paymentRecord.update({ where: { id: existing.id }, data: common });
+        // Patient link: only FILL an empty one. A payment the app already linked
+        // to a patient is never reassigned or unlinked by an email lookup (the
+        // card/receipt email often differs from the account email).
+        const nonEmpty = Object.fromEntries(Object.entries(details).filter(([, v]) => v !== null && v !== undefined));
+        // Billing email: fill if empty, or normalise case of the same address —
+        // never swap in a different email (guest purchases are matched by it).
+        if (
+          existing.billingEmail &&
+          nonEmpty.billingEmail &&
+          existing.billingEmail.toLowerCase() !== nonEmpty.billingEmail
+        ) {
+          delete nonEmpty.billingEmail;
+        }
+        await this.prisma.paymentRecord.update({
+          where: { id: existing.id },
+          data: {
+            ...always,
+            ...nonEmpty,
+            ...(!existing.userId && userId ? { userId } : {}),
+          },
+        });
       } else {
         // New to us: it never originated in our app → imported from Stripe.
         await this.prisma.paymentRecord.create({
           data: {
             stripePaymentIntentId: pi.id,
-            ...common,
+            userId,
+            ...always,
+            ...details,
             channel: 'IMPORTED' as any,
             category: 'OTHER' as any,
             billing: 'ONE_TIME' as any,
@@ -292,8 +319,11 @@ export class PaymentSyncService implements OnModuleInit {
     // row shows a breakdown only when we're 100% certain of it.
     const unlinkedPIs = pis.map((p) => p.id).filter((id) => id && !byPI.has(id));
     if (unlinkedPIs.length) {
+      // Only rows the sync itself imported. Payments the app created (supplement
+      // orders, appointment/signup fees, POS…) carry exact line items written at
+      // checkout — those are never cleared.
       const recs = await this.prisma.paymentRecord.findMany({
-        where: { stripePaymentIntentId: { in: unlinkedPIs } },
+        where: { stripePaymentIntentId: { in: unlinkedPIs }, channel: 'IMPORTED' as any },
         select: { id: true },
       });
       const ids = recs.map((r) => r.id);
@@ -309,9 +339,27 @@ export class PaymentSyncService implements OnModuleInit {
       try {
         const rec = await this.prisma.paymentRecord.findUnique({
           where: { stripePaymentIntentId: pi.id },
-          select: { id: true, channel: true },
+          select: { id: true, channel: true, description: true, hostedInvoiceUrl: true },
         });
         if (!rec) continue;
+
+        // App-created (not imported) rows that already have line items keep
+        // them as written by the app — only fill in a missing invoice link /
+        // description. Portal invoices still go through the promotion below.
+        const isPortalCandidate =
+          (match.invoiceId && portalByInvoice.has(match.invoiceId)) ||
+          (match.subscriptionId && portalBySub.has(match.subscriptionId));
+        if (rec.channel !== 'IMPORTED' && !isPortalCandidate) {
+          const itemCount = await this.prisma.paymentLineItem.count({ where: { paymentRecordId: rec.id } });
+          if (itemCount > 0) {
+            const fill: Record<string, any> = {};
+            if (!rec.hostedInvoiceUrl && match.hostedInvoiceUrl) fill.hostedInvoiceUrl = match.hostedInvoiceUrl;
+            const desc = match.lines.map((l) => l.description).filter(Boolean).join(', ');
+            if (!rec.description && desc) fill.description = desc;
+            if (Object.keys(fill).length) await this.prisma.paymentRecord.update({ where: { id: rec.id }, data: fill });
+            continue;
+          }
+        }
 
         // Preserve any per-line category already stored (e.g. written by the
         // invoice builder) before we replace the rows, so re-syncing never loses
@@ -391,13 +439,13 @@ export class PaymentSyncService implements OnModuleInit {
             },
           });
         } else {
-          // App-created (PLATFORM / POS / etc.): KEEP its type. Only enrich the
-          // description with item names + the invoice link.
+          // App-created (PLATFORM / POS / etc.): KEEP its type. Only fill in a
+          // missing invoice link / description — never replace what's there.
           await this.prisma.paymentRecord.update({
             where: { id: rec.id },
             data: {
-              hostedInvoiceUrl: match.hostedInvoiceUrl ?? undefined,
-              description: itemDesc,
+              hostedInvoiceUrl: rec.hostedInvoiceUrl ? undefined : match.hostedInvoiceUrl ?? undefined,
+              description: rec.description ? undefined : itemDesc,
             },
           });
         }
@@ -451,10 +499,11 @@ export class PaymentSyncService implements OnModuleInit {
     const map = new Map<string, { id: string }>();
     const lowered = Array.from(new Set(emails.filter(Boolean).map((e) => (e as string).toLowerCase())));
     if (!lowered.length) return map;
-    const users = await this.prisma.user.findMany({
-      where: { OR: [{ primaryEmail: { in: lowered } }, { email: { in: lowered } }] },
-      select: { id: true, primaryEmail: true, email: true },
-    });
+    // Case-insensitive: account emails are stored as typed (e.g. "John@…").
+    const users = await this.prisma.$queryRaw<{ id: string; primaryEmail: string | null; email: string | null }[]>`
+      SELECT id, "primaryEmail", email FROM users
+      WHERE LOWER("primaryEmail") = ANY(${lowered}) OR LOWER(email) = ANY(${lowered})
+    `;
     for (const u of users) {
       for (const e of [u.primaryEmail, u.email]) if (e) map.set(e.toLowerCase(), { id: u.id });
     }
