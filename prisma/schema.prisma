@@ -914,6 +914,12 @@ model Appointment {
   // Staff-sent "please pay for your medications" reminders (patient chart button).
   medicationPaymentReminderSentAt DateTime?
   medicationPaymentReminderCount  Int       @default(0)
+  // "New Encounter": a doctor-created follow-up on an existing patient — no slot,
+  // no booking payment, no reminders/Meet. Starts IN_PROGRESS, becomes COMPLETED
+  // when the notes are signed (time = sign time rounded to the hour). Hidden from
+  // the patient until signed and excluded from appointment stats and slot math.
+  isEncounter                     Boolean   @default(false)
+  encounterSourceAppointmentId    String?   // the visit it was started from
   
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
@@ -932,6 +938,7 @@ model Appointment {
   followUpIntakeForm FollowUpIntakeForm?
   rescheduleLogs    AppointmentRescheduleLog[]
 
+  @@index([isEncounter])
   @@map("appointments")
 }
 
