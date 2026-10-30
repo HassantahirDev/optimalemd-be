@@ -475,6 +475,16 @@ export class AppointmentsService {
       throw new NotFoundException('Appointment not found');
     }
 
+    // Encounters created before they cloned a medical form have none of their own —
+    // fall back to the patient's latest so the subjective/objective templates fill in.
+    if (!appointment.medicalForm && (appointment as any).isEncounter) {
+      const latestForm = await this.prisma.medicalForm.findFirst({
+        where: { patientId: appointment.patientId },
+        orderBy: { createdAt: 'desc' },
+      });
+      if (latestForm) (appointment as any).medicalForm = latestForm;
+    }
+
     return appointment;
   }
 
@@ -768,7 +778,7 @@ export class AppointmentsService {
 
     if (
       (updateAppointmentDto as any).status === AppointmentStatus.COMPLETED &&
-      !this.canCloseOutVisit((appointment as any).medications)
+      !this.canCloseOutVisit((appointment as any).medications, (appointment as any).isEncounter)
     ) {
       throw new BadRequestException(
         'Prescribe at least one medication for this appointment, or mark it as no medication required, before marking it completed.',
@@ -838,7 +848,7 @@ export class AppointmentsService {
 
     if (
       visitStatus === 'COMPLETED' &&
-      !this.canCloseOutVisit((appointment as any).medications)
+      !this.canCloseOutVisit((appointment as any).medications, (appointment as any).isEncounter)
     ) {
       throw new BadRequestException(
         'Prescribe at least one medication for this appointment, or mark it as no medication required, before marking the visit completed.',
@@ -1072,7 +1082,10 @@ export class AppointmentsService {
   }
 
   /** The visit may be signed/completed once either is true. */
-  private canCloseOutVisit(medications: any): boolean {
+  private canCloseOutVisit(medications: any, isEncounter = false): boolean {
+    // An encounter is a follow-up on an existing plan — the previous medications
+    // carry on, so it can be closed without prescribing anything new.
+    if (isEncounter) return true;
     return this.hasPrescribedMedications(medications) || this.isExplicitlyNoMedication(medications);
   }
 
@@ -1176,6 +1189,9 @@ export class AppointmentsService {
       });
       const to = appt?.patient?.primaryEmail || appt?.patient?.email;
       if (!to) return;
+      // Encounters only notify the patient when they changed the medications
+      // (which means a new invoice to pay); a notes-only encounter sends nothing.
+      if ((appt as any).isEncounter && !this.hasPrescribedMedications((appt as any).medications)) return;
 
       const patientName =
         `${appt.patient.firstName || ''} ${appt.patient.lastName || ''}`.trim() || 'there';
@@ -1196,6 +1212,69 @@ export class AppointmentsService {
     }
   }
 
+  /**
+   * "New Encounter" from the patient chart: a fresh visit record for a patient
+   * this doctor already treats, so they can document changes without a booking.
+   * No slot, no booking payment, no Meet, no emails. Same service as the last
+   * visit, default care plan like any new appointment, timed "now" (UTC
+   * date + "HH:MM", same storage as every appointment). Starts IN_PROGRESS;
+   * signing the notes completes it (see signNotes).
+   */
+  async createEncounter(patientId: string, doctorId: string) {
+    // Only for a patient this doctor has already seen (their own latest visit).
+    const source = await this.prisma.appointment.findFirst({
+      where: { patientId, doctorId, status: { not: AppointmentStatus.CANCELLED } },
+      orderBy: [{ appointmentDate: 'desc' }, { appointmentTime: 'desc' }],
+      select: { id: true, serviceId: true, primaryServiceId: true, duration: true },
+    });
+    if (!source) {
+      throw new BadRequestException('You have no previous visit with this patient to start an encounter from.');
+    }
+
+    const now = new Date();
+    const defaultCarePlan = `1. Continue current treatment regimen as prescribed
+2. Monitor symptoms and report any changes
+3. Follow up with lab work as scheduled
+4. Maintain healthy lifestyle habits (diet, exercise, sleep)`;
+
+    const encounter = await this.prisma.appointment.create({
+      data: {
+        patient: { connect: { id: patientId } },
+        doctor: { connect: { id: doctorId } },
+        service: { connect: { id: source.serviceId } },
+        primaryService: source.primaryServiceId ? { connect: { id: source.primaryServiceId } } : undefined,
+        appointmentDate: new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())),
+        appointmentTime: toUTCTimeString(now),
+        duration: source.duration,
+        status: AppointmentStatus.IN_PROGRESS,
+        carePlan: defaultCarePlan,
+        // Nothing to pay for an encounter — marked settled so no "unpaid" flow picks it up.
+        isPaid: true,
+        amount: '0.00',
+        isEncounter: true,
+        encounterSourceAppointmentId: source.id,
+      } as any,
+      select: { id: true, appointmentDate: true, appointmentTime: true, status: true, isEncounter: true },
+    });
+
+    // Clone the patient's latest medical form onto the encounter, like every new
+    // appointment — the subjective/objective note templates are built from it.
+    try {
+      const lastForm = await this.prisma.medicalForm.findFirst({
+        where: { patientId },
+        orderBy: { createdAt: 'desc' },
+      });
+      const { id: _id, createdAt: _ca, updatedAt: _ua, appointmentId: _oldAptId, ...rest } = (lastForm || {}) as any;
+      await this.prisma.medicalForm.create({
+        data: { ...rest, patientId, appointmentId: encounter.id } as any,
+      });
+    } catch (err) {
+      console.error('Failed to clone medical form for encounter:', err);
+    }
+
+    return encounter;
+  }
+
   async signNotes(appointmentId: string, doctorId: string): Promise<AppointmentResponseDto> {
     // Check if appointment exists and belongs to the doctor
     const appointment = await this.prisma.appointment.findFirst({
@@ -1214,16 +1293,36 @@ export class AppointmentsService {
       throw new BadRequestException('Notes have already been signed for this appointment.');
     }
 
-    if (!this.canCloseOutVisit((appointment as any).medications)) {
+    const isEncounter = !!(appointment as any).isEncounter;
+    if (!this.canCloseOutVisit((appointment as any).medications, isEncounter)) {
       throw new BadRequestException(
         'Prescribe at least one medication for this appointment before signing the notes.',
       );
     }
 
+    const signedAt = new Date();
+    // An encounter closes on signing: it becomes COMPLETED and takes the sign
+    // time, rounded to the nearest hour, as its appointment time (UTC, like every
+    // appointment).
+    const encounterClose = isEncounter
+      ? (() => {
+          const at = roundToNearestHourUTC(signedAt);
+          return {
+            appointmentDate: new Date(Date.UTC(at.getUTCFullYear(), at.getUTCMonth(), at.getUTCDate())),
+            appointmentTime: toUTCTimeString(at),
+            status: AppointmentStatus.COMPLETED,
+            completedAt: signedAt,
+            visitStatus: 'COMPLETED' as any,
+            visitStatusSetAt: signedAt,
+            visitStatusSetBy: doctorId,
+          };
+        })()
+      : {};
+
     // Set notesSignedAt timestamp
     const updatedAppointment = await this.prisma.appointment.update({
       where: { id: appointmentId },
-      data: { notesSignedAt: new Date() },
+      data: { notesSignedAt: signedAt, ...encounterClose },
     });
 
     // Tell the patient their care plan is ready — unless completing the visit
@@ -1672,11 +1771,19 @@ export class AppointmentsService {
   /**
    * Get patient appointments
    */
-  async getPatientAppointments(patientId: string, query: QueryAppointmentsDto): Promise<{ appointments: AppointmentWithRelationsResponseDto[], total: number }> {
+  async getPatientAppointments(
+    patientId: string,
+    query: QueryAppointmentsDto,
+    opts: { hideUnsignedEncounters?: boolean } = {},
+  ): Promise<{ appointments: AppointmentWithRelationsResponseDto[], total: number }> {
     const { status, startDate, endDate, page = 1, limit = 10 } = query;
     const skip = (page - 1) * limit;
 
     const where: any = { patientId };
+    // Patients only see an encounter once the doctor has signed it.
+    if (opts.hideUnsignedEncounters) {
+      where.NOT = { AND: [{ isEncounter: true }, { notesSignedAt: null }] };
+    }
 
     if (status) where.status = status;
     if (startDate || endDate) {
@@ -1741,7 +1848,11 @@ export class AppointmentsService {
           // text — pulling the full row for every appointment in the list was
           // multiplying the response payload for no reason. Existence only.
           medicalForm: { select: { id: true } },
-          rescheduleLogs: { orderBy: { createdAt: 'asc' } } // Reschedule audit history
+          rescheduleLogs: { orderBy: { createdAt: 'asc' } }, // Reschedule audit history
+          // Drives the doctor's "Active meds / Unpaid / Canceled" badge per visit.
+          medicationPayment: {
+            select: { status: true, subscriptionStatus: true, stripeSubscriptionId: true, amount: true, paidAt: true },
+          },
         },
         skip,
         take: limit,
@@ -1972,7 +2083,8 @@ export class AppointmentsService {
    * Get appointment statistics
    */
   async getAppointmentStats(doctorId?: string, startDate?: Date, endDate?: Date): Promise<any> {
-    const where: any = {};
+    // Encounters are chart updates, not visits — kept out of appointment stats.
+    const where: any = { isEncounter: false };
     
     if (doctorId) {
       where.doctorId = doctorId;
@@ -3054,4 +3166,18 @@ The FormaMD Team`;
 
     return { sentTo: to, subject };
   }
+}
+
+/** "HH:MM" of a Date in UTC — the format every appointmentTime is stored in. */
+function toUTCTimeString(d: Date): string {
+  return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
+}
+
+/** Nearest whole hour: :31 and later rounds up, :30 and earlier rounds down (9:50 → 10:00, 9:30 → 9:00). */
+function roundToNearestHourUTC(d: Date): Date {
+  const r = new Date(d);
+  const minutes = r.getUTCMinutes();
+  r.setUTCMinutes(0, 0, 0);
+  if (minutes > 30) r.setUTCHours(r.getUTCHours() + 1); // rolls over to the next day at 23:31+
+  return r;
 }

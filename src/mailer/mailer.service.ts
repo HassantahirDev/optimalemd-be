@@ -1734,7 +1734,7 @@ export class MailerService implements OnModuleInit {
 
             ${carePlanLink ? `
             <div style="text-align: center; margin: 30px 0;">
-              <a href="${carePlanLink}" target="_blank" style="display: inline-block; background-color: #dc2626; color: #ffffff; text-decoration: none; font-weight: bold; font-size: 16px; padding: 14px 32px; border-radius: 8px;">${hasMedications ? 'Pay for Medications' : 'View Your Care Plan'}</a>
+              <a href="${carePlanLink}" target="_blank" style="display: inline-block; background-color: #dc2626; color: #ffffff; text-decoration: none; font-weight: bold; font-size: 16px; padding: 14px 32px; border-radius: 8px;">View Your Care Plan</a>
               <p style="margin: 12px 0 0 0; font-size: 12px; color: #6b7280;">This secure link takes you straight to your care plan — no need to log in again.</p>
             </div>` : ''}
 
