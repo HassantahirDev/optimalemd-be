@@ -33,6 +33,7 @@ import { PaymentsModule } from './payments/payments.module';
 import { EmailCheckerModule } from './email-checker/email-checker.module';
 import { PartnersModule } from './partners/partners.module';
 import { SupplementsModule } from './supplements/supplements.module';
+import { ShippingModule } from './shipping/shipping.module';
 
 @Module({
   imports: [
@@ -70,6 +71,7 @@ import { SupplementsModule } from './supplements/supplements.module';
     PaymentsModule,
     PartnersModule,
     SupplementsModule,
+    ShippingModule,
   ],
   controllers: [AppController],
   providers: [AppService],

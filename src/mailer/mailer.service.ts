@@ -4984,6 +4984,50 @@ For your security, you will be asked to set a new password the first time you lo
     console.log(`Supplement order shipped email sent for ${order.orderNumber}`);
   }
 
+  // ─── Medication shipments (USPS) ──────────────────────────────────────────
+
+  /** "Your medication is on its way" — sent once, when USPS first shows the package moving. */
+  async sendShipmentOnItsWay(s: {
+    to: string;
+    firstName: string;
+    trackingNumber: string;
+    address: string[];
+  }): Promise<void> {
+    const fromEmail = this.configService.get<string>('APPOINTMENT_SMTP_FROM') || this.configService.get<string>('SMTP_FROM');
+    const esc = (v: string) => this.escapeHtml(v);
+    const trackUrl = `https://tools.usps.com/go/TrackConfirmAction?tLabels=${encodeURIComponent(s.trackingNumber)}`;
+    await this.appointmentTransporter.sendMail({
+      from: `"FormaMD" <${fromEmail}>`,
+      to: s.to,
+      subject: 'Your FormaMD medication is on its way',
+      html: `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      </head>
+      <body style="font-family: Arial, sans-serif; line-height: 1.6; margin: 0; padding: 20px; background-color: #f4f4f4; color: #333333;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; overflow: hidden;">
+          <div style="background-color: #000000; padding: 25px; text-align: center;">
+            <h1 style="color: #ffffff; font-size: 24px; font-weight: bold; text-transform: uppercase; margin: 0;">FormaMD</h1>
+          </div>
+          <div style="padding: 30px;">
+            <h2 style="color: #dc2626; font-size: 22px; margin: 0 0 16px 0;">Your Medication Is On Its Way</h2>
+            <p>Good news, ${esc(s.firstName)} — USPS has your package and it's on its way to you.</p>
+            <p style="margin: 20px 0 6px 0;"><strong>USPS tracking number</strong><br>${esc(s.trackingNumber)}</p>
+            <p style="margin: 20px 0;">
+              <a href="${trackUrl}" style="display: inline-block; background-color: #dc2626; color: #ffffff; text-decoration: none; padding: 12px 22px; border-radius: 6px; font-weight: bold;">Track your package</a>
+            </p>
+            <p style="margin: 20px 0 6px 0;"><strong>Shipping to</strong><br>${s.address.map(esc).join('<br>')}</p>
+            <p style="margin-top: 24px;">Questions about your delivery? Email support@formamd.com and we'll help.</p>
+          </div>
+        </div>
+      </body>
+      </html>`,
+    });
+  }
+
   /** Internal fulfilment alert so the team can ship the order. */
   async sendSupplementOrderNotification(to: string, order: SupplementOrderEmail): Promise<void> {
     const fromEmail = this.configService.get<string>('APPOINTMENT_SMTP_FROM') || this.configService.get<string>('SMTP_FROM');

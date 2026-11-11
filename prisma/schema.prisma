@@ -144,6 +144,7 @@ model User {
   // Unified payments ledger (additive; existing payment relations untouched)
   paymentRecords     PaymentRecord[]
   medicationOrders   MedicationOrder[]
+  shipments          Shipment[]
 
   @@map("users")
 }
@@ -1889,4 +1890,77 @@ model SupplementOrderItem {
 
   @@index([orderId])
   @@map("supplement_order_items")
+}
+
+// =============================================================================
+// SHIPMENTS (USPS) — medication packages sent to patients. A row is created
+// either by buying a USPS label from the admin panel or by entering the tracking
+// number of a label bought elsewhere (e.g. USPS.com). Tracking is refreshed from
+// the USPS Tracking API and the patient is emailed once when it's on the way.
+// =============================================================================
+enum ShipmentStatus {
+  LABEL_CREATED // label exists, USPS hasn't scanned the package yet
+  IN_TRANSIT // accepted by USPS / moving
+  OUT_FOR_DELIVERY
+  DELIVERED
+  ALERT // delivery exception, held, returned to sender…
+  UNKNOWN // USPS has no tracking for this number (yet)
+}
+
+model Shipment {
+  id                 String         @id @default(uuid())
+  userId             String
+  carrier            String         @default("USPS")
+  trackingNumber     String         @unique
+  mailClass          String? // e.g. USPS_GROUND_ADVANTAGE, PRIORITY_MAIL
+  status             ShipmentStatus @default(LABEL_CREATED)
+  statusDetail       String? // USPS's own wording of the latest event
+  lastEventAt        DateTime?
+  lastCheckedAt      DateTime?
+  deliveredAt        DateTime?
+  // Recipient as shipped (snapshot — the patient's profile address can change later)
+  recipientName      String
+  recipientEmail     String
+  addressLine1       String
+  addressLine2       String?
+  city               String
+  state              String
+  zipcode            String
+  // Only for labels bought through FormaMD
+  labelSource        String         @default("EXTERNAL") // USPS_API | EXTERNAL
+  labelPdf           Bytes?
+  postage            Decimal?       @db.Decimal(10, 2)
+  weightOz           Decimal?       @db.Decimal(8, 2)
+  note               String?
+  // "On its way" email — claimed atomically so it is never sent twice
+  shippedEmailSentAt DateTime?
+  createdById        String?
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+
+  user          User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  notifications ShipmentNotification[]
+
+  @@index([userId])
+  @@index([status])
+  @@map("shipments")
+}
+
+/**
+ * Every email sent (or attempted) about a shipment — the audit trail staff see.
+ */
+model ShipmentNotification {
+  id         String   @id @default(uuid())
+  shipmentId String
+  type       String // IN_TRANSIT
+  toEmail    String
+  success    Boolean
+  error      String?
+  trigger    String // AUTO (tracking update) | MANUAL (staff clicked resend)
+  sentAt     DateTime @default(now())
+
+  shipment Shipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+
+  @@index([shipmentId])
+  @@map("shipment_notifications")
 }
