@@ -234,11 +234,37 @@ export class StripeController {
     return { success: true, data: await this.stripeService.getLatestMedicationPaymentForPatient(patientId) };
   }
 
-  @Get('medications/live-plan/:appointmentId')
-  @ApiOperation({ summary: "Staff: medications the visit's patient already pays for monthly, and the next invoice date" })
-  async getLiveMedicationPlan(@Param('appointmentId') appointmentId: string, @Request() req) {
+  @Get('medications/prescribe-context/:appointmentId')
+  @ApiOperation({ summary: "Staff: the visit's patient's membership, saved card and current monthly medication plan" })
+  async getPrescribeContext(@Param('appointmentId') appointmentId: string, @Request() req) {
     assertStaff(req);
-    return { success: true, data: await this.stripeService.getLiveMedicationPlanForAppointment(appointmentId) };
+    return { success: true, data: await this.stripeService.getPrescribeContextForAppointment(appointmentId) };
+  }
+
+  @Post('medications/apply/:appointmentId')
+  @ApiOperation({ summary: 'Staff: bill a just-submitted follow-up prescription to the patient\'s monthly plan' })
+  async applyMedications(@Param('appointmentId') appointmentId: string, @Request() req) {
+    assertStaff(req);
+    return { success: true, data: await this.stripeService.applyMedicationsAtSubmit(appointmentId) };
+  }
+
+  @Post('medications/membership-reminder/:appointmentId')
+  @ApiOperation({ summary: 'Staff: email the patient to renew their Performance membership' })
+  async sendMembershipReminder(@Param('appointmentId') appointmentId: string, @Request() req) {
+    assertStaff(req);
+    return { success: true, data: await this.stripeService.sendMembershipReminder(appointmentId) };
+  }
+
+  @Get('medications/pending')
+  @ApiOperation({ summary: 'Patient: medication payments that need action (declined charge, unpaid invoice)' })
+  async getPendingMedicationPayments(@Request() req) {
+    return { success: true, data: await this.stripeService.getPendingMedicationPayments(req.user.id) };
+  }
+
+  @Post('medications/pending/:invoiceId/paid')
+  @ApiOperation({ summary: 'Patient: record that a pending medication invoice was paid on the page' })
+  async confirmPendingMedicationPayment(@Param('invoiceId') invoiceId: string, @Request() req) {
+    return { success: true, data: await this.stripeService.confirmPendingMedicationPayment(req.user.id, invoiceId) };
   }
 
   @Post('medications/payment-reminder/:appointmentId')

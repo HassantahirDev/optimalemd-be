@@ -131,7 +131,9 @@ export class MedicationsCombinedService {
               startsOn && startsOn.getTime() > Date.now()
                 ? ` · starts ${startsOn.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`
                 : '';
-            names.push(`${detail ? `${name} ${detail}` : name}${starts}`);
+            // "Charge now" the card declined (or no card): staff mustn't ship it yet.
+            const unpaid = entry.awaitingPayment ? ' · awaiting payment, don’t ship' : '';
+            names.push(`${detail ? `${name} ${detail}` : name}${starts}${unpaid}`);
           }
         }
       }

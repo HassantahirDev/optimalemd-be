@@ -1690,19 +1690,136 @@ export class MailerService implements OnModuleInit {
     console.log(`Medication payment reminder sent to ${patientEmail}`);
   }
 
+  /** Shared layout for the payment alert emails (pending charge, unpaid invoice, membership). */
+  private paymentAlertHtml(o: { title: string; name: string; intro: string; box?: string; button: string; link: string; note?: string }) {
+    return `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      </head>
+      <body style="font-family: Arial, sans-serif; line-height: 1.6; margin: 0; padding: 20px; background-color: #f4f4f4; color: #333333;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); overflow: hidden;">
+          <div style="background-color: #000000; padding: 25px; text-align: center;">
+            <h1 style="color: #ffffff; font-size: 24px; font-weight: bold; text-transform: uppercase; margin: 0;">FormaMD</h1>
+          </div>
+          <div style="padding: 30px; text-align: center;">
+            <h2 style="color: #dc2626; font-size: 24px; font-weight: bold; margin-bottom: 20px;">${o.title}</h2>
+            <p>Dear ${escapeHtml(o.name)},</p>
+            <p>${o.intro}</p>
+            ${o.box ? `<div style="background-color: #f9f9f9; border-left: 4px solid #dc2626; padding: 20px; margin: 20px 0; text-align: left;">${o.box}</div>` : ''}
+            <div style="text-align: center; margin: 30px 0;">
+              <a href="${o.link}" target="_blank" style="display: inline-block; background-color: #dc2626; color: #ffffff; text-decoration: none; font-weight: bold; font-size: 16px; padding: 14px 32px; border-radius: 8px;">${o.button}</a>
+              <p style="margin: 12px 0 0 0; font-size: 12px; color: #6b7280;">This secure link takes you straight to your account — no need to log in again.</p>
+            </div>
+            ${o.note ? `<p style="font-size: 14px; color: #4b5563;">${o.note}</p>` : ''}
+            <p style="margin-top: 30px;">Best regards,<br><strong>The FormaMD Team</strong></p>
+          </div>
+          <div style="background-color: #000000; color: #ffffff; padding: 20px; text-align: center; font-size: 12px;">
+            <p>This is an automated email, please do not reply.</p>
+            <p>&copy; ${new Date().getFullYear()} FormaMD</p>
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+  }
+
+  private async sendPaymentAlert(to: string, subject: string, html: string) {
+    const fromEmail = this.configService.get<string>('APPOINTMENT_SMTP_FROM') || this.configService.get<string>('SMTP_FROM');
+    await this.appointmentTransporter.sendMail({ from: `"FormaMD" <${fromEmail}>`, to, subject, html });
+    console.log(`Payment alert "${subject}" sent to ${to}`);
+  }
+
+  /**
+   * A medication the doctor added mid-cycle with "charge now" wasn't paid:
+   * the saved card was declined, or there is no card on file.
+   */
+  async sendMedicationChargePendingEmail(
+    to: string,
+    patientName: string,
+    link: string,
+    items: { name: string; amount: number }[],
+    amount: number,
+    reason: 'declined' | 'no_card',
+    nextInvoiceDate: Date | null,
+  ): Promise<void> {
+    const next = nextInvoiceDate
+      ? nextInvoiceDate.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })
+      : 'your next invoice date';
+    const list = items.map((i) => `<li>${escapeHtml(i.name)} — $${i.amount.toFixed(2)}</li>`).join('');
+    const html = this.paymentAlertHtml({
+      title: reason === 'declined' ? 'We Couldn’t Charge Your Card' : 'Payment Needed for Your New Medication',
+      name: patientName,
+      intro:
+        reason === 'declined'
+          ? `Your doctor added a medication to your monthly plan, but your card on file was declined for <strong>$${amount.toFixed(2)}</strong>.`
+          : `Your doctor added a medication to your monthly plan. Pay <strong>$${amount.toFixed(2)}</strong> to start it now.`,
+      box: `<p style="margin: 0;"><strong>Added to your plan:</strong></p><ul style="margin: 8px 0 0 0; padding-left: 20px;">${list}</ul>
+            <p style="margin: 12px 0 0 0;">This covers today until ${next}. It ships once paid.</p>`,
+      button: `Pay $${amount.toFixed(2)}`,
+      link,
+      note: `If it is still unpaid on ${next}, it is added to that invoice together with your other medications.`,
+    });
+    await this.sendPaymentAlert(
+      to,
+      reason === 'declined' ? 'Your card was declined for your new medication | FormaMD' : 'Payment needed for your new medication | FormaMD',
+      html,
+    );
+  }
+
+  /** The monthly medication invoice is still unpaid a few days after its date. */
+  async sendMedicationRenewalUnpaidEmail(
+    to: string,
+    patientName: string,
+    link: string,
+    amount: number,
+    invoiceDate: Date,
+    items: { name: string; amount: number }[],
+  ): Promise<void> {
+    const date = invoiceDate.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+    const list = items.map((i) => `<li>${escapeHtml(i.name)} — $${i.amount.toFixed(2)}</li>`).join('');
+    const html = this.paymentAlertHtml({
+      title: 'Your Medication Invoice Is Unpaid',
+      name: patientName,
+      intro: `We couldn't collect your monthly medication invoice of <strong>$${amount.toFixed(2)}</strong> from ${date}.`,
+      box: list ? `<p style="margin: 0;"><strong>This invoice covers:</strong></p><ul style="margin: 8px 0 0 0; padding-left: 20px;">${list}</ul>` : undefined,
+      button: `Pay $${amount.toFixed(2)}`,
+      link,
+      note: 'Your medications ship once the invoice is paid. Paying with a new card also updates the card used for future invoices.',
+    });
+    await this.sendPaymentAlert(to, 'Action needed: your medication invoice is unpaid | FormaMD', html);
+  }
+
+  /** Staff-sent: medications are member-only and the patient's Performance membership isn't active. */
+  async sendMembershipRequiredEmail(to: string, patientName: string, link: string, doctorName: string): Promise<void> {
+    const html = this.paymentAlertHtml({
+      title: 'Renew Your Performance Membership',
+      name: patientName,
+      intro: `${escapeHtml(doctorName)} would like to continue your treatment. Medications are available to active Performance members, and your membership isn't active right now.`,
+      box: '<p style="margin: 0;">Renew your membership and your doctor can prescribe your medications right away.</p>',
+      button: 'Renew Membership',
+      link,
+    });
+    await this.sendPaymentAlert(to, 'Renew your Performance membership to continue your medications | FormaMD', html);
+  }
+
   /**
    * Sent once the visit is closed out — the doctor signs the note, or records the
    * visit as completed, whichever happens first. Tells the patient their care plan
-   * is viewable and that they can authorise payment for the treatment plan.
+   * is viewable. It only mentions payment when something is actually owed:
+   *  - start:   first prescription — the patient pays to start their medications
+   *  - pending: a "charge now" the saved card declined (or no card) is still open
+   *  - none:    no medication, or covered/updated on their current monthly plan
    */
   async sendCarePlanReadyEmail(
     patientEmail: string,
     patientName: string,
     carePlanLink?: string,
-    /** False when the visit was closed with no medication — the email must not
-     *  then invite payment for a treatment plan that doesn't exist. */
-    hasMedications = true,
+    payment: { kind: 'start' | 'pending' | 'none'; amount?: number | null } = { kind: 'start' },
   ): Promise<void> {
+    const hasMedications = payment.kind !== 'none';
     const html = `
       <!DOCTYPE html>
       <html>
@@ -1728,9 +1845,11 @@ export class MailerService implements OnModuleInit {
           <div class="content">
             <h2 class="title">Your Care Plan Is Ready</h2>
             <p>Dear ${patientName},</p>
-            <p>${hasMedications
-              ? 'Your care plan is ready to view. You can also authorize payment for your current treatment plan on the portal.'
-              : 'Your care plan is ready to view.'}</p>
+            <p>${payment.kind === 'start'
+              ? 'Your care plan is ready to view. Complete payment on the portal to start your medications.'
+              : payment.kind === 'pending'
+                ? `Your care plan is ready to view. A payment${payment.amount ? ` of $${payment.amount.toFixed(2)}` : ''} for a newly added medication is still pending — you can pay it from your care plan.`
+                : 'Your care plan is ready to view.'}</p>
 
             ${carePlanLink ? `
             <div style="text-align: center; margin: 30px 0;">
@@ -1740,7 +1859,9 @@ export class MailerService implements OnModuleInit {
 
             ${hasMedications ? `
             <div class="info-box">
-              <p style="margin: 0;">Once payment is made, your order will be processed and shipped within 5 business days.</p>
+              <p style="margin: 0;">${payment.kind === 'pending'
+                ? 'The new medication ships once it is paid. If it is still unpaid on your next invoice date, it is added to that invoice.'
+                : 'Once payment is made, your order will be processed and shipped within 5 business days.'}</p>
             </div>` : ''}
 
             <p style="margin-top: 30px;">Best regards,<br><strong>The FormaMD Team</strong></p>
@@ -5012,4 +5133,8 @@ export interface SupplementOrderEmail {
   total: number;
   /** Member savings already deducted from the line totals (0 for non-members). */
   discount?: number;
+}
+
+function escapeHtml(v: string): string {
+  return (v || '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string));
 }

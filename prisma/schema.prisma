@@ -573,6 +573,15 @@ model MedicationPayment {
   subscriptionCanceledAt DateTime? // When cancellation was requested
   subscriptionEndDate DateTime? // When subscription will end (current_period_end)
 
+  // Follow-up visits: billing ran when the doctor submitted (locks the prescription).
+  billingAppliedAt DateTime?
+  // "Charge now" the saved card declined, or no card on file: an open one-off
+  // Stripe invoice the patient can pay until the next invoice date, when it is
+  // voided and the medication bills with the renewal.
+  pendingChargeInvoiceId String?
+  pendingChargeAmount Decimal? @db.Decimal(10, 2)
+  pendingChargeReason String? // declined | no_card
+
   // Partner platform-credit applied to this medication order's FIRST invoice only
   // (never recurring months) — same pattern as Payment/WelcomeOrder.
   partnerCreditPartnerId    String?

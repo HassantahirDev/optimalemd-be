@@ -1168,6 +1168,31 @@ export class AppointmentsService {
   }
 
   /**
+   * Medications are member-only. A patient with no current Stripe subscription
+   * of any kind is first-time — their invoice includes the membership. Anyone
+   * else must be an active Performance member.
+   */
+  private async assertMayPrescribeMedications(patientId: string) {
+    const patient = await this.prisma.user.findUnique({
+      where: { id: patientId },
+      select: { stripeCustomerId: true, isSubscribed: true },
+    });
+    if (!patient || patient.isSubscribed || !patient.stripeCustomerId || !this.stripe) return;
+    const subs = await this.stripe.subscriptions.list({ customer: patient.stripeCustomerId, status: 'all', limit: 100 });
+    const current = subs.data.some((s) => ['active', 'trialing', 'past_due'].includes(s.status));
+    if (current) {
+      throw new BadRequestException(
+        'This patient is not an active Performance member. Medications are member-only — send them a membership reminder first.',
+      );
+    }
+  }
+
+  /** Auto-login link into the patient dashboard, for emails sent from other services. */
+  patientLink(patient: { id: string; primaryEmail: string | null; firstName?: string | null }, next: string): string {
+    return buildAutoLoginLink(this.jwtService, this.configService, patient, next);
+  }
+
+  /**
    * "Your care plan is ready" — fired when the visit is closed out. Never throws:
    * a mail failure must not roll back the signature or the status change the
    * doctor just made.
@@ -1196,12 +1221,18 @@ export class AppointmentsService {
         appt.patient,
         `/dashboard/care-plan-details/${appointmentId}`,
       );
-      await this.mailerService.sendCarePlanReadyEmail(
-        to,
-        patientName,
-        carePlanLink,
-        this.hasPrescribedMedications((appt as any).medications),
-      );
+      // Payment is only mentioned when something is owed: a first prescription
+      // (pay to start) or a "charge now" still unpaid. A follow-up billed to the
+      // monthly plan at submit has nothing to pay.
+      const payment = await this.prisma.medicationPayment.findUnique({ where: { appointmentId } });
+      const paymentState = !this.hasPrescribedMedications((appt as any).medications)
+        ? { kind: 'none' as const }
+        : payment?.pendingChargeInvoiceId
+          ? { kind: 'pending' as const, amount: Number(payment.pendingChargeAmount ?? 0) }
+          : payment?.status === 'SUCCEEDED'
+            ? { kind: 'none' as const }
+            : { kind: 'start' as const };
+      await this.mailerService.sendCarePlanReadyEmail(to, patientName, carePlanLink, paymentState);
     } catch (err) {
       console.error('[care plan ready] email failed:', err);
     }
@@ -1357,6 +1388,14 @@ export class AppointmentsService {
     // Check if medications have been paid/submitted
     if (appointment.medicationPayment && appointment.medicationPayment.status === 'SUCCEEDED') {
       throw new BadRequestException('Cannot modify medications. Medications have already been submitted and paid.');
+    }
+    // Follow-up billing runs when the doctor submits; once it has, a second
+    // submit could charge or change the plan twice.
+    if (appointment.medicationPayment?.billingAppliedAt) {
+      throw new BadRequestException('Cannot modify medications. They were submitted and billed to the patient\'s monthly plan.');
+    }
+    if (this.hasPrescribedMedications(medications)) {
+      await this.assertMayPrescribeMedications(appointment.patientId);
     }
 
     console.log('=== Backend updateMedications Debug ===');
