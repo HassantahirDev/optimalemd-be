@@ -462,7 +462,8 @@ export class AppointmentsService {
         },
         medicalForm: true, // Include medical form data
         medicationPrescriptions: true, // Include medication prescriptions
-        rescheduleLogs: { orderBy: { createdAt: 'asc' } } // Reschedule audit history for the chart
+        rescheduleLogs: { orderBy: { createdAt: 'asc' } }, // Reschedule audit history for the chart
+        questionnaire: true, // qADAM / IIEF / PHQ-9 answered at booking — scored into the subjective note
       }
     });
 
