@@ -4518,6 +4518,74 @@ export class StripeService {
     });
   }
 
+  /**
+   * A later visit (notes signed) that changed this same subscription: this
+   * visit's medication list is then history, and the later one is current.
+   */
+  private async laterVisitOnSameSubscription(appointmentId: string, payment: { stripeSubscriptionId: string | null; paidAt: Date | null }) {
+    if (!payment.stripeSubscriptionId) return null;
+    const later = await this.prisma.medicationPayment.findFirst({
+      where: {
+        stripeSubscriptionId: payment.stripeSubscriptionId,
+        status: 'SUCCEEDED',
+        appointmentId: { not: appointmentId },
+        paidAt: { gt: payment.paidAt ?? new Date(0) },
+        appointment: { notesSignedAt: { not: null } },
+      },
+      orderBy: { paidAt: 'desc' },
+      select: { appointmentId: true, appointment: { select: { appointmentDate: true } } },
+    });
+    return later ? { appointmentId: later.appointmentId, appointmentDate: later.appointment.appointmentDate } : null;
+  }
+
+  /**
+   * What this follow-up visit did to the patient's monthly plan, per medication,
+   * from what was saved when the doctor submitted: their answers on the
+   * prescription (planLink / billingStart / startsOn), the ledger row for a
+   * "charge now" that was paid, and the pending-charge fields for one that wasn't.
+   */
+  private async visitBillingSummary(appointmentId: string, payment: any) {
+    const appt = await this.prisma.appointment.findUnique({ where: { id: appointmentId }, select: { medications: true } });
+    const charge = await this.prisma.paymentRecord.findFirst({
+      where: { appointmentId, category: 'MEDICATION' as any, billing: 'ONE_TIME' as any, status: 'SUCCEEDED' as any },
+      orderBy: { paidAt: 'desc' },
+      select: { amount: true, paidAt: true },
+    });
+    const pending = payment.pendingChargeInvoiceId ? Number(payment.pendingChargeAmount ?? 0) : null;
+    const lines: any[] = [];
+    for (const entries of Object.values((appt?.medications as any) || {})) {
+      if (!Array.isArray(entries)) continue;
+      for (const e of entries as any[]) {
+        if (!e || typeof e !== 'object' || !e.name) continue;
+        const price = Number(e.priceOverride ?? 0);
+        const link = e.planLink || null;
+        const base = { name: e.name, detail: [e.strength, e.dose].filter(Boolean).join(' ') || null, monthly: price };
+        if (!link || link.kind === 'new') {
+          const status =
+            e.billingStart === 'next_invoice'
+              ? 'next_invoice'
+              : e.awaitingPayment
+                ? 'pending'
+                : charge
+                  ? 'charged'
+                  : 'moved_to_next_invoice'; // declined/no card and not paid before the renewal
+          lines.push({ ...base, status, startsOn: e.startsOn ?? null });
+        } else if (link.kind === 'replace') {
+          lines.push({ ...base, status: 'replaced', replaces: link.itemName ?? null, from: link.itemMonthly ?? null });
+        } else {
+          const from = typeof link.itemMonthly === 'number' ? link.itemMonthly : null;
+          lines.push({ ...base, status: from !== null && Math.abs(from - price) >= 0.005 ? 'price_changed' : 'continued', from });
+        }
+      }
+    }
+    return {
+      appliedAt: payment.billingAppliedAt,
+      charged: charge ? { amount: Number(charge.amount), paidAt: charge.paidAt } : null,
+      pending: pending !== null ? { amount: pending, reason: payment.pendingChargeReason } : null,
+      lines,
+    };
+  }
+
   async getMedicationPaymentStatus(appointmentId: string, userId: string, userType?: string) {
     const appointment = await this.prisma.appointment.findUnique({
       where: { id: appointmentId },
@@ -4557,11 +4625,18 @@ export class StripeService {
     let subscriptionStatus: Stripe.Subscription.Status | null = null;
     let cancelAtPeriodEnd = false;
     let currentPeriodEnd: Date | null = null;
-    
+    let subscriptionStartedAt: Date | null = null;
+    let currentMonthly: number | null = null;
+
     if (payment.stripeSubscriptionId) {
       try {
         const subscription = await this.stripe.subscriptions.retrieve(payment.stripeSubscriptionId);
         subscriptionStatus = subscription.status;
+        // The plan's real start (not when this visit was linked to it) and what
+        // it bills now, after any follow-up visit changed it.
+        subscriptionStartedAt = subscription.start_date ? new Date(subscription.start_date * 1000) : null;
+        currentMonthly =
+          subscription.items.data.reduce((t, it) => t + (it.price.unit_amount ?? 0) * (it.quantity ?? 1), 0) / 100;
         // A cancellation can be scheduled via cancel_at_period_end OR a cancel_at timestamp
         // (the Stripe Billing Portal / dashboard use cancel_at). Treat either as canceling so a
         // cancellation done directly in Stripe is reflected here.
@@ -4670,6 +4745,11 @@ export class StripeService {
       // Follow-up billed to the existing monthly plan when the doctor submitted:
       // the visit didn't start a subscription, so paidAt isn't a start date.
       billingAppliedAt: payment.billingAppliedAt,
+      subscriptionStartedAt,
+      nextBillingDate: currentPeriodEnd,
+      currentMonthly,
+      supersededBy: await this.laterVisitOnSameSubscription(appointmentId, payment),
+      visitBilling: payment.billingAppliedAt ? await this.visitBillingSummary(appointmentId, payment) : null,
       pendingCharge: payment.pendingChargeInvoiceId
         ? { amount: Number(payment.pendingChargeAmount ?? 0), reason: payment.pendingChargeReason }
         : null,
