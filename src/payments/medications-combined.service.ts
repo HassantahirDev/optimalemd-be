@@ -63,7 +63,7 @@ export class MedicationsCombinedService {
       orderBy: { createdAt: 'desc' },
     });
 
-    const groups: LegacyMedicationGroup[] = [];
+    const groups: (LegacyMedicationGroup & { subscriptionId: string | null })[] = [];
     for (const appt of appointments) {
       const pay = appt.medicationPayment;
       // Only reflect medications the patient actually paid for.
@@ -90,9 +90,27 @@ export class MedicationsCombinedService {
         subscriptionStatus: pay.subscriptionStatus || (isSubscription ? null : 'one_time'),
         billing: isSubscription ? 'SUBSCRIPTION' : 'ONE_TIME',
         status: canceled ? 'PAST' : 'ACTIVE',
+        subscriptionId: pay.stripeSubscriptionId,
       });
     }
-    return groups;
+
+    // Follow-up visits update the same subscription, so several visits can
+    // point at one. Only the newest is what the patient is on now (current
+    // dose); earlier ones ended when it was confirmed.
+    const newestBySub = new Map<string, (typeof groups)[number]>();
+    for (const g of groups) {
+      if (g.status !== 'ACTIVE' || !g.subscriptionId) continue;
+      const cur = newestBySub.get(g.subscriptionId);
+      if (!cur || (g.since?.getTime() ?? 0) > (cur.since?.getTime() ?? 0)) newestBySub.set(g.subscriptionId, g);
+    }
+    for (const g of groups) {
+      const newest = g.subscriptionId ? newestBySub.get(g.subscriptionId) : null;
+      if (g.status === 'ACTIVE' && newest && newest !== g) {
+        g.status = 'PAST';
+        g.endedAt = newest.since;
+      }
+    }
+    return groups.map(({ subscriptionId, ...g }) => g);
   }
 
   private extractMedicationNames(medications: any): string[] {
@@ -107,7 +125,13 @@ export class MedicationsCombinedService {
           const name = entry.name || entry.medicationName || entry.label;
           if (name) {
             const detail = [entry.strength, entry.dose].filter(Boolean).join(' ');
-            names.push(detail ? `${name} ${detail}` : name);
+            // Added mid-cycle "on the next invoice": not shipped or billed until then.
+            const startsOn = entry.startsOn ? new Date(entry.startsOn) : null;
+            const starts =
+              startsOn && startsOn.getTime() > Date.now()
+                ? ` · starts ${startsOn.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`
+                : '';
+            names.push(`${detail ? `${name} ${detail}` : name}${starts}`);
           }
         }
       }

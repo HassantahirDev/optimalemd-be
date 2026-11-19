@@ -244,6 +244,49 @@ export class PaymentLedgerService {
   }
 
   // ---------------------------------------------------------------------------
+  // Public: a follow-up visit changed the medications on the patient's existing
+  // subscription (dose change, stop, add). The subscription id stays the same, so
+  // runMedicationLifecycle's "same subscription = renewal" shortcut would keep the
+  // old items — this replaces the ACTIVE set outright. Never throws.
+  // ---------------------------------------------------------------------------
+  async replaceActiveMedicationSet(params: {
+    userId: string;
+    stripeSubscriptionId: string;
+    startedAt: Date;
+    sourcePaymentRecordId?: string | null;
+    items: { medicationId?: string | null; medicationName: string; dosageSnapshot?: string | null }[];
+  }): Promise<void> {
+    const { userId, stripeSubscriptionId, startedAt, items } = params;
+    try {
+      await this.prisma.medicationOrder.updateMany({
+        where: { userId, status: 'ACTIVE' as any },
+        data: { status: 'PAST' as any, endedAt: startedAt },
+      });
+      if (!items.length) return;
+      await this.prisma.medicationOrder.create({
+        data: {
+          userId,
+          status: 'ACTIVE' as any,
+          startedAt,
+          billing: 'SUBSCRIPTION' as any,
+          sourcePaymentRecordId: params.sourcePaymentRecordId ?? null,
+          stripeSubscriptionId,
+          items: {
+            create: items.map((li) => ({
+              medicationId: li.medicationId ?? null,
+              medicationName: li.medicationName,
+              quantity: 1,
+              dosageSnapshot: li.dosageSnapshot ?? null,
+            })),
+          },
+        },
+      });
+    } catch (err: any) {
+      this.logger.error(`[ledger] replaceActiveMedicationSet failed: ${err?.message}`);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Public: transition an INVOICE record when its Stripe invoice is paid/failed
   // (Part D webhook). Uses the line items already stored on the PENDING record,
   // so the medication lifecycle runs without re-passing them.

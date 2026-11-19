@@ -2,6 +2,7 @@ import { Injectable, BadRequestException, NotFoundException, ForbiddenException 
 import { ModuleRef } from '@nestjs/core';
 import { ConfigService } from '@nestjs/config';
 import Stripe from 'stripe';
+import { createHash } from 'crypto';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import type { SupplementsService } from '../supplements/supplements.service';
@@ -2601,6 +2602,8 @@ export class StripeService {
       standardPrice: number;
       membershipPrice: number | null;
       priceOverride: number | null;
+      billingStart: 'now' | 'next_invoice';
+      startsOn: string | null;
     }> = [];
 
     Object.entries(medicationsData).forEach(([category, meds]: [string, any]) => {
@@ -2639,6 +2642,10 @@ export class StripeService {
               standardPrice,
               membershipPrice,
               priceOverride,
+              // Doctor's choice for a medication added to a live subscription:
+              // charge the full month now, or start it on the next invoice.
+              billingStart: med.billingStart === 'next_invoice' ? 'next_invoice' : 'now',
+              startsOn: typeof med.startsOn === 'string' ? med.startsOn : null,
             });
           }
         }
@@ -2669,6 +2676,8 @@ export class StripeService {
       price: number;
       discount: number;
       priceOverride: number | null;
+      billingStart: 'now' | 'next_invoice';
+      startsOn: string | null;
     }> = [];
 
     let subtotal = 0;
@@ -2705,6 +2714,8 @@ export class StripeService {
         standardPrice: tempItem.standardPrice,
         membershipPrice: tempItem.membershipPrice,
         priceOverride: tempItem.priceOverride,
+        billingStart: tempItem.billingStart,
+        startsOn: tempItem.startsOn,
               price,
               discount,
             });
@@ -2740,6 +2751,24 @@ export class StripeService {
       premiumMonthly,
       grandTotal: subtotal + premiumMonthly,
     };
+  }
+
+  /**
+   * The patient's invoice page: the invoice plus, while unpaid, what paying it
+   * does to their existing plan (see planMedicationChange). The plan is left
+   * out rather than failing the page if Stripe can't be read.
+   */
+  async getMedicationInvoiceForPatient(appointmentId: string, userId: string) {
+    const invoice: any = await this.calculateMedicationInvoice(appointmentId, userId);
+    if (!invoice.isPaid && invoice.items?.length) {
+      try {
+        invoice.change = await this.planMedicationChange(appointmentId, userId, invoice);
+      } catch (e: any) {
+        console.error(`Could not plan medication change for ${appointmentId}: ${e.message}`);
+        invoice.change = null;
+      }
+    }
+    return invoice;
   }
 
   /** Monthly premium membership price, in dollars, straight from Stripe. */
@@ -2779,6 +2808,591 @@ export class StripeService {
     } catch (e: any) {
       console.error('findActiveMedicationSubscriptionFromStripe error:', e.message);
       return null;
+    }
+  }
+
+  /**
+   * The patient's live medication subscription, whichever visit started it.
+   * Follow-up visits update this one instead of starting another (which is what
+   * double-billed patients). Live = active, trialing or past_due; a cancellation
+   * scheduled for period end is still active. If an older double-billing left
+   * several, the newest is used. Throws on Stripe errors: guessing "none" here
+   * would start a second subscription.
+   */
+  private async findLiveMedicationSubscriptionForCustomer(customerId: string): Promise<Stripe.Subscription | null> {
+    if (!customerId) return null;
+    const subs = await this.stripe.subscriptions.list({ customer: customerId, status: 'all', limit: 100 });
+    const live = subs.data
+      .filter(
+        (s) =>
+          s.metadata?.type === 'medication_subscription' && ['active', 'trialing', 'past_due'].includes(s.status),
+      )
+      .sort((a, b) => b.created - a.created);
+    if (!live.length) return null;
+    if (live.length > 1) {
+      console.warn(
+        `⚠️  Customer ${customerId} has ${live.length} live medication subscriptions; using the newest (${live[0].id})`,
+      );
+    }
+    return this.stripe.subscriptions.retrieve(live[0].id, { expand: ['items.data.price.product'] });
+  }
+
+  /**
+   * What paying this visit's prescription would do to the patient's billing.
+   *  - new: no live medication subscription, so checkout starts one (unchanged flow).
+   *  - unchanged: every line matches the live subscription; nothing to pay or confirm.
+   *  - update: the live subscription changes. Per line:
+   *      continue  same medication, same price
+   *      change    same medication (or same name, i.e. another dose) at a new price —
+   *                the new dose shows now, the new price bills from the next invoice
+   *      add       new medication — the doctor chose either the full monthly price
+   *                today (ships now) or starting on the next invoice ($0 today, ships then)
+   *      stop      on the subscription but not prescribed now — removed, no refund
+   * Nothing is prorated. $0 lines are never on a subscription, so they don't take part.
+   */
+  async planMedicationChange(
+    appointmentId: string,
+    patientId: string,
+    invoice?: any,
+    customerId?: string | null,
+  ): Promise<MedicationChangePlan> {
+    const inv = invoice ?? (await this.calculateMedicationInvoice(appointmentId, patientId));
+    if (customerId === undefined) {
+      const user = await this.prisma.user.findUnique({ where: { id: patientId }, select: { stripeCustomerId: true } });
+      customerId = user?.stripeCustomerId ?? null;
+    }
+
+    const prescribed: MedicationPlanLine[] = (inv.items || [])
+      .map((it: any) => ({
+        action: 'add' as const,
+        medicationId: it.medicationId ?? null,
+        name: it.name,
+        detail: [it.strength, it.dose].filter(Boolean).join(' ') || null,
+        dosageSnapshot: [it.strength, it.dose, it.frequency, it.route].filter(Boolean).join(' ') || null,
+        fromCents: null,
+        toCents: Math.round(Number(it.price) * 100),
+        itemId: null,
+        billingStart: it.billingStart === 'next_invoice' ? ('next_invoice' as const) : ('now' as const),
+      }))
+      .filter((l: MedicationPlanLine) => (l.toCents ?? 0) > 0);
+    const newMonthly = prescribed.reduce((s, l) => s + (l.toCents ?? 0), 0) / 100;
+
+    const sub = customerId ? await this.findLiveMedicationSubscriptionForCustomer(customerId) : null;
+    if (!sub) {
+      return {
+        mode: 'new',
+        subscriptionId: null,
+        resumesCancelled: false,
+        nextRenewal: null,
+        currentMonthly: 0,
+        newMonthly,
+        dueToday: newMonthly,
+        lines: prescribed,
+      };
+    }
+
+    const live = liveMedicationItems(sub);
+    const unmatchedLive = [...live];
+    const take = (pred: (l: (typeof live)[number]) => boolean) => {
+      const i = unmatchedLive.findIndex(pred);
+      return i < 0 ? null : unmatchedLive.splice(i, 1)[0];
+    };
+    const norm = (s: string) => (s || '').trim().toLowerCase();
+
+    // Exact medication first, then same name (a dose change is a different
+    // catalogue row under the same medication name).
+    const lines: MedicationPlanLine[] = [];
+    const unmatchedNew: MedicationPlanLine[] = [];
+    for (const l of prescribed) {
+      const same = l.medicationId ? take((x) => x.medicationId === l.medicationId) : null;
+      if (same) {
+        lines.push({ ...l, action: same.cents === l.toCents ? 'continue' : 'change', fromCents: same.cents, itemId: same.itemId });
+      } else {
+        unmatchedNew.push(l);
+      }
+    }
+    for (const l of unmatchedNew) {
+      const byName = take((x) => norm(x.name) === norm(l.name));
+      lines.push(byName ? { ...l, action: 'change', fromCents: byName.cents, itemId: byName.itemId } : l);
+    }
+    for (const x of unmatchedLive) {
+      lines.push({
+        action: 'stop',
+        medicationId: x.medicationId,
+        name: x.name || 'Medication',
+        detail: null,
+        dosageSnapshot: null,
+        fromCents: x.cents,
+        toCents: null,
+        itemId: x.itemId,
+        billingStart: 'now',
+      });
+    }
+
+    const periodEnd = periodEndOf(sub);
+    const dueTodayCents = lines
+      .filter((l) => l.action === 'add' && l.billingStart === 'now')
+      .reduce((s, l) => s + (l.toCents ?? 0), 0);
+
+    const resumesCancelled = !!(sub.cancel_at_period_end || (sub as any).cancel_at);
+    const unchanged = !resumesCancelled && lines.every((l) => l.action === 'continue');
+    return {
+      mode: unchanged ? 'unchanged' : 'update',
+      subscriptionId: sub.id,
+      resumesCancelled,
+      nextRenewal: periodEnd ? new Date(periodEnd * 1000) : null,
+      currentMonthly: live.reduce((s, x) => s + x.cents, 0) / 100,
+      newMonthly,
+      dueToday: dueTodayCents / 100,
+      lines,
+    };
+  }
+
+  /**
+   * Doctor's prescribe dialog: what the patient already pays for monthly, so
+   * it can tell which picks are new (and ask how to bill them). Null when the
+   * patient has no live medication subscription.
+   */
+  async getLiveMedicationPlanForAppointment(appointmentId: string) {
+    const appt = await this.prisma.appointment.findUnique({
+      where: { id: appointmentId },
+      select: { patient: { select: { stripeCustomerId: true } } },
+    });
+    if (!appt) throw new NotFoundException('Appointment not found');
+    const customerId = appt.patient?.stripeCustomerId;
+    const sub = customerId ? await this.findLiveMedicationSubscriptionForCustomer(customerId) : null;
+    if (!sub) return null;
+    const periodEnd = periodEndOf(sub);
+    const items = liveMedicationItems(sub);
+    return {
+      subscriptionId: sub.id,
+      nextRenewal: periodEnd ? new Date(periodEnd * 1000) : null,
+      cancelling: !!(sub.cancel_at_period_end || (sub as any).cancel_at),
+      currentMonthly: items.reduce((s, x) => s + x.cents, 0) / 100,
+      items: items.map(({ medicationId, name, cents }) => ({ medicationId, name, monthly: cents / 100 })),
+    };
+  }
+
+  /** A monthly Stripe price for one prescribed medication, under a product named after it. */
+  private async createMedicationLinePrice(
+    line: MedicationPlanLine,
+    ctx: { appointmentId: string; userId: string; patientName: string; patientEmail: string; idem: string },
+  ): Promise<string> {
+    const key = `${ctx.idem}-${line.medicationId || norm16(line.name)}-${line.toCents}`;
+    const product = await this.stripe.products.create(
+      {
+        name: line.name,
+        metadata: {
+          appointmentId: ctx.appointmentId,
+          userId: ctx.userId,
+          medicationId: line.medicationId || '',
+          patientName: ctx.patientName,
+          patientEmail: ctx.patientEmail,
+          type: 'medication',
+        },
+      },
+      { idempotencyKey: `${key}-prod` },
+    );
+    const price = await this.stripe.prices.create(
+      {
+        unit_amount: line.toCents ?? 0,
+        currency: 'usd',
+        recurring: { interval: 'month' },
+        product: product.id,
+        metadata: {
+          appointmentId: ctx.appointmentId,
+          userId: ctx.userId,
+          type: 'medication',
+          medicationId: line.medicationId || '',
+        },
+      },
+      { idempotencyKey: `${key}-price` },
+    );
+    return price.id;
+  }
+
+  /**
+   * Patient confirmed a follow-up prescription that changes their live
+   * subscription. Nothing is prorated:
+   *  1. Undo a scheduled cancellation (re-prescribed and confirmed = continuing).
+   *  2. Medications the doctor chose to "charge now" are billed at their full
+   *     monthly price on a one-off invoice, to the saved card. If that fails the
+   *     subscription is left alone and the patient pays on the page
+   *     (confirmMedicationPayment then carries on from step 3).
+   *  3. One subscription update with no proration: adds, price swaps and stops
+   *     all take effect on the next invoice, which bills everything together.
+   */
+  private async applyMedicationChange(
+    appointmentId: string,
+    userId: string,
+    ctx: { customerId: string; email: string; patientName: string },
+    plan: MedicationChangePlan,
+    invoice: any,
+  ) {
+    const subscriptionId = plan.subscriptionId!;
+
+    if (plan.mode === 'unchanged') {
+      await this.linkVisitToLiveMedicationSubscription(appointmentId, subscriptionId, ctx.customerId, plan.newMonthly);
+      return { mode: plan.mode, applied: true, requiresPayment: false, chargedToday: 0, newMonthly: plan.newMonthly, nextRenewal: plan.nextRenewal, premium: null };
+    }
+
+    const idem = medicationChangeIdem(appointmentId, plan);
+    const priceCtx = { appointmentId, userId, patientName: ctx.patientName, patientEmail: ctx.email, idem };
+
+    let sub = await this.stripe.subscriptions.retrieve(subscriptionId);
+    if (sub.cancel_at_period_end || (sub as any).cancel_at) {
+      sub = await this.stripe.subscriptions.update(
+        subscriptionId,
+        (sub as any).cancel_at ? { cancel_at: '' } : { cancel_at_period_end: false },
+      );
+    }
+
+    let charged: { invoiceId: string | null; paymentIntentId: string | null; cents: number } | null = null;
+    const chargeNow = plan.lines.filter((l) => l.action === 'add' && l.billingStart === 'now');
+    if (chargeNow.length) {
+      const cardOnFile = await this.medicationCardOnFile(sub, ctx.customerId);
+      let inv: any = await this.createMedicationChargeInvoice(appointmentId, userId, subscriptionId, ctx.customerId, plan, chargeNow, cardOnFile, idem);
+      if (inv.status !== 'paid' && cardOnFile) {
+        try {
+          inv = await this.stripe.invoices.pay(inv.id, { off_session: true });
+        } catch (e: any) {
+          console.warn(`Saved card declined for medication add on ${appointmentId}: ${e.message}`);
+        }
+      }
+      if (inv.status !== 'paid') {
+        inv = await this.stripe.invoices.retrieve(inv.id, { expand: ['confirmation_secret'] });
+        return this.medicationChangeNeedsPayment(appointmentId, subscriptionId, ctx.customerId, plan, inv, userId);
+      }
+      charged = { invoiceId: inv.id, paymentIntentId: await this.invoicePaymentIntentId(inv.id), cents: inv.amount_paid ?? 0 };
+    }
+
+    await this.applyMedicationItems(subscriptionId, plan, priceCtx);
+    await this.finalizeMedicationChange(appointmentId, userId, subscriptionId, ctx.customerId, plan, invoice, charged);
+    return {
+      mode: plan.mode,
+      applied: true,
+      requiresPayment: false,
+      chargedToday: (charged?.cents ?? 0) / 100,
+      newMonthly: plan.newMonthly,
+      nextRenewal: plan.nextRenewal,
+      premium: null,
+    };
+  }
+
+  /** The card renewals use: the subscription's, else the customer's default. */
+  private async medicationCardOnFile(sub: Stripe.Subscription, customerId: string): Promise<string | null> {
+    const fromSub = sub.default_payment_method;
+    if (fromSub) return typeof fromSub === 'string' ? fromSub : fromSub.id;
+    const customer: any = await this.stripe.customers.retrieve(customerId);
+    const fromCustomer = customer?.invoice_settings?.default_payment_method;
+    if (fromCustomer) return typeof fromCustomer === 'string' ? fromCustomer : fromCustomer.id;
+    return null;
+  }
+
+  /**
+   * Finalized one-off invoice for the full monthly price of each "charge now"
+   * medication, covering today until the next invoice. Kept off the subscription
+   * so the next invoice bills only the regular month. Idempotent per prescription.
+   */
+  private async createMedicationChargeInvoice(
+    appointmentId: string,
+    userId: string,
+    subscriptionId: string,
+    customerId: string,
+    plan: MedicationChangePlan,
+    lines: MedicationPlanLine[],
+    cardOnFile: string | null,
+    idem: string,
+  ) {
+    const until = plan.nextRenewal ? ` (until ${plan.nextRenewal.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })})` : '';
+    let inv: any = await this.stripe.invoices.create(
+      {
+        customer: customerId,
+        collection_method: 'charge_automatically',
+        auto_advance: false,
+        pending_invoice_items_behavior: 'exclude',
+        ...(cardOnFile ? { default_payment_method: cardOnFile } : {}),
+        description: `Medication added to your monthly plan${until}`,
+        metadata: { type: 'medication_change', appointmentId, userId, subscriptionId },
+      },
+      { idempotencyKey: `${idem}-inv` },
+    );
+    // A retry gets Stripe's cached create response ("draft"), so read it fresh.
+    inv = await this.stripe.invoices.retrieve(inv.id);
+    if (inv.status === 'draft') {
+      for (const [i, l] of lines.entries()) {
+        await this.stripe.invoiceItems.create(
+          {
+            customer: customerId,
+            invoice: inv.id,
+            amount: l.toCents ?? 0,
+            currency: 'usd',
+            description: `${[l.name, l.detail].filter(Boolean).join(' ')}${until}`,
+            metadata: { medicationId: l.medicationId || '', appointmentId, type: 'medication' },
+          },
+          { idempotencyKey: `${idem}-ii-${i}` },
+        );
+      }
+      inv = await this.stripe.invoices.finalizeInvoice(inv.id, { auto_advance: false });
+    }
+    return inv;
+  }
+
+  /** The PaymentIntent that paid an invoice (Clover moved it to invoice.payments). */
+  private async invoicePaymentIntentId(invoiceId: string): Promise<string | null> {
+    try {
+      const inv: any = await this.stripe.invoices.retrieve(invoiceId, { expand: ['payments'] });
+      const pi = inv.payments?.data?.find((p: any) => p.status === 'paid')?.payment?.payment_intent ?? inv.payment_intent;
+      return (typeof pi === 'string' ? pi : pi?.id) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Step 3 of applyMedicationChange, from the plan made before anything was
+   * applied. One update, no proration: the next invoice bills the new set.
+   */
+  private async applyMedicationItems(
+    subscriptionId: string,
+    plan: MedicationChangePlan,
+    priceCtx: { appointmentId: string; userId: string; patientName: string; patientEmail: string; idem: string },
+  ) {
+    // Never strip the last item: if only stops are left the patient should
+    // cancel instead (whole-plan cancel keeps the current month).
+    if (!plan.lines.some((l) => l.action !== 'stop')) return;
+    const items: Stripe.SubscriptionUpdateParams.Item[] = [];
+    for (const l of plan.lines) {
+      if (l.action === 'add') items.push({ price: await this.createMedicationLinePrice(l, priceCtx), quantity: 1 });
+      if (l.action === 'change') items.push({ id: l.itemId!, price: await this.createMedicationLinePrice(l, priceCtx), quantity: 1 });
+      if (l.action === 'stop') items.push({ id: l.itemId!, deleted: true });
+    }
+    if (!items.length) return;
+    await this.stripe.subscriptions.update(
+      subscriptionId,
+      { items, proration_behavior: 'none' },
+      { idempotencyKey: `${priceCtx.idem}-items` },
+    );
+  }
+
+  /** The saved card couldn't pay the "charge now" invoice; the patient pays it on the page. */
+  private async medicationChangeNeedsPayment(
+    appointmentId: string,
+    subscriptionId: string,
+    customerId: string,
+    plan: MedicationChangePlan,
+    inv: any,
+    userId: string,
+  ) {
+    const clientSecret: string | null = inv?.confirmation_secret?.client_secret ?? null;
+    if (!clientSecret?.startsWith('pi_')) {
+      throw new BadRequestException('Could not prepare the payment for the added medication. Please try again.');
+    }
+    const paymentIntentId = clientSecret.split('_secret_')[0];
+    await this.stripe.paymentIntents.update(paymentIntentId, {
+      metadata: { invoiceId: inv.id, subscriptionId, appointmentId, userId, type: 'medication', medChange: 'update' },
+    });
+
+    // The doctor edited the prescription after an earlier unpaid attempt: void
+    // that invoice so the patient can't pay for the old set.
+    const prev = await this.prisma.medicationPayment.findUnique({ where: { appointmentId } });
+    if (prev?.status === 'PENDING' && prev.paymentIntent && prev.paymentIntent !== paymentIntentId) {
+      try {
+        const oldPi = await this.stripe.paymentIntents.retrieve(prev.paymentIntent);
+        const oldInv = oldPi.metadata?.medChange === 'update' ? oldPi.metadata.invoiceId : null;
+        if (oldInv && oldInv !== inv.id) await this.stripe.invoices.voidInvoice(oldInv);
+      } catch (e: any) {
+        console.warn(`Could not void the earlier medication change invoice for ${appointmentId}: ${e.message}`);
+      }
+    }
+
+    // stripeSubscriptionId stays empty until paid: getMedicationPaymentStatus
+    // treats a row on an active subscription as paid.
+    await this.prisma.medicationPayment.upsert({
+      where: { appointmentId },
+      create: {
+        appointmentId,
+        stripeCustomerId: customerId,
+        amount: plan.newMonthly,
+        currency: 'usd',
+        status: 'PENDING',
+        paymentIntent: paymentIntentId,
+      },
+      update: { stripeCustomerId: customerId, amount: plan.newMonthly, status: 'PENDING', paymentIntent: paymentIntentId },
+    });
+    return {
+      mode: plan.mode,
+      applied: false,
+      requiresPayment: true,
+      clientSecret,
+      paymentIntentId,
+      chargedToday: (inv.amount_due ?? 0) / 100,
+      newMonthly: plan.newMonthly,
+      nextRenewal: plan.nextRenewal,
+      premium: null,
+    };
+  }
+
+  /**
+   * Point this visit at the live subscription and mark it paid. Shared by
+   * "nothing changed" and a finished change.
+   */
+  private async linkVisitToLiveMedicationSubscription(
+    appointmentId: string,
+    subscriptionId: string,
+    customerId: string,
+    newMonthly: number,
+    extra: { paymentIntent?: string | null } = {},
+  ) {
+    const sub = await this.stripe.subscriptions.retrieve(subscriptionId);
+    const periodEnd = periodEndOf(sub);
+    const data = {
+      stripeSubscriptionId: subscriptionId,
+      stripeCustomerId: customerId,
+      amount: newMonthly,
+      status: 'SUCCEEDED' as const,
+      paidAt: new Date(),
+      subscriptionStatus: (sub.cancel_at_period_end || (sub as any).cancel_at ? 'canceling' : sub.status) as any,
+      subscriptionEndDate: periodEnd ? new Date(periodEnd * 1000) : null,
+      subscriptionCanceledAt: null,
+      ...(extra.paymentIntent ? { paymentIntent: extra.paymentIntent } : {}),
+    };
+    await this.prisma.medicationPayment.upsert({
+      where: { appointmentId },
+      create: { appointmentId, currency: 'usd', ...data },
+      update: data,
+    });
+  }
+
+  /**
+   * Records a finished change: visit row, the "starts on" date of medications
+   * held for the next invoice, active medication set, ledger row for any charge.
+   */
+  private async finalizeMedicationChange(
+    appointmentId: string,
+    userId: string,
+    subscriptionId: string,
+    customerId: string,
+    plan: MedicationChangePlan,
+    invoice: any,
+    charged: { invoiceId: string | null; paymentIntentId: string | null; cents: number } | null,
+  ) {
+    await this.linkVisitToLiveMedicationSubscription(appointmentId, subscriptionId, customerId, plan.newMonthly, {
+      paymentIntent: charged?.paymentIntentId,
+    });
+
+    // "Add to next invoice" medications ship with that invoice; the date sits on
+    // the prescription so the chart and whoever ships can see it.
+    const deferred = plan.lines.filter((l) => l.action === 'add' && l.billingStart === 'next_invoice');
+    if (deferred.length && plan.nextRenewal) {
+      await this.markMedicationsStartOn(appointmentId, deferred, plan.nextRenewal);
+    }
+
+    const names = (invoice.items || []).map((i: any) => i.name).join(', ');
+    await this.stripe.subscriptions
+      .update(subscriptionId, { metadata: { medications: names.substring(0, 500), latestAppointmentId: appointmentId } })
+      .catch((e) => console.error(`Could not update medication subscription metadata: ${e.message}`));
+
+    let recordId: string | null = null;
+    if (charged && charged.cents > 0 && (charged.invoiceId || charged.paymentIntentId)) {
+      let hostedInvoiceUrl: string | null = null;
+      let lineItems: any[] = [];
+      if (charged.invoiceId) {
+        try {
+          const paidInv: any = await this.stripe.invoices.retrieve(charged.invoiceId);
+          hostedInvoiceUrl = paidInv.hosted_invoice_url || null;
+          lineItems = (paidInv.lines?.data || [])
+            .filter((l: any) => (l.amount ?? 0) > 0)
+            .map((l: any) => ({
+              description: l.description || 'Medication',
+              quantity: 1,
+              unitAmount: (l.amount ?? 0) / 100,
+              isSubscription: false,
+            }));
+        } catch (e: any) {
+          console.error(`Could not read medication change invoice ${charged.invoiceId}: ${e.message}`);
+        }
+      }
+      recordId = await this.paymentLedger.upsertFromStripe({
+        receiptUrl: hostedInvoiceUrl,
+        hostedInvoiceUrl,
+        stripeInvoiceId: charged.invoiceId,
+        stripePaymentIntentId: charged.paymentIntentId,
+        stripeSubscriptionId: subscriptionId,
+        stripeCustomerId: customerId,
+        userId,
+        appointmentId,
+        channel: 'PLATFORM',
+        category: 'MEDICATION',
+        billing: 'ONE_TIME',
+        amount: charged.cents / 100,
+        currency: 'usd',
+        status: 'SUCCEEDED',
+        paidAt: new Date(),
+        note: 'Medication added mid-cycle (full month until next invoice)',
+        lineItems,
+        skipMedicationLifecycle: true,
+      });
+    }
+
+    await this.paymentLedger.replaceActiveMedicationSet({
+      userId,
+      stripeSubscriptionId: subscriptionId,
+      startedAt: new Date(),
+      sourcePaymentRecordId: recordId,
+      items: (invoice.items || []).map((it: any) => ({
+        medicationId: it.medicationId ?? null,
+        medicationName: [it.name, it.strength, it.dose].filter(Boolean).join(' '),
+        dosageSnapshot: [it.strength, it.dose, it.frequency, it.route].filter(Boolean).join(' ') || null,
+      })),
+    });
+  }
+
+  /** Stamps startsOn on the matching entries of the appointment's medications JSON. */
+  private async markMedicationsStartOn(appointmentId: string, lines: MedicationPlanLine[], startsOn: Date) {
+    try {
+      const appt = await this.prisma.appointment.findUnique({ where: { id: appointmentId }, select: { medications: true } });
+      const meds: any = appt?.medications;
+      if (!meds || typeof meds !== 'object') return;
+      const ids = new Set(lines.map((l) => l.medicationId).filter(Boolean));
+      const iso = startsOn.toISOString();
+      for (const entries of Object.values(meds)) {
+        if (!Array.isArray(entries)) continue;
+        for (const e of entries) if (e && typeof e === 'object' && ids.has(e.id)) e.startsOn = iso;
+      }
+      await this.prisma.appointment.update({ where: { id: appointmentId }, data: { medications: meds } });
+    } catch (e: any) {
+      console.error(`Could not mark start date on medications for ${appointmentId}: ${e.message}`);
+    }
+  }
+
+  /**
+   * A signed follow-up that prescribes exactly what the patient already pays
+   * for needs no invoice: link it to the live subscription so the patient,
+   * the chart and reminders all see it as covered. Only after signing (a paid
+   * row locks the medications). Best-effort, never throws.
+   */
+  private async linkIfCoveredByLiveSubscription(appointmentId: string): Promise<boolean> {
+    try {
+      const appt = await this.prisma.appointment.findUnique({
+        where: { id: appointmentId },
+        select: { patientId: true, notesSignedAt: true, medications: true, patient: { select: { stripeCustomerId: true } } },
+      });
+      if (!appt?.notesSignedAt || !appt.patient?.stripeCustomerId) return false;
+      if (!this.appointmentsService.hasPrescribedMedications(appt.medications)) return false;
+      const plan = await this.planMedicationChange(appointmentId, appt.patientId, undefined, appt.patient.stripeCustomerId);
+      if (plan.mode !== 'unchanged' || !plan.subscriptionId) return false;
+      await this.linkVisitToLiveMedicationSubscription(
+        appointmentId,
+        plan.subscriptionId,
+        appt.patient.stripeCustomerId,
+        plan.newMonthly,
+      );
+      console.log(`✅ Visit ${appointmentId} continues the live medication subscription ${plan.subscriptionId}; no invoice`);
+      return true;
+    } catch (e: any) {
+      console.error(`linkIfCoveredByLiveSubscription(${appointmentId}) failed: ${e.message}`);
+      return false;
     }
   }
 
@@ -2865,6 +3479,31 @@ export class StripeService {
           throw error;
         }
       }
+    }
+
+    // A follow-up visit for a patient who already has a live medication
+    // subscription (from any visit) changes that subscription instead of
+    // starting a second one — the second one is what double-billed patients.
+    const plan = await this.planMedicationChange(appointmentId, userId, invoice, customerId);
+    if (plan.mode !== 'new') {
+      const patientName = `${user.firstName || ''} ${user.lastName || ''}`.trim();
+      const result: any = await this.applyMedicationChange(
+        appointmentId,
+        userId,
+        { customerId, email, patientName },
+        plan,
+        invoice,
+      );
+      // Medications are member-only; a lapsed member restarts the membership here.
+      if (!invoice.isSubscribed) {
+        const premiumResult: any = await this.createSubscription(userId);
+        result.premium = {
+          clientSecret: premiumResult.clientSecret,
+          subscriptionId: premiumResult.subscriptionId,
+          amount: premiumResult.amount ?? 0,
+        };
+      }
+      return result;
     }
 
     // P0 (M1): guard against duplicate medication subscriptions. Trust Stripe live, not just the
@@ -3205,6 +3844,46 @@ export class StripeService {
 
     if (paymentIntent.status !== 'succeeded') {
       throw new BadRequestException('Payment not completed');
+    }
+
+    // The patient paid the "charge now" invoice for a medication added to their
+    // existing subscription on the page (the saved card was declined; see
+    // applyMedicationChange). Now apply the change to the subscription.
+    if (paymentIntent.metadata?.medChange === 'update') {
+      const appointmentId = paymentIntent.metadata.appointmentId;
+      const subscriptionId = paymentIntent.metadata.subscriptionId;
+      const appt = await this.prisma.appointment.findUnique({
+        where: { id: appointmentId },
+        include: { patient: true },
+      });
+      if (!appt || appt.patientId !== userId) throw new BadRequestException('Unauthorized');
+      // They paid with a new card because the saved one was declined; renewals
+      // must use the new one too.
+      const newCard = typeof paymentIntent.payment_method === 'string' ? paymentIntent.payment_method : paymentIntent.payment_method?.id;
+      if (newCard) {
+        await this.stripe.subscriptions
+          .update(subscriptionId, { default_payment_method: newCard })
+          .catch((e) => console.error(`Could not set the new card on ${subscriptionId}: ${e.message}`));
+      }
+      const customerId = String(paymentIntent.customer || appt.patient.stripeCustomerId || '');
+      const invoice = await this.calculateMedicationInvoice(appointmentId, userId);
+      const plan = await this.planMedicationChange(appointmentId, userId, invoice, customerId);
+      const patientName = `${appt.patient.firstName || ''} ${appt.patient.lastName || ''}`.trim();
+      if (plan.subscriptionId === subscriptionId && plan.mode === 'update') {
+        await this.applyMedicationItems(subscriptionId, plan, {
+          appointmentId,
+          userId,
+          patientName,
+          patientEmail: appt.patient.primaryEmail || appt.patient.email || '',
+          idem: medicationChangeIdem(appointmentId, plan),
+        });
+      }
+      await this.finalizeMedicationChange(appointmentId, userId, subscriptionId, customerId, plan, invoice, {
+        invoiceId: paymentIntent.metadata.invoiceId || null,
+        paymentIntentId,
+        cents: paymentIntent.amount_received ?? 0,
+      });
+      return { success: true, appointmentId };
     }
 
     // Get payment record with appointment and patient
@@ -3558,9 +4237,14 @@ export class StripeService {
       throw new BadRequestException('Unauthorized');
     }
 
-    const payment = await this.prisma.medicationPayment.findUnique({
+    let payment = await this.prisma.medicationPayment.findUnique({
       where: { appointmentId },
     });
+
+    // Same medications as the plan already being billed: covered, no invoice.
+    if (!payment && (await this.linkIfCoveredByLiveSubscription(appointmentId))) {
+      payment = await this.prisma.medicationPayment.findUnique({ where: { appointmentId } });
+    }
 
     if (!payment) {
       return {
@@ -4084,4 +4768,62 @@ function periodStartOf(sub: any): any {
 }
 function periodEndOf(sub: any): any {
   return sub?.current_period_end ?? sub?.items?.data?.[0]?.current_period_end ?? null;
+}
+
+/** Short stable token from free text, for idempotency keys. */
+function norm16(s: string): string {
+  return createHash('sha1').update((s || '').trim().toLowerCase()).digest('hex').slice(0, 16);
+}
+
+/** The medications a live subscription bills, matched back to the catalogue where possible. */
+function liveMedicationItems(sub: Stripe.Subscription) {
+  return sub.items.data.map((it) => {
+    const product: any = it.price.product;
+    return {
+      itemId: it.id,
+      medicationId:
+        it.price.metadata?.medicationId || (typeof product === 'object' ? product?.metadata?.medicationId : '') || null,
+      name: typeof product === 'object' && !product?.deleted ? product.name : '',
+      cents: (it.price.unit_amount ?? 0) * (it.quantity ?? 1),
+    };
+  });
+}
+
+/** Same prescription contents → same Stripe objects on a retry or double click. */
+function medicationChangeIdem(appointmentId: string, plan: MedicationChangePlan): string {
+  const contentKey = createHash('sha1')
+    .update(JSON.stringify(plan.lines.map((l) => [l.action, l.medicationId, l.toCents, l.itemId, l.billingStart])))
+    .digest('hex')
+    .slice(0, 16);
+  return `medupd-${appointmentId}-${contentKey}`;
+}
+
+/** One prescribed or billed medication and what a follow-up visit does to it. See planMedicationChange. */
+export interface MedicationPlanLine {
+  action: 'continue' | 'change' | 'add' | 'stop';
+  medicationId: string | null;
+  name: string;
+  detail: string | null;
+  dosageSnapshot: string | null;
+  /** Monthly cents on the live subscription today (null for an add). */
+  fromCents: number | null;
+  /** Monthly cents after this visit (null for a stop). */
+  toCents: number | null;
+  /** The live subscription item this line continues, changes or stops. */
+  itemId: string | null;
+  /** For an add: full monthly price today, or first billed on the next invoice. */
+  billingStart: 'now' | 'next_invoice';
+}
+
+export interface MedicationChangePlan {
+  mode: 'new' | 'unchanged' | 'update';
+  subscriptionId: string | null;
+  /** The live subscription was set to cancel; confirming resumes it. */
+  resumesCancelled: boolean;
+  nextRenewal: Date | null;
+  currentMonthly: number;
+  newMonthly: number;
+  /** Full monthly price of the medications the doctor chose to charge now. */
+  dueToday: number;
+  lines: MedicationPlanLine[];
 }

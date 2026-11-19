@@ -191,7 +191,7 @@ export class StripeController {
   @ApiResponse({ status: 404, description: 'Appointment not found' })
   async getMedicationInvoice(@Param('appointmentId') appointmentId: string, @Request() req) {
     const userId = req.user.id;
-    const invoice = await this.stripeService.calculateMedicationInvoice(appointmentId, userId);
+    const invoice = await this.stripeService.getMedicationInvoiceForPatient(appointmentId, userId);
     return {
       success: true,
       data: invoice,
@@ -232,6 +232,13 @@ export class StripeController {
   async getLatestMedicationPayment(@Param('patientId') patientId: string, @Request() req) {
     assertStaff(req);
     return { success: true, data: await this.stripeService.getLatestMedicationPaymentForPatient(patientId) };
+  }
+
+  @Get('medications/live-plan/:appointmentId')
+  @ApiOperation({ summary: "Staff: medications the visit's patient already pays for monthly, and the next invoice date" })
+  async getLiveMedicationPlan(@Param('appointmentId') appointmentId: string, @Request() req) {
+    assertStaff(req);
+    return { success: true, data: await this.stripeService.getLiveMedicationPlanForAppointment(appointmentId) };
   }
 
   @Post('medications/payment-reminder/:appointmentId')

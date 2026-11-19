@@ -566,7 +566,7 @@ model MedicationPayment {
   currency          String   @default("usd")
   status            PaymentStatus @default(PENDING)
   paymentIntent     String?  @unique // Stripe payment intent ID (for initial setup)
-  stripeSubscriptionId String? @unique // Stripe subscription ID for monthly billing
+  stripeSubscriptionId String? // Stripe subscription ID for monthly billing. Not unique: follow-up visits that continue or change the plan share the patient's one subscription.
   stripeCustomerId String? // Stripe customer ID
   paidAt            DateTime?
   subscriptionStatus String? // active, canceling, canceled, etc.
@@ -586,6 +586,7 @@ model MedicationPayment {
   // Relations
   appointment       Appointment @relation("MedicationPayments", fields: [appointmentId], references: [id], onDelete: Restrict)
 
+  @@index([stripeSubscriptionId])
   @@map("medication_payments")
 }
 
