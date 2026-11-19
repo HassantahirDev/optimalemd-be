@@ -137,6 +137,7 @@ model User {
   referralsMade       Referral[]    @relation("Referrer")
   referralReceived    Referral?     @relation("Referred")
   followUpIntakeForms FollowUpIntakeForm[]
+  appointmentQuestionnaires AppointmentQuestionnaire[]
   blogComments       BlogComment[]
   blogReactions      BlogReaction[]
   subscriptionTransactions SubscriptionTransaction[]
@@ -946,6 +947,7 @@ model Appointment {
   appointmentAssessments AppointmentAssessment[]
   medicationPrescriptions MedicationPrescription[]
   followUpIntakeForm FollowUpIntakeForm?
+  questionnaire AppointmentQuestionnaire?
   rescheduleLogs    AppointmentRescheduleLog[]
 
   @@index([isEncounter])
@@ -991,6 +993,29 @@ model FollowUpIntakeForm {
   patient       User        @relation(fields: [patientId], references: [id], onDelete: Cascade)
 
   @@map("follow_up_intake_forms")
+}
+
+// qADAM, IIEF (erectile function domain) and PHQ-9, answered by the patient
+// before every booking. Each answer is the scale value, in question order, so a
+// score is the sum of its array. qADAM and IIEF are asked of male patients only
+// (empty arrays otherwise).
+model AppointmentQuestionnaire {
+  id             String   @id @default(uuid())
+  appointmentId  String   @unique
+  patientId      String
+  qadam          Int[] // 10 answers, 1–5
+  iief           Int[] // 6 answers: Q1–5 0–5 (0 = no sexual activity), Q6 1–5
+  phq9           Int[] // 9 answers, 0–3
+  phq9Difficulty Int? // 0–3 (not difficult … extremely difficult); not part of the PHQ-9 score
+  submittedAt    DateTime @default(now())
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  appointment Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  patient     User        @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  @@index([patientId])
+  @@map("appointment_questionnaires")
 }
 
 // Booking model for appointment requests
