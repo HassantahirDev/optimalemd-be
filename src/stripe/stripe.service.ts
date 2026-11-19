@@ -3027,18 +3027,26 @@ export class StripeService {
    * The doctor submitted a follow-up prescription (POST medications/apply).
    * Billing follows the doctor's answers right away, with no patient step, and
    * nothing is prorated:
-   *  1. Undo a scheduled cancellation (re-prescribed = continuing).
-   *  2. One subscription update, no proration: adds, swaps and stops all bill
-   *     from the next invoice.
-   *  3. "Charge now" medications: their full monthly price on a one-off invoice
-   *     (today until the next invoice), charged to the saved card. Declined, or
-   *     no card: the invoice stays open for the patient to pay until the next
-   *     invoice date, when it is voided — the medication is already on the
-   *     subscription, so it bills with the renewal (see voidPendingMedicationCharges).
+   *  1. "Charge now" medications first, before anything else changes: their
+   *     full monthly price on a one-off invoice (today until the next invoice),
+   *     charged to the saved card. If the card can't be charged, nothing is
+   *     changed and the doctor decides (onChargeFailure): send the patient that
+   *     invoice, or add the medication to the next invoice instead. With no
+   *     saved card the doctor already chose "send invoice" in the dialog.
+   *  2. Undo a scheduled cancellation (re-prescribed = continuing).
+   *  3. One subscription update, no proration: adds, swaps and stops all bill
+   *     from the next invoice. A sent invoice stays open for the patient until
+   *     the next invoice date, when it is voided and the medication bills with
+   *     the renewal (see voidPendingMedicationCharges).
+   * Charging first means a retry after a failure part-way never skips or
+   * repeats the charge: it finds the visit's existing invoice and carries on.
    * First prescriptions (no monthly plan) are left to the patient's invoice page.
    * Runs once per visit: billingAppliedAt locks the prescription.
    */
-  async applyMedicationsAtSubmit(appointmentId: string): Promise<MedicationSubmitResult> {
+  async applyMedicationsAtSubmit(
+    appointmentId: string,
+    onChargeFailure?: 'send_invoice' | 'next_invoice',
+  ): Promise<MedicationSubmitResult> {
     const appt = await this.prisma.appointment.findUnique({
       where: { id: appointmentId },
       include: { patient: true, medicationPayment: true },
@@ -3068,6 +3076,9 @@ export class StripeService {
     const subscriptionId = plan.subscriptionId!;
     if (plan.mode === 'unchanged') {
       await this.linkVisitToLiveMedicationSubscription(appointmentId, subscriptionId, customerId!, plan.newMonthly);
+      // A retry after an earlier attempt charged the card but failed before
+      // recording it: record that payment now (never charge it again).
+      await this.recordPaidVisitCharge(appointmentId, userId, subscriptionId, customerId!);
       await this.markMedicationBillingApplied(appointmentId);
       return { mode: 'unchanged', message: 'Nothing changes: the medications continue on the current plan.', newMonthly: plan.newMonthly, nextRenewal: plan.nextRenewal };
     }
@@ -3078,33 +3089,65 @@ export class StripeService {
     const priceCtx = { appointmentId, userId, patientName, patientEmail: email, idem };
 
     let sub = await this.stripe.subscriptions.retrieve(subscriptionId);
+
+    // 1. Charge now — before the plan changes.
+    let charged: { invoiceId: string | null; paymentIntentId: string | null; cents: number } | null = null;
+    let pending: { invoiceId: string; amount: number; reason: 'declined' | 'no_card' } | null = null;
+    let chargeNow = plan.lines.filter((l) => l.action === 'add' && l.billingStart === 'now');
+    if (chargeNow.length) {
+      const cardOnFile = await this.medicationCardOnFile(sub, customerId!);
+      let inv: any = await this.createMedicationChargeInvoice(appointmentId, userId, subscriptionId, customerId!, plan, chargeNow, cardOnFile, idem);
+      let declineReason: string | null = null;
+      if (inv.status !== 'paid' && cardOnFile && !onChargeFailure) {
+        try {
+          inv = await this.stripe.invoices.pay(inv.id, { off_session: true });
+        } catch (e: any) {
+          declineReason = e?.raw?.message || e?.message || 'The card was declined.';
+          console.warn(`Saved card declined for medication charge on ${appointmentId}: ${declineReason}`);
+          inv = await this.stripe.invoices.retrieve(inv.id);
+        }
+      }
+      const amount = (inv.amount_due ?? 0) / 100;
+      if (inv.status === 'paid') {
+        charged = { invoiceId: inv.id, paymentIntentId: await this.invoicePaymentIntentId(inv.id), cents: inv.amount_paid ?? 0 };
+      } else if (!cardOnFile || onChargeFailure === 'send_invoice') {
+        // No saved card (the doctor picked "Send invoice now"), or the doctor
+        // chose to send it after the card failed: the patient pays it.
+        await this.releaseMedicationChargeInvoice(inv.id);
+        pending = { invoiceId: inv.id, amount, reason: cardOnFile ? 'declined' : 'no_card' };
+      } else if (onChargeFailure === 'next_invoice') {
+        // The doctor chose to bill it with the next invoice instead: $0 today.
+        await this.stripe.invoices.voidInvoice(inv.id).catch((e) => console.error(`Could not void ${inv.id}: ${e.message}`));
+        for (const l of chargeNow) l.billingStart = 'next_invoice';
+        await this.setMedicationsBillingStart(appointmentId, chargeNow, 'next_invoice');
+        chargeNow = [];
+      } else {
+        // Card failed: change nothing. The doctor must send the invoice or move
+        // it to the next invoice (the invoice stays hidden from the patient).
+        const pm = cardOnFile ? await this.stripe.paymentMethods.retrieve(cardOnFile).catch(() => null) : null;
+        return {
+          mode: 'charge_failed',
+          message: `Couldn't charge ${pm?.card ? `${pm.card.brand} •••• ${pm.card.last4}` : 'the saved card'} ${`$${amount.toFixed(2)}`}. Choose how to bill it before the prescription is submitted.`,
+          chargeFailure: {
+            amount,
+            card: pm?.card ? { brand: pm.card.brand, last4: pm.card.last4 } : null,
+            reason: declineReason,
+            medications: chargeNow.map((l) => [l.name, l.detail].filter(Boolean).join(' ')),
+            nextRenewal: plan.nextRenewal,
+          },
+        };
+      }
+    }
+
+    // 2. Re-prescribed = continuing: undo a scheduled cancellation.
     if (sub.cancel_at_period_end || (sub as any).cancel_at) {
       sub = await this.stripe.subscriptions.update(
         subscriptionId,
         (sub as any).cancel_at ? { cancel_at: '' } : { cancel_at_period_end: false },
       );
     }
+    // 3. The plan itself.
     await this.applyMedicationItems(subscriptionId, plan, priceCtx);
-
-    let charged: { invoiceId: string | null; paymentIntentId: string | null; cents: number } | null = null;
-    let pending: { invoiceId: string; amount: number; reason: 'declined' | 'no_card' } | null = null;
-    const chargeNow = plan.lines.filter((l) => l.action === 'add' && l.billingStart === 'now');
-    if (chargeNow.length) {
-      const cardOnFile = await this.medicationCardOnFile(sub, customerId!);
-      let inv: any = await this.createMedicationChargeInvoice(appointmentId, userId, subscriptionId, customerId!, plan, chargeNow, cardOnFile, idem);
-      if (inv.status !== 'paid' && cardOnFile) {
-        try {
-          inv = await this.stripe.invoices.pay(inv.id, { off_session: true });
-        } catch (e: any) {
-          console.warn(`Saved card declined for medication charge on ${appointmentId}: ${e.message}`);
-        }
-      }
-      if (inv.status === 'paid') {
-        charged = { invoiceId: inv.id, paymentIntentId: await this.invoicePaymentIntentId(inv.id), cents: inv.amount_paid ?? 0 };
-      } else {
-        pending = { invoiceId: inv.id, amount: (inv.amount_due ?? 0) / 100, reason: cardOnFile ? 'declined' : 'no_card' };
-      }
-    }
 
     await this.finalizeMedicationChange(appointmentId, userId, subscriptionId, customerId!, plan, invoice, charged, pending);
     await this.markMedicationBillingApplied(appointmentId, pending);
@@ -3123,8 +3166,8 @@ export class StripeService {
       pendingCharge: pending ? { amount: pending.amount, reason: pending.reason } : null,
       message: pending
         ? pending.reason === 'declined'
-          ? `The saved card was declined for ${usd(pending.amount)}. The patient has been sent an invoice; if unpaid, it moves to the next invoice. Don't ship until paid.`
-          : `No card on file: the patient has been sent a ${usd(pending.amount)} invoice. Don't ship until paid.`
+          ? `The patient has been emailed a ${usd(pending.amount)} invoice and can pay it from their portal. If unpaid, it moves to the next invoice. Don't ship until paid.`
+          : `No card on file: the patient has been emailed a ${usd(pending.amount)} invoice. Don't ship until paid.`
         : charged
           ? `Charged ${usd(charged.cents / 100)} to the saved card. Plan updated.`
           : 'Plan updated. Nothing charged today; changes bill from the next invoice.',
@@ -3178,7 +3221,7 @@ export class StripeService {
   async getPrescribeContextForAppointment(appointmentId: string) {
     const appt = await this.prisma.appointment.findUnique({
       where: { id: appointmentId },
-      select: { patient: { select: { stripeCustomerId: true, isSubscribed: true } } },
+      select: { medications: true, patient: { select: { stripeCustomerId: true, isSubscribed: true } } },
     });
     if (!appt) throw new NotFoundException('Appointment not found');
     const customerId = appt.patient?.stripeCustomerId ?? null;
@@ -3218,7 +3261,43 @@ export class StripeService {
       }
     }
 
-    return { membership: { active: member, firstTime, blocked: !firstTime && !member }, card, plan };
+    // A "charge now" that failed and is waiting for the doctor's decision, so the
+    // choice is offered again even after the dialog was closed (it reopens read-only).
+    let chargeFailure: any = null;
+    if (customerId) {
+      const open = (await this.visitChargeInvoices(customerId, appointmentId)).find(
+        (i) => i.status === 'open' && i.metadata?.awaitingDoctor,
+      );
+      if (open) {
+        chargeFailure = {
+          amount: (open.amount_due ?? 0) / 100,
+          card,
+          reason: null,
+          medications: (open.lines?.data || []).map((l: any) => l.description || 'Medication'),
+          nextRenewal: plan?.nextRenewal ?? null,
+        };
+      }
+    }
+    // A follow-up whose prescription was saved but billing never ran (it failed,
+    // and the dialog was closed): the locked view offers "Retry billing".
+    const row = await this.prisma.medicationPayment.findUnique({
+      where: { appointmentId },
+      select: { billingAppliedAt: true, status: true },
+    });
+    const billingPending =
+      !!plan &&
+      !chargeFailure &&
+      !row?.billingAppliedAt &&
+      row?.status !== 'SUCCEEDED' &&
+      this.appointmentsService.hasPrescribedMedications(appt.medications);
+
+    return {
+      membership: { active: member, firstTime, blocked: !firstTime && !member },
+      card,
+      plan,
+      chargeFailure,
+      billingPending,
+    };
   }
 
   /** Staff: email a lapsed member to renew their Performance membership so medications can be prescribed. */
@@ -3261,6 +3340,8 @@ export class StripeService {
     for (const raw of open.data) {
       const inv: any = raw;
       if (inv.metadata?.type === 'medication_change') {
+        // Card failed and the doctor hasn't chosen "send invoice" / "next invoice" yet.
+        if (inv.metadata?.awaitingDoctor) continue;
         const sub = inv.metadata.subscriptionId ? await getSub(inv.metadata.subscriptionId) : null;
         // The renewal it was waiting for already happened (missed webhook):
         // the medication billed with it, so this one is no longer owed.
@@ -3268,7 +3349,8 @@ export class StripeService {
           await this.voidMedicationChargeInvoice(inv.id);
           continue;
         }
-        out.push(await this.pendingMedicationPaymentView(inv.id, 'charge'));
+        const end = sub ? periodEndOf(sub) : null;
+        out.push(await this.pendingMedicationPaymentView(inv.id, 'charge', end ? new Date(end * 1000) : null));
         continue;
       }
       await this.normalizeInvoice(inv);
@@ -3282,11 +3364,14 @@ export class StripeService {
     return out;
   }
 
-  private async pendingMedicationPaymentView(invoiceId: string, kind: 'charge' | 'renewal') {
+  private async pendingMedicationPaymentView(invoiceId: string, kind: 'charge' | 'renewal', coversUntil: Date | null = null) {
     const inv: any = await this.stripe.invoices.retrieve(invoiceId, { expand: ['confirmation_secret'] });
     return {
       invoiceId: inv.id,
       kind,
+      // charge: the date it covers until (the next monthly invoice), and why it wasn't paid automatically.
+      coversUntil,
+      reason: kind === 'charge' ? (inv.default_payment_method ? 'declined' : 'no_card') : null,
       amount: (inv.amount_due ?? 0) / 100,
       invoiceDate: new Date(inv.created * 1000),
       appointmentId: inv.metadata?.appointmentId || null,
@@ -3479,9 +3564,81 @@ export class StripeService {
   }
 
   /**
+   * This visit's existing "charge now" invoices (open or paid), newest first.
+   * One visit has at most one that counts, so retries reuse it.
+   */
+  private async visitChargeInvoices(customerId: string, appointmentId: string): Promise<any[]> {
+    const found: any[] = [];
+    for (const status of ['paid', 'open'] as const) {
+      const res = await this.stripe.invoices.list({ customer: customerId, status, limit: 100 });
+      found.push(...res.data.filter((i: any) => i.metadata?.type === 'medication_change' && i.metadata?.appointmentId === appointmentId));
+    }
+    return found.sort((a, b) => b.created - a.created);
+  }
+
+  /** The patient can now see (and pay) a "charge now" invoice the doctor chose to send. */
+  private async releaseMedicationChargeInvoice(invoiceId: string) {
+    const inv: any = await this.stripe.invoices.retrieve(invoiceId);
+    if (inv.metadata?.awaitingDoctor) {
+      await this.stripe.invoices.update(invoiceId, { metadata: { awaitingDoctor: '' } });
+    }
+  }
+
+  /** Saves the doctor's "add to next invoice" on the prescription (labels, ship date). */
+  private async setMedicationsBillingStart(appointmentId: string, lines: MedicationPlanLine[], billingStart: 'now' | 'next_invoice') {
+    const appt = await this.prisma.appointment.findUnique({ where: { id: appointmentId }, select: { medications: true } });
+    const meds: any = appt?.medications;
+    if (!meds || typeof meds !== 'object') return;
+    const ids = new Set(lines.map((l) => l.medicationId).filter(Boolean));
+    for (const entries of Object.values(meds)) {
+      if (!Array.isArray(entries)) continue;
+      for (const e of entries) if (e && typeof e === 'object' && ids.has(e.id)) e.billingStart = billingStart;
+    }
+    await this.prisma.appointment.update({ where: { id: appointmentId }, data: { medications: meds } });
+  }
+
+  /**
+   * An earlier attempt for this visit charged the card but failed before it was
+   * recorded: put that payment in the ledger. Idempotent (keyed on the invoice).
+   */
+  private async recordPaidVisitCharge(appointmentId: string, userId: string, subscriptionId: string, customerId: string) {
+    const paid = (await this.visitChargeInvoices(customerId, appointmentId)).find((i) => i.status === 'paid');
+    if (!paid) return;
+    await this.paymentLedger.upsertFromStripe({
+      receiptUrl: paid.hosted_invoice_url || null,
+      hostedInvoiceUrl: paid.hosted_invoice_url || null,
+      stripeInvoiceId: paid.id,
+      stripePaymentIntentId: await this.invoicePaymentIntentId(paid.id),
+      stripeSubscriptionId: subscriptionId,
+      stripeCustomerId: customerId,
+      userId,
+      appointmentId,
+      channel: 'PLATFORM',
+      category: 'MEDICATION',
+      billing: 'ONE_TIME',
+      amount: (paid.amount_paid ?? 0) / 100,
+      currency: 'usd',
+      status: 'SUCCEEDED',
+      paidAt: paid.status_transitions?.paid_at ? new Date(paid.status_transitions.paid_at * 1000) : new Date(),
+      note: 'Medication added mid-cycle (full month until next invoice)',
+      lineItems: (paid.lines?.data || []).map((l: any) => ({
+        description: l.description || 'Medication',
+        quantity: 1,
+        unitAmount: (l.amount ?? 0) / 100,
+        isSubscription: false,
+      })),
+      skipMedicationLifecycle: true,
+    });
+  }
+
+  /**
    * Finalized one-off invoice for the full monthly price of each "charge now"
    * medication, covering today until the next invoice. Kept off the subscription
-   * so the next invoice bills only the regular month. Idempotent per prescription.
+   * so the next invoice bills only the regular month. One per visit: a retry
+   * reuses the visit's paid or open invoice for the same amount (so the card is
+   * never charged twice), and voids one left over from different prescriptions.
+   * New invoices start hidden from the patient (awaitingDoctor) until the
+   * charge succeeds or the doctor chooses to send it.
    */
   private async createMedicationChargeInvoice(
     appointmentId: string,
@@ -3494,6 +3651,16 @@ export class StripeService {
     idem: string,
   ) {
     const until = plan.nextRenewal ? ` (until ${plan.nextRenewal.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })})` : '';
+    const cents = lines.reduce((t, l) => t + (l.toCents ?? 0), 0);
+    const existing = await this.visitChargeInvoices(customerId, appointmentId);
+    const reuse = existing.find((i) => (i.status === 'paid' ? i.amount_paid : i.amount_due) === cents);
+    for (const stale of existing) {
+      if (stale !== reuse && stale.status === 'open') {
+        await this.stripe.invoices.voidInvoice(stale.id).catch((e) => console.error(`Could not void ${stale.id}: ${e.message}`));
+      }
+    }
+    if (reuse) return reuse;
+
     let inv: any = await this.stripe.invoices.create(
       {
         customer: customerId,
@@ -3502,7 +3669,7 @@ export class StripeService {
         pending_invoice_items_behavior: 'exclude',
         ...(cardOnFile ? { default_payment_method: cardOnFile } : {}),
         description: `Medication added to your monthly plan${until}`,
-        metadata: { type: 'medication_change', appointmentId, userId, subscriptionId },
+        metadata: { type: 'medication_change', appointmentId, userId, subscriptionId, awaitingDoctor: '1' },
       },
       { idempotencyKey: `${idem}-inv` },
     );
@@ -5162,8 +5329,16 @@ function norm16(s: string): string {
 
 /** What happened when the doctor submitted a prescription (applyMedicationsAtSubmit). */
 export interface MedicationSubmitResult {
-  mode: 'new' | 'unchanged' | 'update' | 'review' | 'none' | 'applied';
+  mode: 'new' | 'unchanged' | 'update' | 'review' | 'none' | 'applied' | 'charge_failed';
   message: string;
+  /** charge_failed: the saved card couldn't be charged; nothing changed yet. */
+  chargeFailure?: {
+    amount: number;
+    card: { brand: string; last4: string } | null;
+    reason: string | null;
+    medications: string[];
+    nextRenewal: Date | null;
+  };
   newMonthly?: number;
   nextRenewal?: Date | null;
   chargedToday?: number;

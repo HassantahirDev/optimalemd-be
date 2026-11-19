@@ -243,9 +243,15 @@ export class StripeController {
 
   @Post('medications/apply/:appointmentId')
   @ApiOperation({ summary: 'Staff: bill a just-submitted follow-up prescription to the patient\'s monthly plan' })
-  async applyMedications(@Param('appointmentId') appointmentId: string, @Request() req) {
+  async applyMedications(
+    @Param('appointmentId') appointmentId: string,
+    @Body() body: { onChargeFailure?: 'send_invoice' | 'next_invoice' },
+    @Request() req,
+  ) {
     assertStaff(req);
-    return { success: true, data: await this.stripeService.applyMedicationsAtSubmit(appointmentId) };
+    const choice = body?.onChargeFailure;
+    const onChargeFailure = choice === 'send_invoice' || choice === 'next_invoice' ? choice : undefined;
+    return { success: true, data: await this.stripeService.applyMedicationsAtSubmit(appointmentId, onChargeFailure) };
   }
 
   @Post('medications/membership-reminder/:appointmentId')
