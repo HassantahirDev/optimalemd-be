@@ -1,4 +1,5 @@
 import { Injectable, NotFoundException, ConflictException, BadRequestException } from '@nestjs/common';
+import { withCalculatedBmi } from '../medical-form/bmi.util';
 import { PrismaService } from '../prisma/prisma.service';
 import { MailerService } from '../mailer/mailer.service';
 import { AdminCreatePatientDto, AdminUpdatePatientDto, AdminCreateMedicalFormDto, PatientWithMedicalFormResponseDto } from './dto/admin.dto';
@@ -282,7 +283,7 @@ export class AdminService {
     // Prepare medical form data
     const medicalFormData: any = {
       patientId,
-      ...createMedicalFormDto,
+      ...withCalculatedBmi(createMedicalFormDto),
       // Set labSchedulingNeeded to true by default if not provided
       labSchedulingNeeded: createMedicalFormDto.labSchedulingNeeded !== undefined ? createMedicalFormDto.labSchedulingNeeded : true,
     };
@@ -333,7 +334,7 @@ export class AdminService {
 
     // Prepare update data
     const updateData: any = { 
-      ...updateMedicalFormDto,
+      ...withCalculatedBmi(updateMedicalFormDto, existingForm),
       // Set labSchedulingNeeded to true by default if not provided
       labSchedulingNeeded: updateMedicalFormDto.labSchedulingNeeded !== undefined ? updateMedicalFormDto.labSchedulingNeeded : true,
     };

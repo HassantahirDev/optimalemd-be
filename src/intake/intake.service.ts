@@ -1,4 +1,5 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
+import { calculateBmi } from '../medical-form/bmi.util';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateIntakeFormDto } from './dto/create-intake-form.dto';
 import { MedicalFormService } from '../medical-form/medical-form.service';
@@ -73,6 +74,7 @@ export class IntakeService {
         height: screen2Data.height,
         weight: screen2Data.weight,
         waist: screen2Data.waist,
+        bmi: calculateBmi(screen2Data.height, screen2Data.weight),
         // Set other required fields to default values
         goalMoreEnergy: false,
         goalBetterSexualPerformance: false,

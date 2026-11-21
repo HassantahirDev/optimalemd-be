@@ -3,6 +3,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { MailerService } from '../mailer/mailer.service';
 import { ConfigService } from '@nestjs/config';
 import { CreateMedicalFormDto, MedicalFormResponseDto } from './dto';
+import { calculateBmi, withCalculatedBmi } from './bmi.util';
 
 @Injectable()
 export class MedicalFormService {
@@ -48,7 +49,7 @@ export class MedicalFormService {
       data: {
         patientId,
         appointmentId,
-        ...createMedicalFormDto,
+        ...withCalculatedBmi(createMedicalFormDto),
         // Set labSchedulingNeeded to true by default if not provided
         labSchedulingNeeded: createMedicalFormDto.labSchedulingNeeded !== undefined ? createMedicalFormDto.labSchedulingNeeded : true,
       }
@@ -115,7 +116,9 @@ export class MedicalFormService {
         date: (f.appointment?.appointmentDate || f.createdAt).toISOString(),
         weight: num(f.weight),
         weightRaw: f.weight || null,
-        bmi: num(f.bmi),
+        // Calculated from that visit's height and weight, so old forms saved
+        // with a stale or missing BMI still trend correctly.
+        bmi: num(calculateBmi(f.height, f.weight)) ?? num(f.bmi),
         height: f.height || null,
         waist: num(f.waist),
       }))
@@ -148,7 +151,7 @@ export class MedicalFormService {
 
     // Set labSchedulingNeeded to true by default if not provided
     const processedUpdateData = {
-      ...updateData,
+      ...withCalculatedBmi(updateData, existingForm),
       labSchedulingNeeded: updateData.labSchedulingNeeded !== undefined ? updateData.labSchedulingNeeded : true,
     };
 
@@ -169,7 +172,7 @@ export class MedicalFormService {
       const medicalForm = await this.prisma.medicalForm.create({
         data: {
           patientId,
-          ...processedUpdateData,
+          ...withCalculatedBmi(processedUpdateData),
         },
       });
 
@@ -184,10 +187,29 @@ export class MedicalFormService {
       return this.mapToResponseDto(medicalForm);
     }
 
-    await this.prisma.medicalForm.updateMany({
+    // Height/weight/waist/BMI are a reading from one visit: they go on the latest
+    // form only, so earlier visits keep their own numbers and the trend stays
+    // real. Everything else still syncs across the patient's forms as before.
+    const latest = await this.prisma.medicalForm.findFirst({
       where: { patientId },
-      data: processedUpdateData,
+      orderBy: { createdAt: 'desc' },
     });
+    const { height, weight, waist, bmi, ...sharedData } = processedUpdateData as any;
+    if (Object.keys(sharedData).length) {
+      await this.prisma.medicalForm.updateMany({
+        where: { patientId },
+        data: sharedData,
+      });
+    }
+    const biometrics = Object.fromEntries(
+      Object.entries({ height, weight, waist, bmi }).filter(([, v]) => v !== undefined),
+    );
+    if (Object.keys(biometrics).length) {
+      await this.prisma.medicalForm.update({
+        where: { id: latest!.id },
+        data: withCalculatedBmi(biometrics, latest),
+      });
+    }
 
     const updatedForm = await this.prisma.medicalForm.findFirst({
       where: { patientId },
@@ -366,7 +388,7 @@ export class MedicalFormService {
       respiratoryRate: medicalForm.respiratoryRate,
       temperature: medicalForm.temperature,
       oxygenSaturation: medicalForm.oxygenSaturation,
-      bmi: medicalForm.bmi,
+      bmi: calculateBmi(medicalForm.height, medicalForm.weight) ?? medicalForm.bmi,
       generalExam: medicalForm.generalExam,
       heentExam: medicalForm.heentExam,
       chestLungsExam: medicalForm.chestLungsExam,
