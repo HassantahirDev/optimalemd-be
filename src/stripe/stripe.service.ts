@@ -66,6 +66,8 @@ export class StripeService {
 
     let stripeCustomerId: string | undefined;
     let appointmentCreditApplied: { partnerId: string; appliedCents: number } | null = null;
+    // $50 referral credits taken off this booking (non-members); spent once it's paid.
+    let referralCreditCents = 0;
 
     if (appointmentId) {
       const appointment = await this.prisma.appointment.findUnique({
@@ -79,6 +81,16 @@ export class StripeService {
 
       if (!appointment) throw new NotFoundException('Appointment not found');
       if (appointment.isPaid) throw new BadRequestException('Appointment is already paid');
+
+      // Referral $ credit (e.g. $50 per referral) — deducted here, authoritatively, from
+      // the booking price the page sends. Members get 0 (theirs go on the membership
+      // invoice). Leaves Stripe's 50-cent minimum, like the partner credit below.
+      if (amount && amount > 0) {
+        const available = await this.referralService.getAppointmentDollarCreditCents(appointment.patient.id);
+        const amountCents = Math.round(amount * 100);
+        referralCreditCents = Math.min(available, Math.max(0, amountCents - 50));
+        if (referralCreditCents > 0) amount = (amountCents - referralCreditCents) / 100;
+      }
 
       // Partner platform credit — same mechanism as the welcome-order signup fee.
       // Applied authoritatively here (never trust a client-sent discount), reserved
@@ -125,6 +137,7 @@ export class StripeService {
         doctorName,
         service: serviceName,
         type: 'appointment',
+        ...(referralCreditCents > 0 && { referralCreditCents: String(referralCreditCents) }),
       };
       description = `Appointment – ${serviceName} | Patient: ${patientName} | ${doctorName}`;
 
@@ -259,6 +272,8 @@ export class StripeService {
    */
   async confirmPayment(confirmPaymentDto: ConfirmPaymentDto) {
     const { paymentIntentId, appointmentId, isFreeAppointment, patientTimezone } = confirmPaymentDto;
+    // Referral $ credit this payment deducted (set at createPaymentIntent) — spent below.
+    let referralCreditCentsUsed = 0;
 
     // Handle free appointments
     if (isFreeAppointment) {
@@ -274,10 +289,11 @@ export class StripeService {
 
     // Verify payment intent
     const paymentIntent = await this.stripe.paymentIntents.retrieve(paymentIntentId);
-    
+
     if (paymentIntent.status !== 'succeeded') {
       throw new BadRequestException('Payment not completed');
     }
+    referralCreditCentsUsed = parseInt(paymentIntent.metadata?.referralCreditCents || '0', 10) || 0;
 
     // Update payment status
     const updatedPayment = await this.prisma.payment.update({
@@ -449,7 +465,7 @@ export class StripeService {
 
     // Apply any pending credits to this appointment
     try {
-      await this.referralService.applyCreditsToAppointment(appointment.patientId, appointmentId);
+      await this.referralService.applyCreditsToAppointment(appointment.patientId, appointmentId, referralCreditCentsUsed);
     } catch (creditErr) {
       console.error('Credit application failed (non-fatal):', creditErr);
     }
