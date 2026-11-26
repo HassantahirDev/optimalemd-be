@@ -239,6 +239,8 @@ export class ReferralService {
       qualifiedReferrals,
       totalReferrals: referrals.length,
       pendingCreditDollar,
+      // $ referral credit a non-member's next booking deducts (0 for members).
+      appointmentCreditDollars: (await this.getAppointmentDollarCreditCents(patientId)) / 100,
       pendingCreditPct,
       appliedPct,
       rolloverPct,
@@ -542,46 +544,106 @@ export class ReferralService {
     return consumed; // dollars consumed from platform credit
   }
 
-  async applyCreditsToAppointment(patientId: string, appointmentId: string): Promise<void> {
+  /**
+   * Flat-dollar referral credit ($50 each) a non-member can take off a booking, in
+   * cents. Members get theirs on the membership invoice instead, so this is 0 for them.
+   * The booking page shows this and createPaymentIntent deducts it — same number.
+   */
+  async getAppointmentDollarCreditCents(patientId: string): Promise<number> {
+    const patient = await this.prisma.user.findUnique({ where: { id: patientId }, select: { isSubscribed: true } });
+    if (!patient || patient.isSubscribed) return 0;
+    await this.expireOldCredits(patientId);
+    const events = await this.getActivePendingEvents(patientId);
+    return events
+      .filter((e) => (e.type as string) !== 'FREE_MONTH' && e.dollarAmount != null && e.dollarAmount > 0)
+      .reduce((sum, e) => sum + Math.round(e.dollarAmount! * 100), 0);
+  }
+
+  /**
+   * After a booking is paid: spend the credits it used.
+   * - Dollar credits: exactly `dollarCentsUsed` (what was taken off the charge), oldest
+   *   first. A credit only partly used keeps its remainder for the next booking.
+   * - Percent credits (legacy review credits): the booking page already discounted
+   *   by them, so they're all marked used, as before.
+   * Safe to call twice for one appointment: credits already tied to it aren't re-spent.
+   */
+  async applyCreditsToAppointment(patientId: string, appointmentId: string, dollarCentsUsed = 0): Promise<void> {
     const patient = await this.prisma.user.findUnique({ where: { id: patientId } });
     if (!patient) return;
 
     // Subscribers get credits applied to their subscription billing, not appointments
     if (patient.isSubscribed) return;
 
+    const alreadyApplied = await this.prisma.creditEvent.count({
+      where: { patientId, appliedToInvoice: appointmentId },
+    });
+    if (alreadyApplied > 0) return;
+
     await this.expireOldCredits(patientId);
 
-    const [freshPatient, pendingEvents] = await Promise.all([
-      this.prisma.user.findUnique({ where: { id: patientId } }),
-      this.getActivePendingEvents(patientId),
-    ]);
-    if (!freshPatient) return;
+    const pendingEvents = await this.getActivePendingEvents(patientId);
+    const isDollar = (e: CreditEvent) =>
+      (e.type as string) !== 'FREE_MONTH' && e.dollarAmount != null && e.dollarAmount > 0;
+    // Everything that isn't a dollar credit (review %, free month, legacy %) is what
+    // the booking page's percent discount used — spent exactly as before.
+    const percentEvents = pendingEvents.filter((e) => !isDollar(e));
+    const dollarEvents = pendingEvents
+      .filter(isDollar)
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
 
-    const totalDollar = pendingEvents.reduce((sum, e) => {
-      if (e.dollarAmount != null && e.dollarAmount > 0) return sum + e.dollarAmount;
-      return sum + e.percentAmount; // legacy
-    }, 0) + freshPatient.creditRolloverPct;
-    if (totalDollar <= 0) return;
-
-    const newRolloverPct = 0; // dollar credits don't roll over as percentages
-
-    const updates = pendingEvents.map((e) =>
+    const now = new Date();
+    const updates: any[] = percentEvents.map((e) =>
       this.prisma.creditEvent.update({
         where: { id: e.id },
-        data: {
-          status: CreditStatus.APPLIED,
-          appliedAt: new Date(),
-          appliedToInvoice: appointmentId,
-        },
+        data: { status: CreditStatus.APPLIED, appliedAt: now, appliedToInvoice: appointmentId },
       }),
     );
 
+    let remaining = Math.max(0, Math.round(dollarCentsUsed));
+    for (const e of dollarEvents) {
+      if (remaining <= 0) break;
+      const eventCents = Math.round(e.dollarAmount! * 100);
+      if (eventCents <= remaining) {
+        updates.push(
+          this.prisma.creditEvent.update({
+            where: { id: e.id },
+            data: { status: CreditStatus.APPLIED, appliedAt: now, appliedToInvoice: appointmentId },
+          }),
+        );
+        remaining -= eventCents;
+      } else {
+        // Partly used: record the used part as applied, keep the rest pending.
+        updates.push(
+          this.prisma.creditEvent.update({
+            where: { id: e.id },
+            data: { dollarAmount: (eventCents - remaining) / 100 },
+          }),
+          this.prisma.creditEvent.create({
+            data: {
+              patientId,
+              type: e.type,
+              percentAmount: 0,
+              dollarAmount: remaining / 100,
+              status: CreditStatus.APPLIED,
+              referralId: e.referralId,
+              appliedAt: now,
+              appliedToInvoice: appointmentId,
+            },
+          }),
+        );
+        remaining = 0;
+      }
+    }
+
+    // The percent rollover was part of the booking page's percent discount too.
+    const clearRollover = percentEvents.length > 0 || (patient.creditRolloverPct ?? 0) > 0;
+    if (updates.length === 0 && !clearRollover) return;
+
     await this.prisma.$transaction([
       ...updates,
-      this.prisma.user.update({
-        where: { id: patientId },
-        data: { creditRolloverPct: newRolloverPct },
-      }),
+      ...(clearRollover
+        ? [this.prisma.user.update({ where: { id: patientId }, data: { creditRolloverPct: 0 } })]
+        : []),
     ]);
   }
 }

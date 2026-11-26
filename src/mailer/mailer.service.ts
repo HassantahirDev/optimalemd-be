@@ -4606,7 +4606,9 @@ For your security, you will be asked to set a new password the first time you lo
     }
   }
 
-  async sendReferralCreditEmail(to: string, name: string, creditPct: number, isSubscribed: boolean): Promise<void> {
+  /** Referral reward: a flat dollar credit (e.g. $50 off), not a percentage. */
+  async sendReferralCreditEmail(to: string, name: string, creditDollars: number, isSubscribed: boolean): Promise<void> {
+    const amount = `$${Number.isInteger(creditDollars) ? creditDollars : creditDollars.toFixed(2)}`;
     const context = isSubscribed ? 'your next monthly subscription renewal' : 'your next appointment';
     const html = `
       <!DOCTYPE html>
@@ -4632,9 +4634,9 @@ For your security, you will be asked to set a new password the first time you lo
           <div class="content">
             <h2>You earned a referral credit! 🎉</h2>
             <p>Hi ${name},</p>
-            <p>Great news! A patient you referred just completed their first appointment. As a thank-you, we've added a <strong>${creditPct}% discount</strong> to your account.</p>
-            <div class="credit-badge">${creditPct}% OFF</div>
-            <p>This credit will automatically be applied to ${context}. Credits expire 30 days after being earned, so use them soon!</p>
+            <p>Great news! A patient you referred just completed their first appointment. As a thank-you, we've added a <strong>${amount} credit</strong> to your account.</p>
+            <div class="credit-badge">${amount} OFF</div>
+            <p>This credit will automatically be applied to ${context}.</p>
             <p>Keep sharing your referral link to earn more credits. You can view your current balance in the <strong>Referrals &amp; Credits</strong> section of your dashboard.</p>
             <p>Thank you for helping grow the FormaMD community!</p>
             <p>— The FormaMD Team</p>
@@ -4650,7 +4652,7 @@ For your security, you will be asked to set a new password the first time you lo
       await this.transporter.sendMail({
         from: `"FormaMD" <${this.configService.get<string>('SMTP_FROM')}>`,
         to,
-        subject: `You earned ${creditPct}% credit — referral qualified!`,
+        subject: `You earned a ${amount} credit — referral qualified!`,
         html,
       });
       console.log(`Referral credit email sent to ${to}`);
